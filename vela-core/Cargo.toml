@@ -1,0 +1,20 @@
+[package]
+name = "vela-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+blake3.workspace = true
+vela-coord-client = { path = "../vela-coord-client" }
+ed25519-dalek.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+vela-crypto = { path = "../vela-crypto" }
+vela-proto = { path = "../vela-proto" }
+vela-stun = { path = "../vela-stun" }

@@ -1,0 +1,22 @@
+[package]
+name = "vela-coord"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+axum-server.workspace = true
+base64.workspace = true
+blake3.workspace = true
+futures-util.workspace = true
+rand.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+vela-crypto = { path = "../vela-crypto" }
+vela-proto = { path = "../vela-proto" }

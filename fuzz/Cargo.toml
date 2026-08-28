@@ -1,0 +1,19 @@
+[package]
+name = "vela-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+vela-proto = { path = "../vela-proto" }
+
+[[bin]]
+name = "wire_packet"
+path = "fuzz_targets/wire_packet.rs"
+test = false
+doc = false
+bench = false

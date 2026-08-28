@@ -1,0 +1,12 @@
+[package]
+name = "vela-stun"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
