@@ -1,7 +1,8 @@
 //! Lightweight, single-tenant coordination server.
 //!
-//! The server stores only authorization metadata. Online WebSocket sessions
-//! and candidates are in memory, and no data-plane packet enters this crate.
+//! The server stores authorization metadata and the latest peer candidates.
+//! Online WebSocket sessions are in memory, and no data-plane packet enters
+//! this crate.
 
 use axum::{
     Router,
@@ -30,7 +31,7 @@ use tokio::{
 };
 use tracing::debug;
 use vela_crypto::{CryptoError, MembershipCredential, ServerSigner};
-use vela_proto::{Candidate, ControlMessage, NodeId, PublicPeerInfo};
+use vela_proto::{Candidate, ControlMessage, NodeId, PeerCapability, PeerSummary, PublicPeerInfo};
 
 #[derive(Clone)]
 pub struct CoordServer {
@@ -41,7 +42,7 @@ struct ServerInner {
     tenant: String,
     signer: ServerSigner,
     database: Mutex<Connection>,
-    online: AsyncMutex<HashMap<NodeId, mpsc::Sender<ControlMessage>>>,
+    online: AsyncMutex<HashMap<NodeId, HashMap<u64, mpsc::Sender<ControlMessage>>>>,
 }
 
 impl CoordServer {
@@ -62,6 +63,7 @@ impl CoordServer {
                 noise_public BLOB NOT NULL,
                 candidates TEXT NOT NULL,
                 credential BLOB NOT NULL,
+                capabilities TEXT NOT NULL,
                 revoked INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS invites (
@@ -136,8 +138,10 @@ impl CoordServer {
                 "UPDATE peers SET revoked = 1 WHERE node_id = ?1",
                 params![node_id.as_bytes().as_slice()],
             )?;
-        if let Some(sender) = self.inner.online.lock().await.remove(&node_id) {
-            let _ = sender.send(ControlMessage::Revoke { node_id }).await;
+        if let Some(sessions) = self.inner.online.lock().await.remove(&node_id) {
+            for sender in sessions.into_values() {
+                let _ = sender.send(ControlMessage::Revoke { node_id }).await;
+            }
         }
         Ok(())
     }
@@ -171,6 +175,7 @@ async fn ws_handler(
 }
 
 async fn handle_socket(state: Arc<ServerInner>, socket: WebSocket) {
+    let connection_id: u64 = rand::random();
     let (mut writer, mut reader) = socket.split();
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<ControlMessage>(64);
     let writer_task = tokio::spawn(async move {
@@ -180,6 +185,22 @@ async fn handle_socket(state: Arc<ServerInner>, socket: WebSocket) {
                 Err(_) => break,
             };
             if writer.send(Message::Text(text.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+    let heartbeat_tx = outbound_tx.clone();
+    let heartbeat_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+        loop {
+            interval.tick().await;
+            if heartbeat_tx
+                .send(ControlMessage::Ping {
+                    nonce: rand::random(),
+                })
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -198,7 +219,7 @@ async fn handle_socket(state: Arc<ServerInner>, socket: WebSocket) {
                 continue;
             }
         };
-        match handle_message(&state, &outbound_tx, registered, request).await {
+        match handle_message(&state, &outbound_tx, connection_id, registered, request).await {
             Ok(next_registered) => registered = next_registered,
             Err(error) => {
                 let _ = outbound_tx.send(error.as_control()).await;
@@ -206,14 +227,22 @@ async fn handle_socket(state: Arc<ServerInner>, socket: WebSocket) {
         }
     }
     if let Some(node_id) = registered {
-        state.online.lock().await.remove(&node_id);
+        let mut online = state.online.lock().await;
+        if let Some(sessions) = online.get_mut(&node_id) {
+            sessions.remove(&connection_id);
+            if sessions.is_empty() {
+                online.remove(&node_id);
+            }
+        }
     }
+    heartbeat_task.abort();
     writer_task.abort();
 }
 
 async fn handle_message(
     state: &Arc<ServerInner>,
     outbound: &mpsc::Sender<ControlMessage>,
+    connection_id: u64,
     registered: Option<NodeId>,
     request: ControlMessage,
 ) -> Result<Option<NodeId>, CoordError> {
@@ -225,6 +254,7 @@ async fn handle_message(
             credential,
             invite_token,
             candidates,
+            capabilities,
         } => {
             let signing_public = decode_key(&signing_public)?;
             let noise_public = decode_key(&noise_public)?;
@@ -275,13 +305,25 @@ async fn handle_message(
                 noise_public,
                 candidates,
                 credential: stored_credential.clone(),
+                capabilities,
             };
             update_peer(state, &peer)?;
-            state.online.lock().await.insert(node_id, outbound.clone());
+            state
+                .online
+                .lock()
+                .await
+                .entry(node_id)
+                .or_default()
+                .insert(connection_id, outbound.clone());
+            let peers = load_peers(state)?
+                .into_iter()
+                .filter(|peer| peer.node_id != node_id)
+                .map(|peer| public_peer(&peer))
+                .collect::<Result<Vec<_>, _>>()?;
             outbound
                 .send(ControlMessage::RegisterOk {
                     credential: BASE64.encode(stored_credential),
-                    peers: Vec::new(),
+                    peers,
                 })
                 .await
                 .map_err(|_| CoordError::ConnectionClosed)?;
@@ -299,6 +341,7 @@ async fn handle_message(
                     noise_public: peer.noise_public,
                     candidates,
                     credential: peer.credential,
+                    capabilities: peer.capabilities,
                 },
             )?;
             Ok(registered)
@@ -314,12 +357,42 @@ async fn handle_message(
                 })
                 .await
                 .map_err(|_| CoordError::ConnectionClosed)?;
-            if let Some(target_sender) = state.online.lock().await.get(&node_id).cloned() {
+            let target_senders = state
+                .online
+                .lock()
+                .await
+                .get(&node_id)
+                .map(|sessions| sessions.values().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            if !target_senders.is_empty() {
                 let from = public_peer(&requester_info)?;
-                let _ = target_sender
-                    .send(ControlMessage::ConnectSignal { from, to: node_id })
-                    .await;
+                for target_sender in target_senders {
+                    let _ = target_sender
+                        .send(ControlMessage::ConnectSignal {
+                            from: from.clone(),
+                            to: node_id,
+                        })
+                        .await;
+                }
             }
+            Ok(registered)
+        }
+        ControlMessage::ListPeers => {
+            let requester = registered.ok_or(CoordError::NotRegistered)?;
+            let online = state.online.lock().await;
+            let peers = load_peers(state)?
+                .into_iter()
+                .filter(|peer| peer.node_id != requester)
+                .map(|peer| PeerSummary {
+                    node_id: peer.node_id,
+                    online: online.contains_key(&peer.node_id),
+                    capabilities: peer.capabilities,
+                })
+                .collect();
+            outbound
+                .send(ControlMessage::ListPeersOk { peers })
+                .await
+                .map_err(|_| CoordError::ConnectionClosed)?;
             Ok(registered)
         }
         ControlMessage::Ping { nonce } => {
@@ -329,6 +402,7 @@ async fn handle_message(
                 .map_err(|_| CoordError::ConnectionClosed)?;
             Ok(registered)
         }
+        ControlMessage::Pong { .. } => Ok(registered),
         _ => Err(CoordError::UnsupportedMessage),
     }
 }
@@ -383,11 +457,13 @@ struct StoredPeer {
     noise_public: [u8; 32],
     candidates: Vec<Candidate>,
     credential: Vec<u8>,
+    capabilities: Vec<PeerCapability>,
 }
 
 fn update_peer(state: &Arc<ServerInner>, peer: &StoredPeer) -> Result<(), CoordError> {
     let candidates = serde_json::to_string(&peer.candidates)?;
-    state.database.lock().map_err(|_| CoordError::DatabasePoisoned)?.execute("INSERT INTO peers(node_id, signing_public, noise_public, candidates, credential, revoked) VALUES(?1, ?2, ?3, ?4, ?5, 0) ON CONFLICT(node_id) DO UPDATE SET signing_public = excluded.signing_public, noise_public = excluded.noise_public, candidates = excluded.candidates, credential = excluded.credential, revoked = 0", params![peer.node_id.as_bytes().as_slice(), peer.signing_public.as_slice(), peer.noise_public.as_slice(), candidates, peer.credential])?;
+    let capabilities = serde_json::to_string(&peer.capabilities)?;
+    state.database.lock().map_err(|_| CoordError::DatabasePoisoned)?.execute("INSERT INTO peers(node_id, signing_public, noise_public, candidates, credential, capabilities, revoked) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 0) ON CONFLICT(node_id) DO UPDATE SET signing_public = excluded.signing_public, noise_public = excluded.noise_public, candidates = excluded.candidates, credential = excluded.credential, capabilities = excluded.capabilities, revoked = 0", params![peer.node_id.as_bytes().as_slice(), peer.signing_public.as_slice(), peer.noise_public.as_slice(), candidates, peer.credential, capabilities])?;
     Ok(())
 }
 
@@ -396,12 +472,61 @@ fn load_peer(state: &Arc<ServerInner>, node_id: NodeId) -> Result<Option<StoredP
         .database
         .lock()
         .map_err(|_| CoordError::DatabasePoisoned)?;
-    database.query_row("SELECT signing_public, noise_public, candidates, credential FROM peers WHERE node_id = ?1 AND revoked = 0", params![node_id.as_bytes().as_slice()], |row| {
-        let signing: Vec<u8> = row.get(0)?; let noise: Vec<u8> = row.get(1)?; let candidates: String = row.get(2)?; let credential: Vec<u8> = row.get(3)?;
-        Ok((signing, noise, candidates, credential))
-    }).optional()?.map(|(signing, noise, candidates, credential)| {
-        Ok(StoredPeer { node_id, signing_public: signing.try_into().map_err(|_| CoordError::InvalidPeer)?, noise_public: noise.try_into().map_err(|_| CoordError::InvalidPeer)?, candidates: serde_json::from_str(&candidates)?, credential })
+    database.query_row("SELECT signing_public, noise_public, candidates, credential, capabilities FROM peers WHERE node_id = ?1 AND revoked = 0", params![node_id.as_bytes().as_slice()], |row| {
+        let signing: Vec<u8> = row.get(0)?; let noise: Vec<u8> = row.get(1)?; let candidates: String = row.get(2)?; let credential: Vec<u8> = row.get(3)?; let capabilities: String = row.get(4)?;
+        Ok((signing, noise, candidates, credential, capabilities))
+    }).optional()?.map(|(signing, noise, candidates, credential, capabilities)| {
+        Ok(StoredPeer { node_id, signing_public: signing.try_into().map_err(|_| CoordError::InvalidPeer)?, noise_public: noise.try_into().map_err(|_| CoordError::InvalidPeer)?, candidates: serde_json::from_str(&candidates)?, credential, capabilities: serde_json::from_str(&capabilities)? })
     }).transpose()
+}
+
+fn load_peers(state: &Arc<ServerInner>) -> Result<Vec<StoredPeer>, CoordError> {
+    let database = state
+        .database
+        .lock()
+        .map_err(|_| CoordError::DatabasePoisoned)?;
+    let mut statement = database.prepare(
+        "SELECT node_id, signing_public, noise_public, candidates, credential, capabilities
+         FROM peers WHERE revoked = 0 ORDER BY node_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        let node_id: Vec<u8> = row.get(0)?;
+        let signing: Vec<u8> = row.get(1)?;
+        let noise: Vec<u8> = row.get(2)?;
+        let candidates: String = row.get(3)?;
+        let credential: Vec<u8> = row.get(4)?;
+        let capabilities: String = row.get(5)?;
+        Ok((
+            node_id,
+            signing,
+            noise,
+            candidates,
+            credential,
+            capabilities,
+        ))
+    })?;
+    rows.map(|row| {
+        let (node_id, signing, noise, candidates, credential, capabilities) = row?;
+        Ok(StoredPeer {
+            node_id: node_id
+                .try_into()
+                .map(NodeId::new)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+            signing_public: signing
+                .try_into()
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+            noise_public: noise
+                .try_into()
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+            candidates: serde_json::from_str(&candidates)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+            credential,
+            capabilities: serde_json::from_str(&capabilities)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        })
+    })
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(CoordError::Database)
 }
 
 fn public_peer(peer: &StoredPeer) -> Result<PublicPeerInfo, CoordError> {
@@ -411,6 +536,7 @@ fn public_peer(peer: &StoredPeer) -> Result<PublicPeerInfo, CoordError> {
         noise_public: BASE64.encode(peer.noise_public),
         candidates: peer.candidates.clone(),
         credential: BASE64.encode(&peer.credential),
+        capabilities: peer.capabilities.clone(),
     })
 }
 
@@ -508,6 +634,7 @@ mod tests {
                 "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
             )],
             credential: serde_json::to_vec(&credential).unwrap(),
+            capabilities: vec![PeerCapability::DiagnosticPing],
         };
         update_peer(&server.inner, &peer).unwrap();
         assert_eq!(server.list_peers().unwrap(), vec![public.node_id]);

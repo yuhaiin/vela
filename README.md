@@ -13,8 +13,9 @@ The workspace currently contains:
 - `vela-stun`: client-side STUN Binding transactions.
 - `vela-coord-client`: WebSocket control-plane client with server-key credential verification.
 - `vela-core`: Tokio peer state machine with injectable direct UDP `DatagramProvider`, signed probes, path migration, replay-window checks, and traffic observation.
+- `vela-diagnostic`: registered, relay-free peer diagnostics with authenticated direct Echo/Pong tests.
 - `vela-coord`: single-tenant coordination server with SQLite authorization state and in-memory online sessions.
-- `vela-cli`: identity, server, invite, peer-list and revoke commands.
+- `vela-cli`: identity, server, invite, peer-list, revoke, and diagnostic peer commands.
 
 The default server listener is plain WebSocket for local development. The
 server also exposes `serve_tls` and the CLI accepts `--cert`/`--key` for direct
@@ -61,7 +62,26 @@ cargo run -p vela-cli -- invite \
   --db ./vela.db \
   --signer ./server.key \
   --tenant my-network
+
+# Use the server's printed public key and an invite token for each diagnostic peer.
+cargo run -p vela-cli -- peer register \
+  --state ./peer-a \
+  --server ws://127.0.0.1:7000/ws \
+  --server-key <base64-server-key> \
+  --invite <invite-token> \
+  --bind 192.0.2.10:0
+
+cargo run -p vela-cli -- peer run --state ./peer-a
+cargo run -p vela-cli -- peer list --state ./peer-a --json
+cargo run -p vela-cli -- peer status --state ./peer-a --json
+cargo run -p vela-cli -- peer ping vela:<node-id-hex> --state ./peer-a --count 3 --json
 ```
+
+`peer run` is a diagnostic peer process, not a server or relay. The
+coordination server only exchanges registration and candidate information;
+the Probe, Noise handshake, and encrypted Echo/Pong packets travel directly
+between peer UDP sockets. `--stun <ip:port>` can be repeated during register
+or run to publish server-reflexive candidates.
 
 For an embedded node, create a `TokioDatagramProvider` or implement
 `DatagramProvider` in the host. The host provider is the intended place for
@@ -77,8 +97,9 @@ handshake. `PreferHybrid` currently uses the classical suite because the
 hybrid suite is not yet implemented; `RequireHybrid` fails closed. This is an
 explicit MVP limitation, not an automatic downgrade.
 
-The current persistence format stores identity and server signing keys as
-base64-encoded files. Production deployments should protect those files with
+The peer state directory stores the identity, server key, membership
+credential, and published candidates. Identity and state files are written
+with mode `0600`; production deployments should still protect them with
 filesystem permissions and backups. The coordination server must be exposed
 through TLS, either with the built-in Rustls listener or a trusted TLS
 terminator.

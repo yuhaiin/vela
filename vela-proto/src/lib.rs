@@ -94,6 +94,8 @@ pub enum PacketType {
     Handshake = 3,
     Data = 4,
     KeepAlive = 5,
+    DiagnosticPing = 6,
+    DiagnosticPong = 7,
 }
 
 impl TryFrom<u8> for PacketType {
@@ -106,6 +108,8 @@ impl TryFrom<u8> for PacketType {
             3 => Ok(Self::Handshake),
             4 => Ok(Self::Data),
             5 => Ok(Self::KeepAlive),
+            6 => Ok(Self::DiagnosticPing),
+            7 => Ok(Self::DiagnosticPong),
             _ => Err(ProtoError::UnknownPacketType(value)),
         }
     }
@@ -216,6 +220,20 @@ pub struct PublicPeerInfo {
     pub noise_public: String,
     pub candidates: Vec<Candidate>,
     pub credential: String,
+    pub capabilities: Vec<PeerCapability>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerCapability {
+    DiagnosticPing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PeerSummary {
+    pub node_id: NodeId,
+    pub online: bool,
+    pub capabilities: Vec<PeerCapability>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -225,6 +243,7 @@ pub struct PeerInfo {
     pub noise_public: [u8; 32],
     pub candidates: Vec<Candidate>,
     pub credential: Vec<u8>,
+    pub capabilities: Vec<PeerCapability>,
 }
 
 impl TryFrom<PublicPeerInfo> for PeerInfo {
@@ -250,6 +269,7 @@ impl TryFrom<PublicPeerInfo> for PeerInfo {
                 .map_err(|_| ProtoError::InvalidEncoding)?,
             candidates: value.candidates,
             credential,
+            capabilities: value.capabilities,
         })
     }
 }
@@ -264,6 +284,7 @@ pub enum ControlMessage {
         credential: String,
         invite_token: Option<String>,
         candidates: Vec<Candidate>,
+        capabilities: Vec<PeerCapability>,
     },
     RegisterOk {
         credential: String,
@@ -277,6 +298,10 @@ pub enum ControlMessage {
     },
     PeerInfo {
         peer: PublicPeerInfo,
+    },
+    ListPeers,
+    ListPeersOk {
+        peers: Vec<PeerSummary>,
     },
     ConnectSignal {
         from: PublicPeerInfo,

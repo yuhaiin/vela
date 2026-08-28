@@ -1,11 +1,14 @@
-use std::{env, net::SocketAddr, path::PathBuf, str::FromStr};
+use std::{env, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
 use vela_coord::CoordServer;
 use vela_crypto::Identity;
+use vela_diagnostic::{DiagnosticControl, DiagnosticPeer, PeerState};
+use vela_proto::NodeId;
 
 fn usage() -> ! {
     eprintln!(
-        "Usage:\n  vela-cli identity <path>\n  vela-cli server --bind <addr> --db <path> --signer <path> --tenant <name> [--cert <path> --key <path>]\n  vela-cli invite --db <path> --signer <path> --tenant <name> [--ttl <seconds>]\n  vela-cli peers --db <path> --signer <path> --tenant <name>\n  vela-cli revoke <node-id> --db <path> --signer <path> --tenant <name>"
+        "Usage:\n  vela-cli identity <path>\n  vela-cli server --bind <addr> --db <path> --signer <path> --tenant <name> [--cert <path> --key <path>]\n  vela-cli invite --db <path> --signer <path> --tenant <name> [--ttl <seconds>]\n  vela-cli peers --db <path> --signer <path> --tenant <name>\n  vela-cli revoke <node-id> --db <path> --signer <path> --tenant <name>\n  vela-cli peer register --state <dir> --server <url> --server-key <base64> --invite <token> [--bind <addr>] [--stun <addr>]\n  vela-cli peer run --state <dir> [--bind <addr>] [--stun <addr>]\n  vela-cli peer list --state <dir> [--json]\n  vela-cli peer ping <node-id> --state <dir> [--count <n>] [--timeout <duration>] [--json]"
     );
+    eprintln!("  vela-cli peer status --state <dir> [--json]");
     std::process::exit(2);
 }
 
@@ -19,6 +22,153 @@ fn required(args: &[String], name: &str) -> String {
         eprintln!("missing {name}");
         usage()
     })
+}
+
+fn options(args: &[String], name: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|pair| pair[0] == name)
+        .map(|pair| pair[1].clone())
+        .collect()
+}
+
+fn parse_duration(value: &str) -> Result<Duration, String> {
+    let (number, multiplier) = if let Some(value) = value.strip_suffix("ms") {
+        (value, 1)
+    } else if let Some(value) = value.strip_suffix('s') {
+        (value, 1000)
+    } else {
+        return Err(format!("duration must end in ms or s: {value}"));
+    };
+    let millis = number
+        .parse::<u64>()
+        .map_err(|_| format!("invalid duration: {value}"))?
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("duration is too large: {value}"))?;
+    Ok(Duration::from_millis(millis))
+}
+
+fn decode_server_key(value: &str) -> Result<[u8; 32], String> {
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, value)
+        .map_err(|_| "invalid base64 server key".to_owned())?;
+    bytes
+        .try_into()
+        .map_err(|_| "server key must decode to 32 bytes".to_owned())
+}
+
+fn bind_option(args: &[String]) -> Result<Option<SocketAddr>, Box<dyn std::error::Error>> {
+    option(args, "--bind")
+        .map(|value| value.parse().map_err(Into::into))
+        .transpose()
+}
+
+async fn run_peer_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(subcommand) = args.first() else {
+        usage();
+    };
+    let args = &args[1..];
+    match subcommand.as_str() {
+        "register" => {
+            let state_dir = required(args, "--state");
+            let server = required(args, "--server");
+            let server_key = decode_server_key(&required(args, "--server-key"))?;
+            let invite = required(args, "--invite");
+            let bind = bind_option(args)?.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
+            let stun = options(args, "--stun")
+                .into_iter()
+                .map(|value| value.parse())
+                .collect::<Result<Vec<SocketAddr>, _>>()?;
+            let state =
+                vela_diagnostic::register(&state_dir, server, server_key, &invite, bind, stun)
+                    .await?;
+            let identity = Identity::load(PeerState::identity_path(&state_dir))?;
+            println!("registered {}", identity.public().node_id);
+            println!("state saved in {}", state_dir);
+            let _ = state;
+        }
+        "run" => {
+            let state_dir = required(args, "--state");
+            let stun_values = options(args, "--stun");
+            let stun = if stun_values.is_empty() {
+                None
+            } else {
+                Some(
+                    stun_values
+                        .into_iter()
+                        .map(|value| value.parse())
+                        .collect::<Result<Vec<SocketAddr>, _>>()?,
+                )
+            };
+            let peer = DiagnosticPeer::open(&state_dir, bind_option(args)?, stun).await?;
+            println!(
+                "peer {} ready on {}",
+                peer.node_id(),
+                peer.node.local_addr()?
+            );
+            peer.run().await?;
+        }
+        "list" => {
+            let state_dir = required(args, "--state");
+            let mut control = DiagnosticControl::open(&state_dir).await?;
+            let peers = control.list_peers().await?;
+            if args.iter().any(|arg| arg == "--json") {
+                println!("{}", serde_json::to_string_pretty(&peers)?);
+            } else {
+                for peer in peers {
+                    println!(
+                        "{}\t{}\t{:?}",
+                        peer.node_id,
+                        if peer.online { "online" } else { "offline" },
+                        peer.capabilities
+                    );
+                }
+            }
+        }
+        "status" => {
+            let state_dir = required(args, "--state");
+            let mut control = DiagnosticControl::open(&state_dir).await?;
+            let status = control.status().await?;
+            if args.iter().any(|arg| arg == "--json") {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                println!("node\t{}", status.node_id);
+                println!("server\t{}", status.server);
+                println!("bind\t{}", status.bind);
+                println!("candidates\t{:?}", status.candidates);
+                println!("peers\t{}", status.peers.len());
+            }
+        }
+        "ping" => {
+            let target = args
+                .first()
+                .ok_or_else(|| "missing target node id".to_owned())?
+                .parse::<NodeId>()?;
+            let state_dir = required(args, "--state");
+            let count = option(args, "--count")
+                .map(|value| value.parse())
+                .transpose()?
+                .unwrap_or(1);
+            let timeout = option(args, "--timeout")
+                .map(|value| parse_duration(&value))
+                .transpose()?
+                .unwrap_or_else(|| Duration::from_secs(8));
+            let mut peer = DiagnosticPeer::open(&state_dir, None, None).await?;
+            let report = peer.ping(target, count, timeout).await?;
+            if args.iter().any(|arg| arg == "--json") {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "direct ping {} via {} ({}) connect={}ms rtt={:?}ms",
+                    report.target,
+                    report.path,
+                    report.candidate_type,
+                    report.connect_ms,
+                    report.rtts_ms
+                );
+            }
+        }
+        _ => usage(),
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -97,6 +247,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             server.revoke_peer(node_id).await?;
         }
+        "peer" => run_peer_command(&args).await?,
         _ => usage(),
     }
     Ok(())

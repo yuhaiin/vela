@@ -6,6 +6,7 @@ members = [
     "vela-stun",
     "vela-coord-client",
     "vela-core",
+    "vela-diagnostic",
     "vela-coord",
     "vela-cli",
 ]

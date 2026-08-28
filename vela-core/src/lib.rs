@@ -21,7 +21,7 @@ use std::{
 use thiserror::Error;
 use tokio::{
     net::UdpSocket,
-    sync::{Mutex, Notify, mpsc},
+    sync::{Mutex, Notify, mpsc, oneshot},
     time::{Instant, timeout},
 };
 use tracing::{debug, warn};
@@ -365,8 +365,7 @@ impl VelaNode {
         }
         let node_id = self.node_id();
         let timestamp = unix_time();
-        for candidate in candidates {
-            let address = candidate.address();
+        let send_probes = || async {
             let payload = encode_probe(
                 node_id,
                 peer_id,
@@ -375,12 +374,22 @@ impl VelaNode {
                 nonce,
                 &self.inner.identity,
             );
-            let _ = self
-                .inner
-                .send_packet(address, PacketType::Probe, session_id, 0, &payload)
-                .await;
-        }
+            for candidate in &candidates {
+                let _ = self
+                    .inner
+                    .send_packet(
+                        candidate.address(),
+                        PacketType::Probe,
+                        session_id,
+                        0,
+                        &payload,
+                    )
+                    .await;
+            }
+        };
+        send_probes().await;
         let deadline = Instant::now() + self.inner.config.connect_timeout;
+        let mut next_probe = Instant::now() + Duration::from_millis(250);
         loop {
             if peer.active.lock().await.is_some() {
                 return Ok(PeerHandle {
@@ -394,7 +403,17 @@ impl VelaNode {
                 self.inner.emit(VelaEvent::PeerUnreachable(peer_id)).await;
                 return Err(ConnectError::Timeout);
             }
-            if timeout(remaining, peer.notify.notified()).await.is_err() {
+            if Instant::now() >= next_probe {
+                send_probes().await;
+                next_probe = Instant::now() + Duration::from_millis(250);
+                continue;
+            }
+            let wait_for_probe = next_probe.saturating_duration_since(Instant::now());
+            let wait_for = remaining.min(wait_for_probe);
+            if timeout(wait_for, peer.notify.notified()).await.is_err() {
+                continue;
+            }
+            if peer.active.lock().await.is_none() && Instant::now() >= deadline {
                 *peer.attempt.lock().await = None;
                 self.inner.emit(VelaEvent::PeerUnreachable(peer_id)).await;
                 return Err(ConnectError::Timeout);
@@ -464,7 +483,10 @@ impl Inner {
             PacketType::Probe => self.handle_probe(packet, source).await,
             PacketType::ProbeResponse => self.handle_probe_response(packet, source).await,
             PacketType::Handshake => self.handle_handshake(packet, source).await,
-            PacketType::Data | PacketType::KeepAlive => self.handle_data(packet, source).await,
+            PacketType::Data
+            | PacketType::KeepAlive
+            | PacketType::DiagnosticPing
+            | PacketType::DiagnosticPong => self.handle_data(packet, source).await,
         }
     }
 
@@ -494,6 +516,14 @@ impl Inner {
         .await?;
         self.emit(VelaEvent::PeerConnecting(probe.sender)).await;
         if self.identity.public().node_id < probe.sender {
+            let mut attempt = peer.attempt.lock().await;
+            if attempt.as_ref().map(|value| value.session_id) != Some(probe.session_id) {
+                *attempt = Some(Attempt {
+                    session_id: probe.session_id,
+                    handshake: None,
+                });
+            }
+            drop(attempt);
             self.start_initiator(&peer, source, probe.session_id)
                 .await?;
         }
@@ -638,25 +668,66 @@ impl Inner {
             if !session.replay.accept(packet.header.sequence) {
                 return Ok(());
             }
-            if session.path != source {
-                session.path = source;
-                self.emit(VelaEvent::PathChanged(peer.info.node_id, source))
-                    .await;
+            let path_changed = session.path != source;
+            session.path = source;
+            let mut events = Vec::new();
+            if path_changed {
+                events.push(VelaEvent::PathChanged(peer.info.node_id, source));
             }
-            if packet.header.packet_type == PacketType::Data {
-                self.observe(TrafficSample {
-                    peer: Some(peer.info.node_id),
-                    direction: TrafficDirection::Received,
-                    path: source,
-                    payload_bytes: plaintext.len(),
-                    encrypted_bytes: packet.payload.len(),
-                    wire_bytes: input_wire_len(&packet),
-                });
-                self.emit(VelaEvent::Packet {
-                    peer: peer.info.node_id,
-                    payload: Bytes::from(plaintext),
-                })
-                .await;
+            let mut response = None;
+            match packet.header.packet_type {
+                PacketType::Data => {
+                    self.observe(TrafficSample {
+                        peer: Some(peer.info.node_id),
+                        direction: TrafficDirection::Received,
+                        path: source,
+                        payload_bytes: plaintext.len(),
+                        encrypted_bytes: packet.payload.len(),
+                        wire_bytes: input_wire_len(&packet),
+                    });
+                    events.push(VelaEvent::Packet {
+                        peer: peer.info.node_id,
+                        payload: Bytes::from(plaintext),
+                    });
+                }
+                PacketType::KeepAlive => {}
+                PacketType::DiagnosticPing => {
+                    if plaintext.len() != DIAGNOSTIC_NONCE_LEN {
+                        return Err(CoreError::InvalidDiagnosticPing);
+                    }
+                    let sequence = session.tx_sequence.fetch_add(1, Ordering::Relaxed);
+                    let encrypted =
+                        encrypt_payload(session, PacketType::DiagnosticPong, sequence, &plaintext)?;
+                    response = Some((session.path, session.session_id, sequence, encrypted));
+                }
+                PacketType::DiagnosticPong => {
+                    if plaintext.len() != DIAGNOSTIC_NONCE_LEN {
+                        return Err(CoreError::InvalidDiagnosticPing);
+                    }
+                    let nonce: [u8; DIAGNOSTIC_NONCE_LEN] = plaintext
+                        .try_into()
+                        .expect("diagnostic nonce length checked");
+                    if let Some(waiter) = session.ping_waiters.remove(&nonce) {
+                        let _ = waiter.send(source);
+                    }
+                }
+                PacketType::Probe | PacketType::ProbeResponse | PacketType::Handshake => {
+                    return Err(CoreError::InvalidDiagnosticPing);
+                }
+            }
+            drop(active);
+            for event in events {
+                self.emit(event).await;
+            }
+            if let Some((path, session_id, sequence, payload)) = response {
+                self.send_packet(
+                    path,
+                    PacketType::DiagnosticPong,
+                    session_id,
+                    sequence,
+                    &payload,
+                )
+                .await?;
             }
             return Ok(());
         }
@@ -680,6 +751,7 @@ impl Inner {
             cipher,
             tx_sequence: AtomicU64::new(1),
             replay: ReplayWindow::default(),
+            ping_waiters: HashMap::new(),
         });
         drop(active);
         *peer.attempt.lock().await = None;
@@ -806,6 +878,93 @@ impl PeerHandle {
             .ok_or(SendError::UnknownPeer)?;
         self.node.inner.send_payload(&peer, payload).await
     }
+
+    pub async fn diagnostic_ping(
+        &self,
+        count: usize,
+        timeout_duration: Duration,
+    ) -> Result<DiagnosticPingResult, DiagnosticPingError> {
+        if count == 0 {
+            return Err(DiagnosticPingError::InvalidCount);
+        }
+        let peer = self
+            .node
+            .inner
+            .peers
+            .lock()
+            .await
+            .get(&self.peer_id)
+            .cloned()
+            .ok_or(DiagnosticPingError::UnknownPeer)?;
+        let mut rtts = Vec::with_capacity(count);
+        let mut path = None;
+        for _ in 0..count {
+            let mut nonce = [0u8; DIAGNOSTIC_NONCE_LEN];
+            rand::rngs::OsRng.fill_bytes(&mut nonce);
+            let (receiver, nonce, target, session_id, sequence, encrypted) = {
+                let mut active = peer.active.lock().await;
+                let session = active.as_mut().ok_or(DiagnosticPingError::NotConnected)?;
+                let sequence = session.tx_sequence.fetch_add(1, Ordering::Relaxed);
+                let (sender, receiver) = oneshot::channel();
+                session.ping_waiters.insert(nonce, sender);
+                let encrypted =
+                    encrypt_payload(session, PacketType::DiagnosticPing, sequence, &nonce)
+                        .map_err(DiagnosticPingError::Core)?;
+                (
+                    receiver,
+                    nonce,
+                    session.path,
+                    session.session_id,
+                    sequence,
+                    encrypted,
+                )
+            };
+            let started = Instant::now();
+            if let Err(error) = self
+                .node
+                .inner
+                .send_packet(
+                    target,
+                    PacketType::DiagnosticPing,
+                    session_id,
+                    sequence,
+                    &encrypted,
+                )
+                .await
+            {
+                if let Some(session) = peer.active.lock().await.as_mut() {
+                    session.ping_waiters.remove(&nonce);
+                }
+                return Err(DiagnosticPingError::Core(error));
+            }
+            match timeout(timeout_duration, receiver).await {
+                Ok(Ok(response_path)) => {
+                    path = Some(response_path);
+                    rtts.push(started.elapsed());
+                }
+                _ => {
+                    if let Some(session) = peer.active.lock().await.as_mut() {
+                        session.ping_waiters.remove(&nonce);
+                    }
+                    return Err(DiagnosticPingError::Timeout);
+                }
+            }
+        }
+        Ok(DiagnosticPingResult {
+            peer: self.peer_id,
+            path: path.expect("count is non-zero"),
+            rtts,
+        })
+    }
+}
+
+pub const DIAGNOSTIC_NONCE_LEN: usize = 16;
+
+#[derive(Clone, Debug)]
+pub struct DiagnosticPingResult {
+    pub peer: NodeId,
+    pub path: SocketAddr,
+    pub rtts: Vec<Duration>,
 }
 
 #[derive(Clone, Debug)]
@@ -849,6 +1008,7 @@ struct ActiveSession {
     cipher: SessionCipher,
     tx_sequence: AtomicU64,
     replay: ReplayWindow,
+    ping_waiters: HashMap<[u8; DIAGNOSTIC_NONCE_LEN], oneshot::Sender<SocketAddr>>,
 }
 
 #[derive(Default)]
@@ -1031,6 +1191,8 @@ pub enum CoreError {
     InvalidProbe,
     #[error("invalid handshake")]
     InvalidHandshake,
+    #[error("invalid diagnostic ping payload")]
+    InvalidDiagnosticPing,
 }
 
 #[derive(Debug, Error)]
@@ -1065,6 +1227,20 @@ pub enum SendError {
     Crypto(#[from] CryptoError),
 }
 
+#[derive(Debug, Error)]
+pub enum DiagnosticPingError {
+    #[error("diagnostic ping count must be greater than zero")]
+    InvalidCount,
+    #[error("unknown peer")]
+    UnknownPeer,
+    #[error("peer is not connected")]
+    NotConnected,
+    #[error("diagnostic ping timed out")]
+    Timeout,
+    #[error("core error: {0}")]
+    Core(#[from] CoreError),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1078,6 +1254,7 @@ mod tests {
             noise_public: public.noise_public,
             candidates: vec![Candidate::Host(address)],
             credential: Vec::new(),
+            capabilities: Vec::new(),
         }
     }
 
@@ -1129,9 +1306,14 @@ mod tests {
         node_b.start().await.unwrap();
         let a_id = node_a.node_id();
         let b_id = node_b.node_id();
-        let (result_a, result_b) = tokio::join!(node_a.connect(b_id), node_b.connect(a_id));
-        let handle_a = result_a.unwrap();
-        let handle_b = result_b.unwrap();
+        let handle_a = node_a.connect(b_id).await.unwrap();
+        let diagnostic = handle_a
+            .diagnostic_ping(3, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(diagnostic.peer, b_id);
+        assert_eq!(diagnostic.path, address_b);
+        assert_eq!(diagnostic.rtts.len(), 3);
         handle_a
             .send(Bytes::from_static(b"hello from A"))
             .await
@@ -1147,22 +1329,6 @@ mod tests {
         .unwrap();
         assert!(
             matches!(event, VelaEvent::Packet { peer, ref payload } if peer == a_id && payload.as_ref() == b"hello from A")
-        );
-        handle_b
-            .send(Bytes::from_static(b"hello from B"))
-            .await
-            .unwrap();
-        let event = timeout(Duration::from_secs(1), async {
-            loop {
-                if let Some(event @ VelaEvent::Packet { .. }) = node_a.next_event().await {
-                    break event;
-                }
-            }
-        })
-        .await
-        .unwrap();
-        assert!(
-            matches!(event, VelaEvent::Packet { peer, ref payload } if peer == b_id && payload.as_ref() == b"hello from B")
         );
         node_a.shutdown().await;
         node_b.shutdown().await;

@@ -9,7 +9,9 @@ use thiserror::Error;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use url::Url;
 use vela_crypto::{Identity, MembershipCredential};
-use vela_proto::{Candidate, ControlMessage, NodeId, PeerInfo};
+use vela_proto::{
+    Candidate, ControlMessage, NodeId, PeerCapability, PeerInfo, PeerSummary, PublicPeerInfo,
+};
 
 type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -63,6 +65,7 @@ impl CoordinationClient {
             credential,
             invite_token: token.map(str::to_owned),
             candidates,
+            capabilities: vec![PeerCapability::DiagnosticPing],
         })
         .await?;
         match self.recv().await? {
@@ -80,9 +83,8 @@ impl CoordinationClient {
                     .map_err(|_| CoordClientError::InvalidCredential)?;
                 let peers = peers
                     .into_iter()
-                    .map(PeerInfo::try_from)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(CoordClientError::Protocol)?;
+                    .map(|peer| self.verify_public_peer(peer))
+                    .collect::<Result<Vec<_>, _>>()?;
                 Ok(Registration { credential, peers })
             }
             ControlMessage::Error { code, message } => {
@@ -102,17 +104,36 @@ impl CoordinationClient {
 
     pub async fn lookup_peer(&mut self, node_id: NodeId) -> Result<PeerInfo, CoordClientError> {
         self.send(ControlMessage::LookupPeer { node_id }).await?;
-        match self.recv().await? {
-            ControlMessage::PeerInfo { peer } => {
-                let peer = PeerInfo::try_from(peer).map_err(CoordClientError::Protocol)?;
-                self.verify_peer_credential(&peer)?;
-                Ok(peer)
+        loop {
+            match self.recv().await? {
+                ControlMessage::PeerInfo { peer } => return self.verify_public_peer(peer),
+                ControlMessage::Error { code, message } => {
+                    return Err(CoordClientError::Server { code, message });
+                }
+                ControlMessage::ConnectSignal { .. } => {}
+                _ => return Err(CoordClientError::UnexpectedMessage),
             }
-            ControlMessage::Error { code, message } => {
-                Err(CoordClientError::Server { code, message })
-            }
-            _ => Err(CoordClientError::UnexpectedMessage),
         }
+    }
+
+    pub async fn list_peers(&mut self) -> Result<Vec<PeerSummary>, CoordClientError> {
+        self.send(ControlMessage::ListPeers).await?;
+        loop {
+            match self.recv().await? {
+                ControlMessage::ListPeersOk { peers } => return Ok(peers),
+                ControlMessage::Error { code, message } => {
+                    return Err(CoordClientError::Server { code, message });
+                }
+                ControlMessage::ConnectSignal { .. } => {}
+                _ => return Err(CoordClientError::UnexpectedMessage),
+            }
+        }
+    }
+
+    pub fn verify_public_peer(&self, peer: PublicPeerInfo) -> Result<PeerInfo, CoordClientError> {
+        let peer = PeerInfo::try_from(peer).map_err(CoordClientError::Protocol)?;
+        self.verify_peer_credential(&peer)?;
+        Ok(peer)
     }
 
     pub async fn send(&mut self, message: ControlMessage) -> Result<(), CoordClientError> {
@@ -127,10 +148,22 @@ impl CoordinationClient {
         loop {
             match self.reader.next().await {
                 Some(Ok(Message::Text(text))) => {
-                    return serde_json::from_str(&text).map_err(CoordClientError::Serialization);
+                    let message =
+                        serde_json::from_str(&text).map_err(CoordClientError::Serialization)?;
+                    if let ControlMessage::Ping { nonce } = message {
+                        self.send(ControlMessage::Pong { nonce }).await?;
+                        continue;
+                    }
+                    return Ok(message);
                 }
                 Some(Ok(Message::Binary(bytes))) => {
-                    return serde_json::from_slice(&bytes).map_err(CoordClientError::Serialization);
+                    let message =
+                        serde_json::from_slice(&bytes).map_err(CoordClientError::Serialization)?;
+                    if let ControlMessage::Ping { nonce } = message {
+                        self.send(ControlMessage::Pong { nonce }).await?;
+                        continue;
+                    }
+                    return Ok(message);
                 }
                 Some(Ok(Message::Ping(payload))) => {
                     self.writer

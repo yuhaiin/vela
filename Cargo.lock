@@ -1771,9 +1771,12 @@ name = "vela-cli"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "serde_json",
  "tokio",
  "vela-coord",
  "vela-crypto",
+ "vela-diagnostic",
+ "vela-proto",
 ]
 
 [[package]]
@@ -1847,6 +1850,21 @@ dependencies = [
  "thiserror",
  "vela-proto",
  "x25519-dalek",
+]
+
+[[package]]
+name = "vela-diagnostic"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "vela-coord-client",
+ "vela-core",
+ "vela-crypto",
+ "vela-proto",
+ "vela-stun",
 ]
 
 [[package]]
