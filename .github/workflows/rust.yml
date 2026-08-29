@@ -1,0 +1,228 @@
+name: Rust
+
+on:
+  push:
+    branches: [main]
+    tags: [v*]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  checks:
+    name: Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  build:
+    name: Build ${{ matrix.platform }} ${{ matrix.arch }}
+    needs: checks
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            arch: amd64
+            target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - platform: linux
+            arch: arm64
+            target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+          - platform: darwin
+            arch: amd64
+            target: x86_64-apple-darwin
+            runner: macos-14
+          - platform: darwin
+            arch: arm64
+            target: aarch64-apple-darwin
+            runner: macos-14
+          - platform: windows
+            arch: amd64
+            target: x86_64-pc-windows-msvc
+            runner: windows-latest
+          - platform: windows
+            arch: arm64
+            target: aarch64-pc-windows-msvc
+            runner: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install musl cross toolchain
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "${{ matrix.arch }}" in
+            amd64)
+              toolchain_target="x86_64-unknown-linux-musl"
+              toolchain_sha256="5f20e367608d6e547c04534d37d00ecedbaa0c2e82730df12957b3332fa36a2d"
+              ;;
+            arm64)
+              toolchain_target="aarch64-unknown-linux-musl"
+              toolchain_sha256="90282c463498dcdab9b96a464a0925d53f30c884b2d7b25e3998999416ae34b8"
+              ;;
+            *)
+              echo "unsupported Linux release architecture: ${{ matrix.arch }}" >&2
+              exit 1
+              ;;
+          esac
+
+          archive="${RUNNER_TEMP}/${toolchain_target}.tar.xz"
+          url="https://github.com/cross-tools/musl-cross/releases/download/20260515/${toolchain_target}.tar.xz"
+          curl --fail --location --retry 3 --output "${archive}" "${url}"
+          echo "${toolchain_sha256}  ${archive}" | sha256sum --check
+          tar --extract --xz --file "${archive}" --directory "${RUNNER_TEMP}"
+
+          toolchain_root="${RUNNER_TEMP}/${toolchain_target}"
+          compiler="${toolchain_root}/bin/${toolchain_target}-gcc"
+          archiver="${toolchain_root}/bin/${toolchain_target}-ar"
+          target_env="$(echo "${{ matrix.target }}" | tr '[:lower:]-' '[:upper:]_')"
+          test -x "${compiler}"
+          test -x "${archiver}"
+
+          echo "${toolchain_root}/bin" >> "${GITHUB_PATH}"
+          {
+            echo "CARGO_TARGET_${target_env}_LINKER=${compiler}"
+            echo "CC_${target_env}=${compiler}"
+            echo "AR_${target_env}=${archiver}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target "${{ matrix.target }}" -p vela-cli
+          mkdir -p dist
+          source_binary="target/${{ matrix.target }}/release/vela-cli${{ matrix.platform == 'windows' && '.exe' || '' }}"
+          release_binary="dist/vela-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.platform == 'windows' && '.exe' || '' }}"
+          test -f "${source_binary}"
+          cp "${source_binary}" "${release_binary}"
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: vela-${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist/vela-*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish release
+    if: github.ref_type == 'tag' || (github.ref_type == 'branch' && github.ref_name == 'main')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source and tags
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Download release binaries
+        uses: actions/download-artifact@v7
+        with:
+          pattern: vela-*
+          path: artifacts
+
+      - name: Assemble release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find artifacts -type f -name 'vela-*' -exec cp '{}' release/ ';'
+
+          expected=(
+            vela-linux-amd64
+            vela-linux-arm64
+            vela-darwin-amd64
+            vela-darwin-arm64
+            vela-windows-amd64.exe
+            vela-windows-arm64.exe
+          )
+          for file in "${expected[@]}"; do
+            test -f "release/${file}"
+          done
+
+          (
+            cd release
+            sha256sum -- * | sort -k2
+          ) > release/checksums.txt
+
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            previous_tag=$(git describe --tags --match 'v*' --abbrev=0 HEAD^ 2>/dev/null || true)
+          else
+            previous_tag=$(git describe --tags --match 'v*' --abbrev=0 HEAD 2>/dev/null || true)
+          fi
+          if [[ -n "${previous_tag}" ]]; then
+            git log "${previous_tag}..HEAD" --oneline > release_notes.txt
+          else
+            git log HEAD --oneline > release_notes.txt
+          fi
+
+      - name: Update rolling main tag
+        if: github.ref_type == 'branch' && github.ref_name == 'main'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git tag -f main "${GITHUB_SHA}"
+          git push origin refs/tags/main --force
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          body_path: release_notes.txt
+          tag_name: ${{ github.ref_type == 'branch' && github.ref_name == 'main' && 'main' || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ github.ref_type == 'branch' && github.ref_name == 'main' && format('main-{0}', github.sha) || github.ref_name }}
+          draft: false
+          overwrite_files: true
+          make_latest: ${{ github.ref_type == 'tag' && !contains(github.ref_name, 'beta') && !contains(github.ref_name, 'alpha') }}
+          prerelease: ${{ github.ref_type == 'branch' && github.ref_name == 'main' || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
+          files: |
+            release/*
+            release_notes.txt
