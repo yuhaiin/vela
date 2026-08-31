@@ -207,29 +207,10 @@ async fn run_peer_command(args: &[String]) -> Result<(), Box<dyn std::error::Err
                 })?;
                 let routes = vela_tun::RouteManager::for_tun(&tun).await?;
                 routes.set_mtu(mtu).await?;
-                let local_peer = snapshot
-                    .peers
-                    .iter()
-                    .find(|value| value.node_id == peer.node_id())
-                    .ok_or("snapshot does not contain this node")?;
-                if let (Some(address), Some(cidr)) =
-                    (local_peer.virtual_ipv4, snapshot.virtual_ipv4)
-                {
-                    routes
-                        .add_local_address(address.into(), cidr.prefix_len)
-                        .await?;
-                }
-                if let (Some(address), Some(cidr)) =
-                    (local_peer.virtual_ipv6, snapshot.virtual_ipv6)
-                {
-                    routes
-                        .add_local_address(address.into(), cidr.prefix_len)
-                        .await?;
-                }
-                let _leases =
-                    vela_tun::install_snapshot_routes(&routes, &snapshot, peer.node_id()).await?;
+                let mut leases = Vec::new();
+                apply_tun_snapshot(&peer, &routes, &mut leases, &snapshot).await?;
                 println!("peer {} up on TUN {}", peer.node_id(), tun.name());
-                run_tun_peer(peer, tun, routes, _leases).await?;
+                run_tun_peer(peer, tun, routes, leases).await?;
             }
         }
         "list" => {
@@ -315,6 +296,35 @@ async fn run_peer_command(args: &[String]) -> Result<(), Box<dyn std::error::Err
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+async fn apply_tun_snapshot(
+    peer: &DiagnosticPeer,
+    routes: &vela_tun::RouteManager,
+    leases: &mut Vec<vela_tun::RouteLease>,
+    snapshot: &vela_proto::NetworkSnapshot,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for lease in leases.drain(..) {
+        let _ = lease.release().await;
+    }
+    let local = snapshot
+        .peers
+        .iter()
+        .find(|value| value.node_id == peer.node_id())
+        .ok_or("snapshot does not contain this node")?;
+    if let (Some(address), Some(cidr)) = (local.virtual_ipv4, snapshot.virtual_ipv4) {
+        routes
+            .add_local_address(address.into(), cidr.prefix_len)
+            .await?;
+    }
+    if let (Some(address), Some(cidr)) = (local.virtual_ipv6, snapshot.virtual_ipv6) {
+        routes
+            .add_local_address(address.into(), cidr.prefix_len)
+            .await?;
+    }
+    *leases = vela_tun::install_snapshot_routes(routes, snapshot, peer.node_id()).await?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 async fn run_tun_peer(
     mut peer: DiagnosticPeer,
     tun: vela_tun::TunDevice,
@@ -323,6 +333,9 @@ async fn run_tun_peer(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let node = peer.node.clone();
     let mut refresh = tokio::time::interval(Duration::from_secs(60));
+    let mut control_connected = true;
+    let mut reconnect_backoff = Duration::from_secs(1);
+    let mut reconnect_sleep = Box::pin(tokio::time::sleep(Duration::ZERO));
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     loop {
@@ -346,38 +359,45 @@ async fn run_tun_peer(
                     None => return Err("Vela node stopped".into()),
                 }
             }
-            message = peer.client.recv() => {
-                match message? {
-                    vela_proto::ControlMessage::ConnectSignal { from, to } if to == peer.node_id() => {
+            message = peer.client.recv(), if control_connected => {
+                match message {
+                    Ok(vela_proto::ControlMessage::ConnectSignal { from, to }) if to == peer.node_id() => {
                         let info = peer.client.verify_public_peer(from)?;
                         node.register_peer(info).await?;
                     }
-                    vela_proto::ControlMessage::Snapshot { snapshot } => {
-                        if peer.apply_snapshot(snapshot.clone()).await? {
-                            peer.refresh_candidates().await?;
+                    Ok(vela_proto::ControlMessage::Snapshot { snapshot }) => {
+                        let refresh_candidates = peer.apply_snapshot(snapshot.clone()).await?;
+                        apply_tun_snapshot(&peer, &routes, &mut leases, &snapshot).await?;
+                        if refresh_candidates {
+                            if let Err(error) = peer.refresh_candidates().await {
+                                if !DiagnosticPeer::is_retryable_control_error(&error) {
+                                    return Err(error.into());
+                                }
+                                tracing::warn!(error = %error, "coordination refresh failed; retrying");
+                                control_connected = false;
+                                reconnect_sleep.as_mut().reset(
+                                    tokio::time::Instant::now() + reconnect_backoff,
+                                );
+                            }
                         }
-                        for lease in leases.drain(..) {
-                            let _ = lease.release().await;
-                        }
-                        let local = snapshot
-                            .peers
-                            .iter()
-                            .find(|value| value.node_id == peer.node_id())
-                            .ok_or("snapshot does not contain this node")?;
-                        if let (Some(address), Some(cidr)) = (local.virtual_ipv4, snapshot.virtual_ipv4) {
-                            routes.add_local_address(address.into(), cidr.prefix_len).await?;
-                        }
-                        if let (Some(address), Some(cidr)) = (local.virtual_ipv6, snapshot.virtual_ipv6) {
-                            routes.add_local_address(address.into(), cidr.prefix_len).await?;
-                        }
-                        leases = vela_tun::install_snapshot_routes(&routes, &snapshot, peer.node_id()).await?;
                     }
-                    vela_proto::ControlMessage::Revoke { node_id } if node_id == peer.node_id() => {
+                    Ok(vela_proto::ControlMessage::Revoke { node_id }) if node_id == peer.node_id() => {
                         for lease in leases.drain(..) {
                             let _ = lease.release().await;
                         }
                         peer.node.shutdown().await;
                         return Err("peer membership was revoked".into());
+                    }
+                    Err(error) => {
+                        let error = vela_diagnostic::DiagnosticError::Coordination(error);
+                        if !DiagnosticPeer::is_retryable_control_error(&error) {
+                            return Err(error.into());
+                        }
+                        tracing::warn!(error = %error, "coordination connection lost; retrying");
+                        control_connected = false;
+                        reconnect_sleep.as_mut().reset(
+                            tokio::time::Instant::now() + reconnect_backoff,
+                        );
                     }
                     _ => {}
                 }
@@ -387,9 +407,37 @@ async fn run_tun_peer(
                 release_route_leases(&mut leases).await;
                 return Ok(());
             }
-            tick = refresh.tick() => {
+            tick = refresh.tick(), if control_connected => {
                 let _ = tick;
-                peer.refresh_candidates().await?;
+                if let Err(error) = peer.refresh_candidates().await {
+                    if !DiagnosticPeer::is_retryable_control_error(&error) {
+                        return Err(error.into());
+                    }
+                    tracing::warn!(error = %error, "coordination refresh failed; retrying");
+                    control_connected = false;
+                    reconnect_sleep.as_mut().reset(
+                        tokio::time::Instant::now() + reconnect_backoff,
+                    );
+                }
+            }
+            _ = &mut reconnect_sleep, if !control_connected => {
+                match peer.reconnect().await {
+                    Ok(snapshot) => {
+                        apply_tun_snapshot(&peer, &routes, &mut leases, &snapshot).await?;
+                        control_connected = true;
+                        reconnect_backoff = Duration::from_secs(1);
+                    }
+                    Err(error) if DiagnosticPeer::is_retryable_control_error(&error) => {
+                        tracing::warn!(error = %error, backoff = ?reconnect_backoff, "coordination reconnect failed");
+                        reconnect_sleep.as_mut().reset(
+                            tokio::time::Instant::now() + reconnect_backoff,
+                        );
+                        reconnect_backoff = reconnect_backoff
+                            .saturating_mul(2)
+                            .min(Duration::from_secs(30));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             }
         }
     }

@@ -34,6 +34,44 @@ async fn client_registers_with_invite_and_verifies_server_credential() {
 }
 
 #[tokio::test]
+async fn client_reconnects_and_reregisters_with_existing_credential() {
+    let base = std::env::temp_dir().join(format!(
+        "vela-coord-client-reconnect-test-{}",
+        std::process::id()
+    ));
+    let db = base.with_extension("db");
+    let signer = base.with_extension("key");
+    let server = CoordServer::open(&db, &signer, "integration").unwrap();
+    let token = server.create_invite(60).unwrap();
+    let server_key = server.server_public_key();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server_task = tokio::spawn(async move { server.serve(listener).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let mut client = CoordinationClient::connect(format!("ws://{address}/ws"))
+        .await
+        .unwrap();
+    client.trust_server_key(server_key);
+    let identity = Identity::generate();
+    let registration = client
+        .register(&identity, Some(&token), None, Vec::new())
+        .await
+        .unwrap();
+
+    let reconnected = client
+        .reconnect(&identity, Some(&registration.credential), Vec::new(), &[])
+        .await
+        .unwrap();
+    assert_eq!(reconnected.credential.node_id, identity.public().node_id);
+    assert_eq!(reconnected.credential.tenant, "integration");
+
+    server_task.abort();
+    let _ = std::fs::remove_file(db);
+    let _ = std::fs::remove_file(signer);
+}
+
+#[tokio::test]
 async fn clients_discover_online_peers_and_receive_connect_signal() {
     let base = std::env::temp_dir().join(format!(
         "vela-coord-client-discovery-test-{}",

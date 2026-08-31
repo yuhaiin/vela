@@ -605,10 +605,11 @@ impl VelaNode {
             let mut peers = self.inner.peers.lock().await;
             let previous = peers.insert(peer_id, replacement);
             if let Some(previous) = &previous {
-                if let Some(address) = previous.info.virtual_ipv4 {
+                let previous_info = previous.info();
+                if let Some(address) = previous_info.virtual_ipv4 {
                     routes.remove(&IpAddr::V4(address));
                 }
-                if let Some(address) = previous.info.virtual_ipv6 {
+                if let Some(address) = previous_info.virtual_ipv6 {
                     routes.remove(&IpAddr::V6(address));
                 }
             }
@@ -618,11 +619,14 @@ impl VelaNode {
             previous
         };
         if let Some(previous) = previous {
+            let previous_info = previous.info();
             let disconnected = previous.active.lock().await.take().is_some();
             *previous.attempt.lock().await = None;
             previous.queue.lock().await.clear();
             if disconnected {
-                self.inner.emit(VelaEvent::PeerDisconnected(peer_id)).await;
+                self.inner
+                    .emit(VelaEvent::PeerDisconnected(previous_info.node_id))
+                    .await;
             }
         }
         Ok(())
@@ -636,10 +640,11 @@ impl VelaNode {
             let Some(peer) = peers.remove(&peer_id) else {
                 return Ok(false);
             };
-            if let Some(address) = peer.info.virtual_ipv4 {
+            let peer_info = peer.info();
+            if let Some(address) = peer_info.virtual_ipv4 {
                 routes.remove(&IpAddr::V4(address));
             }
-            if let Some(address) = peer.info.virtual_ipv6 {
+            if let Some(address) = peer_info.virtual_ipv6 {
                 routes.remove(&IpAddr::V6(address));
             }
             peer
@@ -690,21 +695,33 @@ impl VelaNode {
         let local_ipv4 = local.virtual_ipv4;
         let local_ipv6 = local.virtual_ipv6;
 
+        let old_peers = self.inner.peers.lock().await.clone();
         let mut replacement = HashMap::with_capacity(snapshot.peers.len().saturating_sub(1));
+        let mut reused = std::collections::HashSet::new();
         for info in snapshot.peers {
             validate_peer_info(&info)?;
             validate_peer_membership(&info, self.inner.config.server_public_key)?;
             if info.node_id != self.node_id() {
+                if let Some(peer) = old_peers.get(&info.node_id) {
+                    let previous_info = peer.info();
+                    if can_retain_session(&previous_info, &info) {
+                        peer.update_info(info.clone());
+                        reused.insert(info.node_id);
+                        replacement.insert(info.node_id, peer.clone());
+                        continue;
+                    }
+                }
                 replacement.insert(info.node_id, Arc::new(PeerState::new(info)));
             }
         }
         let mut routes = RouteTable::new(local_addresses);
         for peer in replacement.values() {
-            if let Some(address) = peer.info.virtual_ipv4 {
-                routes.insert(IpAddr::V4(address), peer.info.node_id);
+            let peer_info = peer.info();
+            if let Some(address) = peer_info.virtual_ipv4 {
+                routes.insert(IpAddr::V4(address), peer_info.node_id);
             }
-            if let Some(address) = peer.info.virtual_ipv6 {
-                routes.insert(IpAddr::V6(address), peer.info.node_id);
+            if let Some(address) = peer_info.virtual_ipv6 {
+                routes.insert(IpAddr::V6(address), peer_info.node_id);
             }
         }
 
@@ -727,12 +744,16 @@ impl VelaNode {
             .snapshot_expires_at
             .store(snapshot.expires_at, Ordering::Release);
         for peer in old_peers {
+            let peer_info = peer.info();
+            if reused.contains(&peer_info.node_id) {
+                continue;
+            }
             let disconnected = peer.active.lock().await.take().is_some();
             *peer.attempt.lock().await = None;
             peer.queue.lock().await.clear();
             if disconnected {
                 self.inner
-                    .emit(VelaEvent::PeerDisconnected(peer.info.node_id))
+                    .emit(VelaEvent::PeerDisconnected(peer_info.node_id))
                     .await;
             }
         }
@@ -837,7 +858,7 @@ impl VelaNode {
             });
         }
         self.inner.emit(VelaEvent::PeerConnecting(peer_id)).await;
-        let candidates = peer.info.candidates.clone();
+        let candidates = peer.info().candidates;
         if candidates.is_empty() {
             return Err(ConnectError::NoCandidates);
         }
@@ -966,11 +987,12 @@ impl Inner {
                 _ = interval.tick() => {
                     let peers = self.peers.lock().await.values().cloned().collect::<Vec<_>>();
                     for peer in peers {
+                        let peer_info = peer.info();
                         let membership_expired = self
                             .config
                             .server_public_key
                             .is_some_and(|server_key| {
-                                validate_peer_membership(&peer.info, Some(server_key)).is_err()
+                                validate_peer_membership(&peer_info, Some(server_key)).is_err()
                             });
                         if unix_time() >= self.snapshot_expires_at.load(Ordering::Acquire)
                             || membership_expired
@@ -979,7 +1001,7 @@ impl Inner {
                             *peer.attempt.lock().await = None;
                             peer.queue.lock().await.clear();
                             if disconnected {
-                                self.emit(VelaEvent::PeerDisconnected(peer.info.node_id)).await;
+                                self.emit(VelaEvent::PeerDisconnected(peer_info.node_id)).await;
                             }
                             continue;
                         }
@@ -1005,7 +1027,7 @@ impl Inner {
                         }
                         if let Some(path) = rekey_path {
                             *peer.attempt.lock().await = None;
-                            if self.identity.public().node_id < peer.info.node_id {
+                            if self.identity.public().node_id < peer_info.node_id {
                                 let session_id = random_session_id();
                                 *peer.attempt.lock().await = Some(Attempt {
                                     session_id,
@@ -1042,8 +1064,9 @@ impl Inner {
             return Err(CoreError::InvalidProbe);
         }
         let peer = self.peer_for(probe.sender).await?;
-        validate_peer_membership(&peer.info, self.config.server_public_key)?;
-        verify_probe(&probe, &peer.info)?;
+        let peer_info = peer.info();
+        validate_peer_membership(&peer_info, self.config.server_public_key)?;
+        verify_probe(&probe, &peer_info)?;
         let payload = encode_probe(
             self.identity.public().node_id,
             probe.sender,
@@ -1091,8 +1114,9 @@ impl Inner {
             return Err(CoreError::InvalidProbe);
         }
         let peer = self.peer_for(probe.sender).await?;
-        validate_peer_membership(&peer.info, self.config.server_public_key)?;
-        verify_probe(&probe, &peer.info)?;
+        let peer_info = peer.info();
+        validate_peer_membership(&peer_info, self.config.server_public_key)?;
+        verify_probe(&probe, &peer_info)?;
         let attempt = peer.attempt.lock().await;
         if attempt.as_ref().map(|value| value.session_id) != Some(probe.session_id) {
             return Ok(());
@@ -1124,7 +1148,8 @@ impl Inner {
         if attempt_value.handshake.is_some() {
             return Ok(());
         }
-        let mut handshake = NoiseHandshake::initiator(&self.identity, &peer.info.noise_public)?;
+        let peer_info = peer.info();
+        let mut handshake = NoiseHandshake::initiator(&self.identity, &peer_info.noise_public)?;
         let message = handshake.write_message(&self.handshake_context().await?)?;
         attempt_value.handshake = Some(handshake);
         drop(attempt);
@@ -1134,7 +1159,7 @@ impl Inner {
         payload.extend_from_slice(&message);
         self.send_packet(path, PacketType::Handshake, session_id, 0, &payload)
             .await?;
-        self.emit(VelaEvent::PeerConnecting(peer.info.node_id))
+        self.emit(VelaEvent::PeerConnecting(peer_info.node_id))
             .await;
         Ok(())
     }
@@ -1150,7 +1175,8 @@ impl Inner {
         let role = packet.payload[0];
         let sender = NodeId::new(packet.payload[1..33].try_into().expect("checked sender"));
         let peer = self.peer_for(sender).await?;
-        validate_peer_membership(&peer.info, self.config.server_public_key)?;
+        let peer_info = peer.info();
+        validate_peer_membership(&peer_info, self.config.server_public_key)?;
         if peer.active.lock().await.is_some() {
             return Ok(());
         }
@@ -1160,7 +1186,7 @@ impl Inner {
             }
             let mut handshake = NoiseHandshake::responder(&self.identity)?;
             let context = handshake.read_message(&packet.payload[33..])?;
-            self.validate_handshake_context(&context, sender, &peer.info)
+            self.validate_handshake_context(&context, sender, &peer_info)
                 .await?;
             let response = handshake.write_message(&self.handshake_context().await?)?;
             let keys = handshake.into_session()?;
@@ -1191,7 +1217,7 @@ impl Inner {
                 return Ok(());
             };
             let context = handshake.read_message(&packet.payload[33..])?;
-            self.validate_handshake_context(&context, sender, &peer.info)
+            self.validate_handshake_context(&context, sender, &peer_info)
                 .await?;
             let keys = handshake.into_session()?;
             drop(attempt);
@@ -1210,6 +1236,7 @@ impl Inner {
             .cloned()
             .collect::<Vec<_>>();
         for peer in peers {
+            let peer_info = peer.info();
             let mut active = peer.active.lock().await;
             let Some(session) = active.as_mut() else {
                 continue;
@@ -1218,12 +1245,12 @@ impl Inner {
                 continue;
             }
             if let Some(server_key) = self.config.server_public_key {
-                if validate_peer_membership(&peer.info, Some(server_key)).is_err() {
+                if validate_peer_membership(&peer_info, Some(server_key)).is_err() {
                     active.take();
                     drop(active);
                     *peer.attempt.lock().await = None;
                     peer.queue.lock().await.clear();
-                    self.emit(VelaEvent::PeerDisconnected(peer.info.node_id))
+                    self.emit(VelaEvent::PeerDisconnected(peer_info.node_id))
                         .await;
                     return Err(CoreError::PeerCredentialExpired);
                 }
@@ -1240,7 +1267,7 @@ impl Inner {
             session.path = source;
             let mut events = Vec::new();
             if path_changed {
-                events.push(VelaEvent::PathChanged(peer.info.node_id, source));
+                events.push(VelaEvent::PathChanged(peer_info.node_id, source));
             }
             let mut response = None;
             match packet.header.packet_type {
@@ -1253,7 +1280,7 @@ impl Inner {
                         )));
                     }
                     self.observe(TrafficSample {
-                        peer: Some(peer.info.node_id),
+                        peer: Some(peer_info.node_id),
                         direction: TrafficDirection::Received,
                         path: source,
                         payload_bytes: ip_packet.as_bytes().len(),
@@ -1261,7 +1288,7 @@ impl Inner {
                         wire_bytes: input_wire_len(&packet),
                     });
                     events.push(VelaEvent::IpPacket {
-                        peer: peer.info.node_id,
+                        peer: peer_info.node_id,
                         packet: ip_packet,
                     });
                 }
@@ -1333,7 +1360,8 @@ impl Inner {
         drop(active);
         *peer.attempt.lock().await = None;
         peer.notify.notify_waiters();
-        self.emit(VelaEvent::PeerConnected(peer.info.node_id)).await;
+        let peer_id = peer.info().node_id;
+        self.emit(VelaEvent::PeerConnected(peer_id)).await;
         self.flush_queue(peer).await;
     }
 
@@ -1350,7 +1378,7 @@ impl Inner {
     async fn send_payload(&self, peer: &Arc<PeerState>, payload: Bytes) -> Result<(), SendError> {
         if unix_time() >= self.snapshot_expires_at.load(Ordering::Acquire) {
             if peer.active.lock().await.take().is_some() {
-                self.emit(VelaEvent::PeerDisconnected(peer.info.node_id))
+                self.emit(VelaEvent::PeerDisconnected(peer.info().node_id))
                     .await;
             }
             *peer.attempt.lock().await = None;
@@ -1364,7 +1392,7 @@ impl Inner {
             .await
             .validate_outbound(&packet)
             .map_err(SendError::Ip)?;
-        if routed_peer != peer.info.node_id {
+        if routed_peer != peer.info().node_id {
             return Err(SendError::WrongPeer);
         }
         if packet.as_bytes().len() > self.config.virtual_mtu {
@@ -1410,7 +1438,7 @@ impl Inner {
             .tx_bytes
             .fetch_add(payload.len() as u64, Ordering::Relaxed);
         self.observe(TrafficSample {
-            peer: Some(peer.info.node_id),
+            peer: Some(peer.info().node_id),
             direction: TrafficDirection::Sent,
             path: session.path,
             payload_bytes: payload.len(),
@@ -1624,7 +1652,7 @@ pub enum VelaEvent {
 }
 
 struct PeerState {
-    info: PeerInfo,
+    info: StdMutex<PeerInfo>,
     connect: Mutex<()>,
     attempt: Mutex<Option<Attempt>>,
     active: Mutex<Option<ActiveSession>>,
@@ -1635,7 +1663,7 @@ struct PeerState {
 impl PeerState {
     fn new(info: PeerInfo) -> Self {
         Self {
-            info,
+            info: StdMutex::new(info),
             connect: Mutex::new(()),
             attempt: Mutex::new(None),
             active: Mutex::new(None),
@@ -1643,6 +1671,28 @@ impl PeerState {
             queue: Mutex::new(VecDeque::new()),
         }
     }
+
+    fn info(&self) -> PeerInfo {
+        self.info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn update_info(&self, info: PeerInfo) {
+        *self
+            .info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = info;
+    }
+}
+
+fn can_retain_session(previous: &PeerInfo, next: &PeerInfo) -> bool {
+    previous.node_id == next.node_id
+        && previous.signing_public == next.signing_public
+        && previous.noise_public == next.noise_public
+        && previous.virtual_ipv4 == next.virtual_ipv4
+        && previous.virtual_ipv6 == next.virtual_ipv6
 }
 
 struct Attempt {
@@ -2159,6 +2209,38 @@ mod tests {
         assert_eq!(diagnostic.peer, b_id);
         assert_eq!(diagnostic.path, address_b);
         assert_eq!(diagnostic.rtts.len(), 3);
+
+        node_a
+            .apply_snapshot(NetworkSnapshot {
+                network_id: [0; 16],
+                generation: 1,
+                virtual_ipv4: Some(Ipv4Cidr {
+                    address: Ipv4Addr::new(10, 254, 0, 0),
+                    prefix_len: 16,
+                }),
+                virtual_ipv6: None,
+                doh_servers: Vec::new(),
+                stun_servers: Vec::new(),
+                peers: vec![
+                    peer_info(&identity_a, address_a, Ipv4Addr::new(10, 254, 0, 1)),
+                    peer_info(
+                        &identity_b,
+                        "127.0.0.1:45103".parse().unwrap(),
+                        Ipv4Addr::new(10, 254, 0, 2),
+                    ),
+                ],
+                expires_at: u64::MAX,
+                signature: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let diagnostic_after_snapshot = handle_a
+            .diagnostic_ping(1, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(diagnostic_after_snapshot.peer, b_id);
+        assert_eq!(diagnostic_after_snapshot.path, address_b);
+
         let mut packet = vec![0u8; 20 + 12];
         packet[0] = 0x45;
         let packet_len = packet.len() as u16;

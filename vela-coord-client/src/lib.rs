@@ -21,6 +21,7 @@ use vela_proto::{
 type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 pub struct CoordinationClient {
+    endpoint: String,
     writer: SplitSink<Ws, Message>,
     reader: SplitStream<Ws>,
     server_public_key: Option<[u8; 32]>,
@@ -42,7 +43,8 @@ impl CoordinationClient {
         endpoint: impl AsRef<str>,
         doh_servers: &[String],
     ) -> Result<Self, CoordClientError> {
-        let url = Url::parse(endpoint.as_ref()).map_err(|_| CoordClientError::InvalidEndpoint)?;
+        let endpoint = endpoint.as_ref().to_owned();
+        let url = Url::parse(&endpoint).map_err(|_| CoordClientError::InvalidEndpoint)?;
         if !matches!(url.scheme(), "ws" | "wss") {
             return Err(CoordClientError::InvalidEndpoint);
         }
@@ -66,10 +68,11 @@ impl CoordinationClient {
                     continue;
                 }
             };
-            match client_async_tls_with_config(url.as_str(), socket, None, None).await {
+            match client_async_tls_with_config(&endpoint, socket, None, None).await {
                 Ok((stream, _)) => {
                     let (writer, reader) = stream.split();
                     return Ok(Self {
+                        endpoint,
                         writer,
                         reader,
                         server_public_key: None,
@@ -82,6 +85,24 @@ impl CoordinationClient {
         Err(CoordClientError::WebSocket(last_error.unwrap_or_else(
             || "no resolved coordination address".to_owned(),
         )))
+    }
+
+    pub async fn reconnect(
+        &mut self,
+        identity: &Identity,
+        credential: Option<&MembershipCredential>,
+        candidates: Vec<Candidate>,
+        doh_servers: &[String],
+    ) -> Result<Registration, CoordClientError> {
+        let mut replacement = Self::connect_with_doh(&self.endpoint, doh_servers).await?;
+        if let Some(server_public_key) = self.server_public_key {
+            replacement.trust_server_key(server_public_key);
+        }
+        let registration = replacement
+            .register(identity, None, credential, candidates)
+            .await?;
+        *self = replacement;
+        Ok(registration)
     }
 
     pub fn trust_server_key(&mut self, key: [u8; 32]) {

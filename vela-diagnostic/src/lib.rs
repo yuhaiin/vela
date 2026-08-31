@@ -26,6 +26,12 @@ const STATE_FILE: &str = "state.json";
 const IDENTITY_FILE: &str = "identity";
 const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
+fn effective_bind(bind: Option<SocketAddr>) -> SocketAddr {
+    // The default bind is runtime policy, not a persisted peer setting. Keep
+    // old state files from silently forcing a peer back to IPv4-only mode.
+    bind.unwrap_or_else(|| BindOptions::default().local_addr)
+}
+
 fn default_doh_servers() -> Vec<String> {
     vela_stun::default_doh_servers()
 }
@@ -194,9 +200,7 @@ impl DiagnosticPeer {
     ) -> Result<Self, DiagnosticError> {
         let state_dir = state_dir.as_ref();
         let mut state = PeerState::load(state_dir)?;
-        if let Some(bind) = bind {
-            state.bind = bind;
-        }
+        state.bind = effective_bind(bind);
         // Keep an explicitly configured local STUN endpoint across restarts;
         // coordinator endpoints are merged into it when a snapshot arrives.
         let manual_stun_servers = stun_servers.unwrap_or_else(|| state.manual_stun_servers.clone());
@@ -342,6 +346,41 @@ impl DiagnosticPeer {
         Ok(())
     }
 
+    pub async fn reconnect(&mut self) -> Result<NetworkSnapshot, DiagnosticError> {
+        let mut candidates = self.node.local_candidates();
+        retain_server_reflexive_candidates(&mut candidates, &self.candidates);
+        let candidates = unique_candidates(candidates);
+        let registration = self
+            .client
+            .reconnect(
+                self.node.identity(),
+                self.state.credential.as_ref(),
+                candidates.clone(),
+                &self.state.doh_servers,
+            )
+            .await?;
+        self.state.credential = Some(registration.credential);
+        self.candidates = candidates.clone();
+        self.state.candidates = candidates;
+        let snapshot = registration.snapshot;
+        self.apply_snapshot(snapshot.clone()).await?;
+        // The snapshot may have changed the STUN server list while the
+        // control connection was down. Refresh both address families before
+        // advertising the reconnected peer as fully up to date.
+        self.refresh_candidates().await?;
+        self.state.save(&self.state_dir)?;
+        Ok(snapshot)
+    }
+
+    pub fn is_retryable_control_error(error: &DiagnosticError) -> bool {
+        matches!(
+            error,
+            DiagnosticError::Coordination(
+                CoordClientError::WebSocket(_) | CoordClientError::Closed
+            )
+        )
+    }
+
     pub async fn apply_snapshot(
         &mut self,
         snapshot: NetworkSnapshot,
@@ -405,24 +444,79 @@ impl DiagnosticPeer {
 
     pub async fn run(mut self) -> Result<(), DiagnosticError> {
         let mut refresh = interval(DEFAULT_REFRESH_INTERVAL);
+        let mut control_connected = true;
+        let mut reconnect_backoff = Duration::from_secs(1);
+        let mut reconnect_sleep = Box::pin(tokio::time::sleep(Duration::ZERO));
         loop {
             tokio::select! {
-                message = self.client.recv() => match message? {
-                    ControlMessage::ConnectSignal { from, to } if to == self.node_id() => {
-                        let peer = self.client.verify_public_peer(from)?;
-                        self.node.register_peer(peer).await?;
-                    }
-                    ControlMessage::Snapshot { snapshot } => {
-                        if self.apply_snapshot(snapshot).await? {
-                            self.refresh_candidates().await?;
+                message = self.client.recv(), if control_connected => {
+                    match message {
+                        Ok(ControlMessage::ConnectSignal { from, to }) if to == self.node_id() => {
+                            let peer = self.client.verify_public_peer(from)?;
+                            self.node.register_peer(peer).await?;
+                        }
+                        Ok(ControlMessage::Snapshot { snapshot }) => {
+                            let refresh_candidates = self.apply_snapshot(snapshot).await?;
+                            if refresh_candidates {
+                                if let Err(error) = self.refresh_candidates().await {
+                                    if !Self::is_retryable_control_error(&error) {
+                                        return Err(error);
+                                    }
+                                    warn!(error = %error, "coordination refresh failed; retrying");
+                                    control_connected = false;
+                                    reconnect_sleep.as_mut().reset(
+                                        tokio::time::Instant::now() + reconnect_backoff,
+                                    );
+                                }
+                            }
+                        }
+                        Ok(ControlMessage::Revoke { node_id }) if node_id == self.node_id() => {
+                            return Err(DiagnosticError::Revoked);
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            let error = DiagnosticError::Coordination(error);
+                            if !Self::is_retryable_control_error(&error) {
+                                return Err(error);
+                            }
+                            warn!(error = %error, "coordination connection lost; retrying");
+                            control_connected = false;
+                            reconnect_sleep.as_mut().reset(
+                                tokio::time::Instant::now() + reconnect_backoff,
+                            );
                         }
                     }
-                    ControlMessage::Revoke { node_id } if node_id == self.node_id() => {
-                        return Err(DiagnosticError::Revoked);
+                }
+                _ = refresh.tick(), if control_connected => {
+                    if let Err(error) = self.refresh_candidates().await {
+                        if !Self::is_retryable_control_error(&error) {
+                            return Err(error);
+                        }
+                        warn!(error = %error, "coordination refresh failed; retrying");
+                        control_connected = false;
+                        reconnect_sleep.as_mut().reset(
+                            tokio::time::Instant::now() + reconnect_backoff,
+                        );
                     }
-                    _ => {}
-                },
-                _ = refresh.tick() => self.refresh_candidates().await?,
+                }
+                _ = &mut reconnect_sleep, if !control_connected => {
+                    match self.reconnect().await {
+                        Ok(_) => {
+                            control_connected = true;
+                            reconnect_backoff = Duration::from_secs(1);
+                        }
+                        Err(error) if Self::is_retryable_control_error(&error) => {
+                            warn!(error = %error, backoff = ?reconnect_backoff, "coordination reconnect failed");
+                            reconnect_sleep.as_mut().reset(
+                                tokio::time::Instant::now() + reconnect_backoff,
+                            );
+                            reconnect_backoff = reconnect_backoff
+                                .saturating_mul(2)
+                                .min(Duration::from_secs(30));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
             }
         }
     }
@@ -566,6 +660,13 @@ fn set_private(_path: &Path) -> Result<(), std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_bind_ignores_persisted_ipv4_only_setting() {
+        let persisted = "0.0.0.0:0".parse().unwrap();
+        assert_eq!(effective_bind(None), "[::]:0".parse().unwrap());
+        assert_eq!(effective_bind(Some(persisted)), persisted);
+    }
 
     #[test]
     fn failed_stun_refresh_keeps_cached_server_reflexive_candidates() {
