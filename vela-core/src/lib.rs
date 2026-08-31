@@ -220,6 +220,38 @@ fn bind_socket_to_interface(
     Ok(())
 }
 
+#[cfg(any(
+    target_os = "ios",
+    target_os = "visionos",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "watchos",
+))]
+fn bind_dual_stack_socket_to_interface(
+    socket: &Socket,
+    interface: &DefaultRouteInterface,
+) -> io::Result<()> {
+    // Darwin keeps IPv4 and IPv6 interface bindings separately. A dual-stack
+    // IPv6 socket therefore needs both options for IPv4-mapped sends to use
+    // the selected interface as well.
+    bind_socket_to_interface(socket, interface, false)?;
+    bind_socket_to_interface(socket, interface, true)
+}
+
+#[cfg(not(any(
+    target_os = "ios",
+    target_os = "visionos",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "watchos",
+)))]
+fn bind_dual_stack_socket_to_interface(
+    socket: &Socket,
+    interface: &DefaultRouteInterface,
+) -> io::Result<()> {
+    bind_socket_to_interface(socket, interface, false)
+}
+
 #[async_trait]
 impl DatagramProvider for TokioDatagramProvider {
     async fn bind(&self, options: BindOptions) -> Result<Arc<dyn DatagramSocket>, CoreError> {
@@ -229,6 +261,10 @@ impl DatagramProvider for TokioDatagramProvider {
             Domain::IPV6
         };
         let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+        let dual_stack = options.local_addr.is_ipv6() && options.local_addr.ip().is_unspecified();
+        if dual_stack {
+            socket.set_only_v6(false)?;
+        }
         let selected_interface = if options.local_addr.ip().is_unspecified() {
             Some(default_route_interface(options.local_addr)?.ok_or_else(|| {
                 io::Error::new(
@@ -243,12 +279,14 @@ impl DatagramProvider for TokioDatagramProvider {
             tracing::info!(
                 interface = %interface.name,
                 index = ?interface.index,
+                dual_stack,
                 "binding peer UDP socket to the default-route interface"
             );
-            bind_socket_to_interface(&socket, interface, options.local_addr.is_ipv4())?;
-        }
-        if options.local_addr.is_ipv6() && options.local_addr.ip().is_unspecified() {
-            socket.set_only_v6(false)?;
+            if dual_stack {
+                bind_dual_stack_socket_to_interface(&socket, interface)?;
+            } else {
+                bind_socket_to_interface(&socket, interface, options.local_addr.is_ipv4())?;
+            }
         }
         socket.set_nonblocking(true)?;
         socket.bind(&options.local_addr.into())?;
@@ -788,15 +826,17 @@ impl VelaNode {
             .get(&peer_id)
             .cloned()
             .ok_or(SendError::UnknownPeer)?;
-        let should_connect =
-            peer.active.lock().await.is_none() && peer.attempt.lock().await.is_none();
+        let active_session_before = peer.active.lock().await.is_some();
+        let should_connect = !active_session_before && peer.attempt.lock().await.is_none();
         let result = self.inner.send_payload(&peer, packet.into_bytes()).await;
+        let active_session_after = peer.active.lock().await.is_some();
         match &result {
             Ok(()) => debug!(
                 debug_marker = "vela-data",
                 peer_id = %peer_id,
                 packet_len,
-                active_session = !should_connect,
+                active_session = active_session_after,
+                connection_in_progress = !active_session_before && !should_connect,
                 "outbound IP packet accepted by core"
             ),
             Err(error) => debug!(
@@ -930,6 +970,9 @@ impl VelaNode {
             *attempt = Some(Attempt {
                 session_id,
                 handshake: None,
+                handshake_payload: None,
+                handshake_path: None,
+                last_handshake_at: None,
             });
         }
         let node_id = self.node_id();
@@ -944,7 +987,7 @@ impl VelaNode {
                 &self.inner.identity,
             );
             for candidate in &candidates {
-                let _ = self
+                if let Err(error) = self
                     .inner
                     .send_packet(
                         candidate.address(),
@@ -953,7 +996,17 @@ impl VelaNode {
                         0,
                         &payload,
                     )
-                    .await;
+                    .await
+                {
+                    debug!(
+                        debug_marker = "vela-session",
+                        peer_id = %peer_id,
+                        target = %candidate.address(),
+                        session_id,
+                        error = %error,
+                        "peer probe send failed"
+                    );
+                }
             }
         };
         send_probes().await;
@@ -1048,7 +1101,14 @@ impl Inner {
                             }
                             continue;
                         }
-                        if let Err(error) = self.handle_packet(&buffer[..length], source).await { debug!(%error, %source, "dropping invalid Vela packet"); }
+                        if let Err(error) = self.handle_packet(&buffer[..length], source).await {
+                            debug!(
+                                debug_marker = "vela-udp",
+                                error = %error,
+                                %source,
+                                "dropping invalid Vela packet"
+                            );
+                        }
                     }
                     Err(error) => { warn!(%error, "Vela UDP receive loop stopped"); break; }
                 }
@@ -1109,6 +1169,9 @@ impl Inner {
                                 *peer.attempt.lock().await = Some(Attempt {
                                     session_id,
                                     handshake: None,
+                                    handshake_payload: None,
+                                    handshake_path: None,
+                                    last_handshake_at: None,
                                 });
                                 let _ = self.start_initiator(&peer, path, session_id).await;
                             }
@@ -1181,6 +1244,9 @@ impl Inner {
                 *attempt = Some(Attempt {
                     session_id: probe.session_id,
                     handshake: None,
+                    handshake_payload: None,
+                    handshake_path: None,
+                    last_handshake_at: None,
                 });
             }
             drop(attempt);
@@ -1204,10 +1270,26 @@ impl Inner {
         validate_peer_membership(&peer_info, self.config.server_public_key)?;
         verify_probe(&probe, &peer_info)?;
         let attempt = peer.attempt.lock().await;
-        if attempt.as_ref().map(|value| value.session_id) != Some(probe.session_id) {
+        let attempt_session_id = attempt.as_ref().map(|value| value.session_id);
+        if attempt_session_id != Some(probe.session_id) {
+            debug!(
+                debug_marker = "vela-session",
+                peer_id = %probe.sender,
+                source = %source,
+                response_session_id = probe.session_id,
+                attempt_session_id = ?attempt_session_id,
+                "ignoring probe response without a matching connection attempt"
+            );
             return Ok(());
         }
         drop(attempt);
+        debug!(
+            debug_marker = "vela-session",
+            peer_id = %probe.sender,
+            source = %source,
+            session_id = probe.session_id,
+            "accepted probe response for connection attempt"
+        );
         if self.identity.public().node_id < probe.sender {
             self.start_initiator(&peer, source, probe.session_id)
                 .await?;
@@ -1222,37 +1304,116 @@ impl Inner {
         session_id: u64,
     ) -> Result<(), CoreError> {
         let peer_id = peer.info().node_id;
+        if peer.active.lock().await.is_some() {
+            debug!(
+                debug_marker = "vela-session",
+                peer_id = %peer_id,
+                path = %path,
+                session_id,
+                "skipping Noise handshake because peer session is already active"
+            );
+            return Ok(());
+        }
+        let mut attempt = peer.attempt.lock().await;
+        let Some(attempt_value) = attempt.as_mut() else {
+            debug!(
+                debug_marker = "vela-session",
+                peer_id = %peer_id,
+                path = %path,
+                session_id,
+                "skipping Noise handshake because connection attempt is gone"
+            );
+            return Ok(());
+        };
+        if attempt_value.session_id != session_id {
+            debug!(
+                debug_marker = "vela-session",
+                peer_id = %peer_id,
+                path = %path,
+                session_id,
+                attempt_session_id = attempt_value.session_id,
+                "skipping Noise handshake because session id is stale"
+            );
+            return Ok(());
+        }
+        let peer_info = peer.info();
+        let (payload, new_handshake) = match (
+            attempt_value.handshake.is_some(),
+            attempt_value.handshake_payload.clone(),
+        ) {
+            (true, Some(payload)) => {
+                let recently_sent = attempt_value
+                    .handshake_path
+                    .is_some_and(|previous_path| previous_path == path)
+                    && attempt_value
+                        .last_handshake_at
+                        .is_some_and(|sent_at| sent_at.elapsed() < HANDSHAKE_RETRY_INTERVAL);
+                if recently_sent {
+                    debug!(
+                        debug_marker = "vela-session",
+                        peer_id = %peer_id,
+                        path = %path,
+                        session_id,
+                        "skipping Noise handshake retry because the same path was tried recently"
+                    );
+                    return Ok(());
+                }
+                debug!(
+                    debug_marker = "vela-session",
+                    peer_id = %peer_id,
+                    path = %path,
+                    previous_path = ?attempt_value.handshake_path,
+                    session_id,
+                    "retrying Noise handshake on candidate path"
+                );
+                (payload, None)
+            }
+            _ => {
+                debug!(
+                    debug_marker = "vela-session",
+                    peer_id = %peer_id,
+                    path = %path,
+                    session_id,
+                    "creating Noise handshake"
+                );
+                let mut handshake =
+                    NoiseHandshake::initiator(&self.identity, &peer_info.noise_public)?;
+                let message = handshake.write_message(&self.handshake_context().await?)?;
+                let mut payload = Vec::with_capacity(33 + message.len());
+                payload.push(1);
+                payload.extend_from_slice(self.identity.public().node_id.as_bytes());
+                payload.extend_from_slice(&message);
+                (payload, Some(handshake))
+            }
+        };
+        if let Err(error) = self
+            .send_packet(path, PacketType::Handshake, session_id, 0, &payload)
+            .await
+        {
+            debug!(
+                debug_marker = "vela-session",
+                peer_id = %peer_id,
+                path = %path,
+                session_id,
+                error = %error,
+                "Noise handshake send failed; keeping attempt retryable"
+            );
+            return Err(error);
+        }
+        if let Some(handshake) = new_handshake {
+            attempt_value.handshake = Some(handshake);
+            attempt_value.handshake_payload = Some(payload);
+        }
+        attempt_value.handshake_path = Some(path);
+        attempt_value.last_handshake_at = Some(Instant::now());
+        drop(attempt);
         debug!(
             debug_marker = "vela-session",
             peer_id = %peer_id,
             path = %path,
             session_id,
-            "starting Noise handshake"
+            "Noise handshake sent; awaiting response or retry"
         );
-        if peer.active.lock().await.is_some() {
-            return Ok(());
-        }
-        let mut attempt = peer.attempt.lock().await;
-        let Some(attempt_value) = attempt.as_mut() else {
-            return Ok(());
-        };
-        if attempt_value.session_id != session_id {
-            return Ok(());
-        }
-        if attempt_value.handshake.is_some() {
-            return Ok(());
-        }
-        let peer_info = peer.info();
-        let mut handshake = NoiseHandshake::initiator(&self.identity, &peer_info.noise_public)?;
-        let message = handshake.write_message(&self.handshake_context().await?)?;
-        attempt_value.handshake = Some(handshake);
-        drop(attempt);
-        let mut payload = Vec::with_capacity(33 + message.len());
-        payload.push(1);
-        payload.extend_from_slice(self.identity.public().node_id.as_bytes());
-        payload.extend_from_slice(&message);
-        self.send_packet(path, PacketType::Handshake, session_id, 0, &payload)
-            .await?;
         self.emit(VelaEvent::PeerConnecting(peer_info.node_id))
             .await;
         Ok(())
@@ -1271,11 +1432,34 @@ impl Inner {
         let peer = self.peer_for(sender).await?;
         let peer_info = peer.info();
         validate_peer_membership(&peer_info, self.config.server_public_key)?;
+        debug!(
+            debug_marker = "vela-session",
+            peer_id = %sender,
+            source = %source,
+            session_id = packet.header.session_id,
+            role,
+            payload_len = packet.payload.len(),
+            "received Noise handshake"
+        );
         if peer.active.lock().await.is_some() {
+            debug!(
+                debug_marker = "vela-session",
+                peer_id = %sender,
+                source = %source,
+                session_id = packet.header.session_id,
+                "ignoring Noise handshake because peer session is already active"
+            );
             return Ok(());
         }
         if role == 1 {
             if self.identity.public().node_id < sender {
+                debug!(
+                    debug_marker = "vela-session",
+                    peer_id = %sender,
+                    source = %source,
+                    session_id = packet.header.session_id,
+                    "ignoring initiator handshake because local node is the initiator"
+                );
                 return Ok(());
             }
             let mut handshake = NoiseHandshake::responder(&self.identity)?;
@@ -1300,14 +1484,36 @@ impl Inner {
                 .await;
         } else if role == 2 {
             if self.identity.public().node_id > sender {
+                debug!(
+                    debug_marker = "vela-session",
+                    peer_id = %sender,
+                    source = %source,
+                    session_id = packet.header.session_id,
+                    "ignoring responder handshake because local node is the responder"
+                );
                 return Ok(());
             }
             let mut attempt = peer.attempt.lock().await;
             if attempt.as_ref().map(|value| value.session_id) != Some(packet.header.session_id) {
+                debug!(
+                    debug_marker = "vela-session",
+                    peer_id = %sender,
+                    source = %source,
+                    response_session_id = packet.header.session_id,
+                    attempt_session_id = ?attempt.as_ref().map(|value| value.session_id),
+                    "ignoring Noise handshake response without a matching connection attempt"
+                );
                 return Ok(());
             }
             let Some(mut handshake) = attempt.as_mut().and_then(|value| value.handshake.take())
             else {
+                debug!(
+                    debug_marker = "vela-session",
+                    peer_id = %sender,
+                    source = %source,
+                    session_id = packet.header.session_id,
+                    "ignoring Noise handshake response because no initiator state is available"
+                );
                 return Ok(());
             };
             let context = handshake.read_message(&packet.payload[33..])?;
@@ -1641,13 +1847,28 @@ impl Inner {
     ) -> Result<(), CoreError> {
         let expected_network_id = *self.network_id.lock().await;
         let context = decode_handshake_context(bytes).ok_or(CoreError::InvalidHandshake)?;
-        if context.network_id != expected_network_id
-            || context.generation != self.snapshot_generation.load(Ordering::Acquire)
-            || context.node_id != sender
-            || context.node_id != peer.node_id
-            || context.virtual_ipv4 != peer.virtual_ipv4
-            || context.virtual_ipv6 != peer.virtual_ipv6
-        {
+        let expected_generation = self.snapshot_generation.load(Ordering::Acquire);
+        let valid = context.network_id == expected_network_id
+            && context.generation == expected_generation
+            && context.node_id == sender
+            && context.node_id == peer.node_id
+            && context.virtual_ipv4 == peer.virtual_ipv4
+            && context.virtual_ipv6 == peer.virtual_ipv6;
+        if !valid {
+            debug!(
+                debug_marker = "vela-session",
+                peer_id = %sender,
+                context_generation = context.generation,
+                expected_generation,
+                context_node_id = %context.node_id,
+                expected_node_id = %peer.node_id,
+                context_virtual_ipv4 = ?context.virtual_ipv4,
+                expected_virtual_ipv4 = ?peer.virtual_ipv4,
+                context_virtual_ipv6 = ?context.virtual_ipv6,
+                expected_virtual_ipv6 = ?peer.virtual_ipv6,
+                network_id_matches = context.network_id == expected_network_id,
+                "rejecting Noise handshake context"
+            );
             return Err(CoreError::InvalidHandshake);
         }
         Ok(())
@@ -1842,7 +2063,12 @@ fn can_retain_session(previous: &PeerInfo, next: &PeerInfo) -> bool {
 struct Attempt {
     session_id: u64,
     handshake: Option<NoiseHandshake>,
+    handshake_payload: Option<Vec<u8>>,
+    handshake_path: Option<SocketAddr>,
+    last_handshake_at: Option<Instant>,
 }
+
+const HANDSHAKE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
 struct ActiveSession {
     session_id: u64,

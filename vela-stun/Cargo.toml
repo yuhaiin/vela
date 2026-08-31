@@ -10,4 +10,5 @@ async-trait.workspace = true
 rand.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 vela-dns = { path = "../vela-dns" }

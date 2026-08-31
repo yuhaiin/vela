@@ -2647,6 +2647,7 @@ dependencies = [
  "rand 0.8.8",
  "thiserror",
  "tokio",
+ "tracing",
  "vela-dns",
 ]
 

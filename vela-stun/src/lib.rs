@@ -9,6 +9,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{net::UdpSocket, time::timeout};
+use tracing::debug;
 
 pub use vela_dns::DEFAULT_DOH_SERVER;
 
@@ -88,14 +89,43 @@ pub async fn binding<S: StunSocket + ?Sized>(
                 continue;
             }
         };
+        debug!(
+            debug_marker = "vela-stun",
+            server = %server,
+            resolved_addresses = ?addresses,
+            "resolved STUN server addresses"
+        );
         let mut resolved = false;
         let mut server_error = None;
         for address in addresses {
             resolved = true;
             match binding_address(socket, config.timeout, address).await {
-                Ok(address) if !results.contains(&address) => results.push(address),
-                Ok(_) => {}
-                Err(error) => server_error = Some(error),
+                Ok(mapped_address) if !results.contains(&mapped_address) => {
+                    debug!(
+                        debug_marker = "vela-stun",
+                        server_address = %address,
+                        mapped_address = %mapped_address,
+                        "STUN binding succeeded"
+                    );
+                    results.push(mapped_address);
+                }
+                Ok(mapped_address) => {
+                    debug!(
+                        debug_marker = "vela-stun",
+                        server_address = %address,
+                        mapped_address = %mapped_address,
+                        "STUN binding returned a duplicate mapped address"
+                    );
+                }
+                Err(error) => {
+                    debug!(
+                        debug_marker = "vela-stun",
+                        server_address = %address,
+                        error = %error,
+                        "STUN binding failed"
+                    );
+                    server_error = Some(error);
+                }
             }
         }
         if !resolved {
