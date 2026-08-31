@@ -107,12 +107,12 @@ async fn run_peer_command(args: &[String]) -> Result<(), Box<dyn std::error::Err
             peer.run().await?;
         }
         "up" => {
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
             {
                 let _ = args;
-                return Err("peer up currently requires Linux TUN support".into());
+                return Err("peer up is unsupported on this platform".into());
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             {
                 let state_dir = required(args, "--state");
                 let stun_values = options(args, "--stun");
@@ -132,7 +132,13 @@ async fn run_peer_command(args: &[String]) -> Result<(), Box<dyn std::error::Err
                     .snapshot
                     .clone()
                     .ok_or("state has no network snapshot; register first")?;
-                let tun_name = option(args, "--tun").unwrap_or_else(|| "vela0".into());
+                let tun_name = option(args, "--tun").unwrap_or_else(|| {
+                    if cfg!(target_os = "macos") {
+                        "utun0".into()
+                    } else {
+                        "vela0".into()
+                    }
+                });
                 let mtu = option(args, "--mtu")
                     .map(|value| value.parse::<usize>())
                     .transpose()?
@@ -141,7 +147,7 @@ async fn run_peer_command(args: &[String]) -> Result<(), Box<dyn std::error::Err
                     name: tun_name,
                     mtu,
                 })?;
-                let routes = vela_tun::RouteManager::for_interface(tun.name()).await?;
+                let routes = vela_tun::RouteManager::for_tun(&tun).await?;
                 routes.set_mtu(mtu).await?;
                 let local_peer = snapshot
                     .peers
@@ -233,7 +239,7 @@ async fn run_peer_command(args: &[String]) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 async fn run_tun_peer(
     mut peer: DiagnosticPeer,
     tun: vela_tun::TunDevice,

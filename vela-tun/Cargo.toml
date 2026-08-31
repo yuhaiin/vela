@@ -8,9 +8,15 @@ rust-version.workspace = true
 [dependencies]
 bytes.workspace = true
 futures-util.workspace = true
-libc = "0.2"
-rtnetlink.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 vela-core = { path = "../vela-core" }
 vela-proto = { path = "../vela-proto" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+rtnetlink.workspace = true
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+route_manager.workspace = true
+tun-rs.workspace = true

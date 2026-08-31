@@ -2,8 +2,8 @@
 
 Vela is an embeddable, relay-free, encrypted layer-3 peer network for Rust.
 It forwards complete IPv4/IPv6 packets directly between authenticated peers.
-Linux can expose the network through a TUN device; library users can instead
-use the userspace stack without changing kernel routes.
+Linux, macOS, and Windows can expose the network through a TUN device; library
+users can instead use the userspace stack without changing kernel routes.
 
 ## Current implementation
 
@@ -16,10 +16,12 @@ The workspace currently contains:
 - `vela-ip`: strict IPv4/IPv6 packet validation and exact host-route selection.
 - `vela-core`: shared encrypted IP data plane with direct UDP probing, Noise sessions, path migration, replay-window checks, snapshot replacement, and traffic observation.
 - `vela-stack`: Tokio-owned `smoltcp` userspace TCP/UDP/ICMP/raw-IP stack with `dial`, `listen`, and `listen_packet` entry points.
-- `vela-tun`: Linux TUN adapter plus netlink-managed `/32` and `/128` route leases.
+- `vela-tun`: platform TUN adapters plus managed `/32` and `/128` route leases
+  (Linux netlink, macOS route sockets, and Windows IP Helper).
 - `vela-diagnostic`: registered, relay-free peer diagnostics with authenticated direct Echo/Pong tests.
 - `vela-coord`: single-tenant coordination server with SQLite authorization state, signed network snapshots, stable virtual addresses, and in-memory online sessions.
-- `vela-cli`: identity, server, invite, peer-list, revoke, diagnostic peer, and Linux TUN peer commands.
+- `vela-cli`: identity, server, invite, peer-list, revoke, diagnostic peer, and
+  Linux/macOS/Windows TUN peer commands.
 
 The default server listener is plain WebSocket for local development. The
 server also exposes `serve_tls` and the CLI accepts `--cert`/`--key` for direct
@@ -98,6 +100,7 @@ cargo run -p vela-cli -- peer register \
   --bind 192.0.2.10:0
 
 cargo run -p vela-cli -- peer run --state ./peer-a
+# Linux/Windows: vela0; macOS: utun0.
 cargo run -p vela-cli -- peer up --state ./peer-a --tun vela0 --mtu 1200
 cargo run -p vela-cli -- peer list --state ./peer-a --json
 cargo run -p vela-cli -- peer status --state ./peer-a --json
@@ -110,11 +113,15 @@ the Probe, Noise handshake, and encrypted Echo/Pong packets travel directly
 between peer UDP sockets. `--stun <ip:port>` can be repeated during register
 or run to publish server-reflexive candidates.
 
-On Linux, `peer up` creates a layer-3 TUN interface, assigns the stable virtual
-address from the signed network snapshot, installs only the current peers'
-host routes, and bridges complete IP packets to the encrypted direct data
-plane. It needs access to `/dev/net/tun` and `CAP_NET_ADMIN`. Routes are
-reference-counted and removed when the process replaces the snapshot or exits.
+On Linux, macOS, and Windows, `peer up` creates a layer-3 TUN interface, assigns
+the stable virtual address from the signed network snapshot, installs only the
+current peers' host routes, and bridges complete IP packets to the encrypted
+direct data plane. Linux needs access to `/dev/net/tun` and `CAP_NET_ADMIN`;
+macOS needs permission to create and configure `utun` interfaces; Windows uses
+Wintun and requires `wintun.dll` matching the binary architecture beside the
+executable, plus Administrator privileges. The default interface name is
+`vela0` on Linux/Windows and `utun0` on macOS. Routes are reference-counted and
+removed when the process replaces the snapshot or exits.
 
 For an embedded node, create a `TokioDatagramProvider` or implement
 `DatagramProvider` in the host. The host provider is the intended place for
