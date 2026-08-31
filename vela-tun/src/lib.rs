@@ -517,6 +517,14 @@ mod platform {
         V6(Ipv6Addr),
     }
 
+    fn host_route(address: IpAddr, interface_index: u32) -> route_manager::Route {
+        let prefix_len = if address.is_ipv4() { 32 } else { 128 };
+        let route = route_manager::Route::new(address, prefix_len).with_if_index(interface_index);
+        #[cfg(target_os = "macos")]
+        let route = route.with_if_scope(true);
+        route
+    }
+
     impl RouteManager {
         pub async fn for_tun(tun: &TunDevice) -> Result<Self, TunError> {
             Ok(Self {
@@ -586,14 +594,11 @@ mod platform {
         }
 
         async fn change_route(&self, key: RouteKey, add: bool) -> Result<(), TunError> {
-            let (address, prefix_len) = match key {
-                RouteKey::V4(address) => (IpAddr::V4(address), 32),
-                RouteKey::V6(address) => (IpAddr::V6(address), 128),
+            let address = match key {
+                RouteKey::V4(address) => IpAddr::V4(address),
+                RouteKey::V6(address) => IpAddr::V6(address),
             };
-            let route =
-                route_manager::Route::new(address, prefix_len).with_if_index(self.interface_index);
-            #[cfg(target_os = "macos")]
-            let route = route.with_gateway(address).with_if_scope(true);
+            let route = host_route(address, self.interface_index);
             tokio::task::spawn_blocking(move || {
                 let mut manager = route_manager::RouteManager::new()
                     .map_err(|error| TunError::Netlink(error.to_string()))?;
@@ -609,6 +614,20 @@ mod platform {
             })
             .await
             .map_err(|error| TunError::Netlink(error.to_string()))?
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn host_routes_use_the_tun_interface_without_a_gateway() {
+            let route = host_route("10.254.0.2".parse().unwrap(), 7);
+            assert_eq!(route.gateway(), None);
+            assert_eq!(route.if_index(), Some(7));
+            #[cfg(target_os = "macos")]
+            assert!(route.if_scope());
         }
     }
 

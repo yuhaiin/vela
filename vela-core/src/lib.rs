@@ -162,7 +162,11 @@ fn default_route(
     target_os = "illumos",
     target_os = "solaris",
 ))]
-fn bind_socket_to_interface(socket: &Socket, interface: &DefaultRouteInterface) -> io::Result<()> {
+fn bind_socket_to_interface(
+    socket: &Socket,
+    interface: &DefaultRouteInterface,
+    ipv4: bool,
+) -> io::Result<()> {
     let Some(index) = interface.index else {
         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux",))]
         {
@@ -181,12 +185,16 @@ fn bind_socket_to_interface(socket: &Socket, interface: &DefaultRouteInterface) 
     {
         // On Linux both methods map to SO_BINDTOIFINDEX. Setting it twice can
         // fail with EPERM even when the first call succeeded.
+        let _ = ipv4;
         socket.bind_device_by_index_v4(Some(index))
     }
     #[cfg(not(target_os = "linux"))]
     {
-        socket.bind_device_by_index_v4(Some(index))?;
-        socket.bind_device_by_index_v6(Some(index))
+        if ipv4 {
+            socket.bind_device_by_index_v4(Some(index))
+        } else {
+            socket.bind_device_by_index_v6(Some(index))
+        }
     }
 }
 
@@ -236,7 +244,7 @@ impl DatagramProvider for TokioDatagramProvider {
                 index = ?interface.index,
                 "binding peer UDP socket to the default-route interface"
             );
-            bind_socket_to_interface(&socket, interface)?;
+            bind_socket_to_interface(&socket, interface, options.local_addr.is_ipv4())?;
         }
         if options.local_addr.is_ipv6() && options.local_addr.ip().is_unspecified() {
             socket.set_only_v6(false)?;
@@ -2057,6 +2065,31 @@ mod tests {
             candidates,
             vec![Candidate::Host("[2001:db8::10]:45101".parse().unwrap())]
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_interface_binding_matches_socket_address_family() {
+        let mut routes = route_manager::RouteManager::new().unwrap();
+        let Some(route) = routes
+            .find_route(&IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+            .unwrap()
+        else {
+            return;
+        };
+        let Some(index) = route.if_index().and_then(std::num::NonZeroU32::new) else {
+            return;
+        };
+        let interface = DefaultRouteInterface {
+            name: route.if_name().unwrap_or("unknown").to_owned(),
+            index: Some(index),
+        };
+
+        let ipv4_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        bind_socket_to_interface(&ipv4_socket, &interface, true).unwrap();
+
+        let ipv6_socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        bind_socket_to_interface(&ipv6_socket, &interface, false).unwrap();
     }
 
     #[tokio::test]
