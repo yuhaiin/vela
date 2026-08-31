@@ -762,6 +762,9 @@ impl VelaNode {
 
     pub async fn send_ip(&self, packet: impl Into<Bytes>) -> Result<(), SendError> {
         let packet = IpPacket::parse(packet.into()).map_err(SendError::Ip)?;
+        let source = packet.source();
+        let destination = packet.destination();
+        let packet_len = packet.as_bytes().len();
         let peer_id = self
             .inner
             .routes
@@ -769,6 +772,14 @@ impl VelaNode {
             .await
             .validate_outbound(&packet)
             .map_err(SendError::Ip)?;
+        debug!(
+            debug_marker = "vela-data",
+            peer_id = %peer_id,
+            source = ?source,
+            destination = ?destination,
+            packet_len,
+            "outbound IP packet routed to peer"
+        );
         let peer = self
             .inner
             .peers
@@ -780,10 +791,43 @@ impl VelaNode {
         let should_connect =
             peer.active.lock().await.is_none() && peer.attempt.lock().await.is_none();
         let result = self.inner.send_payload(&peer, packet.into_bytes()).await;
+        match &result {
+            Ok(()) => debug!(
+                debug_marker = "vela-data",
+                peer_id = %peer_id,
+                packet_len,
+                active_session = !should_connect,
+                "outbound IP packet accepted by core"
+            ),
+            Err(error) => debug!(
+                debug_marker = "vela-data",
+                peer_id = %peer_id,
+                packet_len,
+                error = %error,
+                "outbound IP packet rejected by core"
+            ),
+        }
         if result.is_ok() && should_connect {
             let node = self.clone();
             tokio::spawn(async move {
-                let _ = node.connect(peer_id).await;
+                debug!(
+                    debug_marker = "vela-session",
+                    peer_id = %peer_id,
+                    "starting peer connection after queued IP packet"
+                );
+                match node.connect(peer_id).await {
+                    Ok(_) => debug!(
+                        debug_marker = "vela-session",
+                        peer_id = %peer_id,
+                        "peer connection completed"
+                    ),
+                    Err(error) => debug!(
+                        debug_marker = "vela-session",
+                        peer_id = %peer_id,
+                        error = %error,
+                        "peer connection failed"
+                    ),
+                }
             });
         }
         result
@@ -836,6 +880,11 @@ impl VelaNode {
     }
 
     pub async fn connect(&self, peer_id: NodeId) -> Result<PeerHandle, ConnectError> {
+        debug!(
+            debug_marker = "vela-session",
+            peer_id = %peer_id,
+            "starting peer connection"
+        );
         if !self.inner.started.load(Ordering::Acquire) {
             return Err(ConnectError::NotStarted);
         }
@@ -860,8 +909,19 @@ impl VelaNode {
         self.inner.emit(VelaEvent::PeerConnecting(peer_id)).await;
         let candidates = peer.info().candidates;
         if candidates.is_empty() {
+            debug!(
+                debug_marker = "vela-session",
+                peer_id = %peer_id,
+                "peer has no candidates"
+            );
             return Err(ConnectError::NoCandidates);
         }
+        debug!(
+            debug_marker = "vela-session",
+            peer_id = %peer_id,
+            candidate_count = candidates.len(),
+            "sending peer probes"
+        );
         let mut nonce = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
         let session_id = random_session_id();
@@ -910,6 +970,11 @@ impl VelaNode {
             if remaining.is_zero() {
                 *peer.attempt.lock().await = None;
                 self.inner.emit(VelaEvent::PeerUnreachable(peer_id)).await;
+                debug!(
+                    debug_marker = "vela-session",
+                    peer_id = %peer_id,
+                    "peer connection timed out"
+                );
                 return Err(ConnectError::Timeout);
             }
             if Instant::now() >= next_probe {
@@ -964,7 +1029,19 @@ impl Inner {
                 _ = self.shutdown.notified() => break,
                 result = self.socket.recv_from(&mut buffer) => match result {
                     Ok((length, source)) => {
+                        debug!(
+                            debug_marker = "vela-udp",
+                            source = %source,
+                            packet_len = length,
+                            "received UDP datagram"
+                        );
                         if let Some(transaction) = stun_transaction_id(&buffer[..length]) {
+                            debug!(
+                                debug_marker = "vela-stun",
+                                source = %source,
+                                packet_len = length,
+                                "received STUN response"
+                            );
                             let waiter = self.stun_waiters.lock().await.remove(&transaction);
                             if let Some((_, sender)) = waiter {
                                 let _ = sender.send((buffer[..length].to_vec(), source));
@@ -1047,6 +1124,15 @@ impl Inner {
             return Err(CoreError::SnapshotExpired);
         }
         let packet = WirePacket::decode(input)?;
+        debug!(
+            debug_marker = "vela-udp",
+            source = %source,
+            packet_type = ?packet.header.packet_type,
+            session_id = packet.header.session_id,
+            sequence = packet.header.sequence,
+            wire_len = input.len(),
+            "decoded inbound Vela packet"
+        );
         match packet.header.packet_type {
             PacketType::Probe => self.handle_probe(packet, source).await,
             PacketType::ProbeResponse => self.handle_probe_response(packet, source).await,
@@ -1135,6 +1221,14 @@ impl Inner {
         path: SocketAddr,
         session_id: u64,
     ) -> Result<(), CoreError> {
+        let peer_id = peer.info().node_id;
+        debug!(
+            debug_marker = "vela-session",
+            peer_id = %peer_id,
+            path = %path,
+            session_id,
+            "starting Noise handshake"
+        );
         if peer.active.lock().await.is_some() {
             return Ok(());
         }
@@ -1244,6 +1338,16 @@ impl Inner {
             if session.session_id != packet.header.session_id {
                 continue;
             }
+            debug!(
+                debug_marker = "vela-data",
+                peer_id = %peer_info.node_id,
+                source = %source,
+                packet_type = ?packet.header.packet_type,
+                session_id = packet.header.session_id,
+                sequence = packet.header.sequence,
+                encrypted_len = packet.payload.len(),
+                "matched inbound packet to active session"
+            );
             if let Some(server_key) = self.config.server_public_key {
                 if validate_peer_membership(&peer_info, Some(server_key)).is_err() {
                     active.take();
@@ -1274,6 +1378,14 @@ impl Inner {
                 PacketType::Data => {
                     let ip_packet = IpPacket::parse(plaintext).map_err(CoreError::Ip)?;
                     let destination = ip_packet.destination();
+                    debug!(
+                        debug_marker = "vela-data",
+                        peer_id = %peer_info.node_id,
+                        source_ip = ?ip_packet.source(),
+                        destination = ?destination,
+                        packet_len = ip_packet.as_bytes().len(),
+                        "decrypted inbound IP packet"
+                    );
                     if !self.routes.lock().await.is_local(destination) {
                         return Err(CoreError::Ip(vela_ip::IpError::DestinationUnknown(
                             destination,
@@ -1361,6 +1473,13 @@ impl Inner {
         *peer.attempt.lock().await = None;
         peer.notify.notify_waiters();
         let peer_id = peer.info().node_id;
+        debug!(
+            debug_marker = "vela-session",
+            peer_id = %peer_id,
+            path = %path,
+            session_id,
+            "encrypted peer session established"
+        );
         self.emit(VelaEvent::PeerConnected(peer_id)).await;
         self.flush_queue(peer).await;
     }
@@ -1408,6 +1527,12 @@ impl Inner {
                 return Err(SendError::QueueFull);
             }
             queue.push_back(payload);
+            debug!(
+                debug_marker = "vela-data",
+                peer_id = %peer.info().node_id,
+                queued_packets = queue.len(),
+                "queued IP packet until peer session is established"
+            );
             return Ok(());
         };
         let sequence = session.tx_sequence.fetch_add(1, Ordering::Relaxed);
@@ -1434,6 +1559,16 @@ impl Inner {
             .send_to(&packet, session.path)
             .await
             .map_err(SendError::Io)?;
+        debug!(
+            debug_marker = "vela-data",
+            peer_id = %peer.info().node_id,
+            path = %session.path,
+            session_id = session.session_id,
+            sequence,
+            packet_len = payload.len(),
+            wire_len = packet.len(),
+            "sent encrypted IP packet"
+        );
         session
             .tx_bytes
             .fetch_add(payload.len() as u64, Ordering::Relaxed);
@@ -1463,6 +1598,15 @@ impl Inner {
         }
         .encode()?;
         self.socket.send_to(&packet, target).await?;
+        debug!(
+            debug_marker = "vela-udp",
+            target = %target,
+            packet_type = ?packet_type,
+            session_id,
+            sequence,
+            wire_len = packet.len(),
+            "sent Vela UDP packet"
+        );
         Ok(())
     }
 

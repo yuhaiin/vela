@@ -1,8 +1,8 @@
 use std::{env, io::Read, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
 use vela_coord::CoordServer;
 use vela_crypto::Identity;
-use vela_diagnostic::{DiagnosticControl, DiagnosticPeer, PeerState};
-use vela_proto::NodeId;
+use vela_diagnostic::{DiagnosticControl, DiagnosticError, DiagnosticPeer, PeerState};
+use vela_proto::{NetworkSnapshot, NodeId};
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -302,6 +302,13 @@ async fn apply_tun_snapshot(
     leases: &mut Vec<vela_tun::RouteLease>,
     snapshot: &vela_proto::NetworkSnapshot,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    tracing::debug!(
+        debug_marker = "vela-tun",
+        node_id = %peer.node_id(),
+        generation = snapshot.generation,
+        peer_count = snapshot.peers.len(),
+        "applying network snapshot to TUN"
+    );
     for lease in leases.drain(..) {
         let _ = lease.release().await;
     }
@@ -321,55 +328,149 @@ async fn apply_tun_snapshot(
             .await?;
     }
     *leases = vela_tun::install_snapshot_routes(routes, snapshot, peer.node_id()).await?;
+    tracing::debug!(
+        debug_marker = "vela-tun",
+        node_id = %peer.node_id(),
+        local_ipv4 = ?local.virtual_ipv4,
+        local_ipv6 = ?local.virtual_ipv6,
+        installed_route_leases = leases.len(),
+        "TUN addresses and peer routes installed"
+    );
     Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 async fn run_tun_peer(
-    mut peer: DiagnosticPeer,
+    peer: DiagnosticPeer,
     tun: vela_tun::TunDevice,
     routes: vela_tun::RouteManager,
     mut leases: Vec<vela_tun::RouteLease>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let node = peer.node.clone();
+    let mut peer = Some(peer);
     let mut refresh = tokio::time::interval(Duration::from_secs(60));
     let mut control_connected = true;
     let mut reconnect_backoff = Duration::from_secs(1);
     let mut reconnect_sleep = Box::pin(tokio::time::sleep(Duration::ZERO));
+    let mut reconnect_task: Option<
+        tokio::task::JoinHandle<(DiagnosticPeer, Result<NetworkSnapshot, DiagnosticError>)>,
+    > = None;
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     loop {
         tokio::select! {
             packet = tun.recv() => {
-                match node.send_ip(packet?).await {
-                    Ok(()) => {}
+                let packet = packet?;
+                let packet_len = packet.len();
+                tracing::debug!(
+                    debug_marker = "vela-tun",
+                    packet_len,
+                    "received packet from TUN"
+                );
+                match node.send_ip(packet).await {
+                    Ok(()) => tracing::debug!(
+                        debug_marker = "vela-tun",
+                        packet_len,
+                        "handed TUN packet to Vela core"
+                    ),
                     Err(vela_core::SendError::Ip(error)) => {
-                        tracing::debug!(error = %error, "dropping invalid or unrouted packet from TUN");
+                        tracing::debug!(
+                            debug_marker = "vela-tun",
+                            packet_len,
+                            error = %error,
+                            "dropping invalid or unrouted packet from TUN"
+                        );
                     }
                     Err(vela_core::SendError::QueueFull) => {
-                        tracing::debug!("dropping packet because the peer send queue is full");
+                        tracing::debug!(
+                            debug_marker = "vela-tun",
+                            packet_len,
+                            "dropping packet because the peer send queue is full"
+                        );
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        tracing::warn!(
+                            debug_marker = "vela-tun",
+                            packet_len,
+                            error = %error,
+                            "fatal error while sending TUN packet"
+                        );
+                        return Err(error.into());
+                    }
                 }
             }
             event = node.next_event() => {
                 match event {
-                    Some(vela_core::VelaEvent::IpPacket { packet, .. }) => tun.send(packet.as_bytes()).await?,
-                    Some(_) => {}
+                    Some(vela_core::VelaEvent::IpPacket { peer, packet }) => {
+                        tracing::debug!(
+                            debug_marker = "vela-tun",
+                            peer_id = %peer,
+                            source = ?packet.source(),
+                            destination = ?packet.destination(),
+                            packet_len = packet.as_bytes().len(),
+                            "received decrypted IP packet; writing to TUN"
+                        );
+                        tun.send(packet.as_bytes()).await?;
+                    }
+                    Some(vela_core::VelaEvent::PeerConnecting(peer)) => tracing::debug!(
+                        debug_marker = "vela-session",
+                        peer_id = %peer,
+                        "peer session connecting"
+                    ),
+                    Some(vela_core::VelaEvent::PeerConnected(peer)) => tracing::info!(
+                        debug_marker = "vela-session",
+                        peer_id = %peer,
+                        "peer session connected"
+                    ),
+                    Some(vela_core::VelaEvent::PeerDisconnected(peer)) => tracing::warn!(
+                        debug_marker = "vela-session",
+                        peer_id = %peer,
+                        "peer session disconnected"
+                    ),
+                    Some(vela_core::VelaEvent::PeerUnreachable(peer)) => tracing::warn!(
+                        debug_marker = "vela-session",
+                        peer_id = %peer,
+                        "peer is unreachable"
+                    ),
+                    Some(vela_core::VelaEvent::PathChanged(peer, path)) => tracing::info!(
+                        debug_marker = "vela-session",
+                        peer_id = %peer,
+                        path = %path,
+                        "peer path changed"
+                    ),
                     None => return Err("Vela node stopped".into()),
                 }
             }
-            message = peer.client.recv(), if control_connected => {
+            message = async {
+                peer.as_mut()
+                    .expect("control peer is available")
+                    .client
+                    .recv()
+                    .await
+            }, if control_connected && peer.is_some() => {
                 match message {
-                    Ok(vela_proto::ControlMessage::ConnectSignal { from, to }) if to == peer.node_id() => {
-                        let info = peer.client.verify_public_peer(from)?;
+                    Ok(vela_proto::ControlMessage::ConnectSignal { from, to }) if to == node.node_id() => {
+                        tracing::debug!(
+                            debug_marker = "vela-control",
+                            from = %from.node_id,
+                            "received peer connect signal"
+                        );
+                        let control_peer = peer.as_mut().expect("control peer is available");
+                        let info = control_peer.client.verify_public_peer(from)?;
                         node.register_peer(info).await?;
                     }
                     Ok(vela_proto::ControlMessage::Snapshot { snapshot }) => {
-                        let refresh_candidates = peer.apply_snapshot(snapshot.clone()).await?;
-                        apply_tun_snapshot(&peer, &routes, &mut leases, &snapshot).await?;
+                        tracing::debug!(
+                            debug_marker = "vela-control",
+                            generation = snapshot.generation,
+                            peer_count = snapshot.peers.len(),
+                            "received network snapshot"
+                        );
+                        let control_peer = peer.as_mut().expect("control peer is available");
+                        let refresh_candidates = control_peer.apply_snapshot(snapshot.clone()).await?;
+                        apply_tun_snapshot(control_peer, &routes, &mut leases, &snapshot).await?;
                         if refresh_candidates {
-                            if let Err(error) = peer.refresh_candidates().await {
+                            if let Err(error) = control_peer.refresh_candidates().await {
                                 if !DiagnosticPeer::is_retryable_control_error(&error) {
                                     return Err(error.into());
                                 }
@@ -381,11 +482,11 @@ async fn run_tun_peer(
                             }
                         }
                     }
-                    Ok(vela_proto::ControlMessage::Revoke { node_id }) if node_id == peer.node_id() => {
+                    Ok(vela_proto::ControlMessage::Revoke { node_id }) if node_id == node.node_id() => {
                         for lease in leases.drain(..) {
                             let _ = lease.release().await;
                         }
-                        peer.node.shutdown().await;
+                        node.shutdown().await;
                         return Err("peer membership was revoked".into());
                     }
                     Err(error) => {
@@ -393,7 +494,11 @@ async fn run_tun_peer(
                         if !DiagnosticPeer::is_retryable_control_error(&error) {
                             return Err(error.into());
                         }
-                        tracing::warn!(error = %error, "coordination connection lost; retrying");
+                        tracing::warn!(
+                            debug_marker = "vela-control",
+                            error = %error,
+                            "coordination connection lost; retrying while keeping data plane alive"
+                        );
                         control_connected = false;
                         reconnect_sleep.as_mut().reset(
                             tokio::time::Instant::now() + reconnect_backoff,
@@ -403,13 +508,15 @@ async fn run_tun_peer(
                 }
             }
             _ = &mut ctrl_c => {
-                peer.node.shutdown().await;
+                tracing::info!(debug_marker = "vela-lifecycle", "shutdown requested");
+                node.shutdown().await;
                 release_route_leases(&mut leases).await;
                 return Ok(());
             }
-            tick = refresh.tick(), if control_connected => {
+            tick = refresh.tick(), if control_connected && peer.is_some() => {
                 let _ = tick;
-                if let Err(error) = peer.refresh_candidates().await {
+                let control_peer = peer.as_mut().expect("control peer is available");
+                if let Err(error) = control_peer.refresh_candidates().await {
                     if !DiagnosticPeer::is_retryable_control_error(&error) {
                         return Err(error.into());
                     }
@@ -420,15 +527,49 @@ async fn run_tun_peer(
                     );
                 }
             }
-            _ = &mut reconnect_sleep, if !control_connected => {
-                match peer.reconnect().await {
+            _ = &mut reconnect_sleep, if !control_connected && reconnect_task.is_none() => {
+                let mut reconnect_peer = peer.take().expect("control peer is available");
+                let reconnect_node_id = node.node_id();
+                tracing::info!(
+                    debug_marker = "vela-control",
+                    node_id = %reconnect_node_id,
+                    "starting coordination reconnect in background"
+                );
+                reconnect_task = Some(tokio::spawn(async move {
+                    let result = reconnect_peer.reconnect().await;
+                    (reconnect_peer, result)
+                }));
+            }
+            reconnect_result = async {
+                reconnect_task
+                    .as_mut()
+                    .expect("reconnect task is available")
+                    .await
+            }, if reconnect_task.is_some() => {
+                let (reconnected_peer, result) = reconnect_result
+                    .map_err(|error| format!("coordination reconnect task failed: {error}"))?;
+                peer = Some(reconnected_peer);
+                match result {
                     Ok(snapshot) => {
-                        apply_tun_snapshot(&peer, &routes, &mut leases, &snapshot).await?;
+                        tracing::info!(
+                            debug_marker = "vela-control",
+                            generation = snapshot.generation,
+                            "coordination reconnected"
+                        );
+                        let control_peer = peer.as_ref().expect("control peer is available");
+                        apply_tun_snapshot(control_peer, &routes, &mut leases, &snapshot).await?;
+                        reconnect_task = None;
                         control_connected = true;
                         reconnect_backoff = Duration::from_secs(1);
                     }
                     Err(error) if DiagnosticPeer::is_retryable_control_error(&error) => {
-                        tracing::warn!(error = %error, backoff = ?reconnect_backoff, "coordination reconnect failed");
+                        tracing::warn!(
+                            debug_marker = "vela-control",
+                            error = %error,
+                            backoff = ?reconnect_backoff,
+                            "coordination reconnect failed; data plane remains running"
+                        );
+                        reconnect_task = None;
                         reconnect_sleep.as_mut().reset(
                             tokio::time::Instant::now() + reconnect_backoff,
                         );
@@ -453,6 +594,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Rustls crypto provider already installed");
@@ -539,4 +681,13 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         _ => usage(),
     }
     Ok(())
+}
+
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter(filter)
+        .try_init();
 }

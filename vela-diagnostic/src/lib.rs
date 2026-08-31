@@ -13,7 +13,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::time::interval;
-use tracing::warn;
+use tracing::{debug, warn};
 use vela_coord_client::{CoordClientError, CoordinationClient};
 use vela_core::{
     BindOptions, ConnectError, CoreError, DiagnosticPingError, DiagnosticPingResult, NodeConfig,
@@ -337,8 +337,18 @@ impl DiagnosticPeer {
             Err(error) => return Err(error),
         };
         if candidates == self.candidates {
+            debug!(
+                debug_marker = "vela-candidates",
+                candidate_count = candidates.len(),
+                "candidate refresh produced no changes"
+            );
             return Ok(());
         }
+        debug!(
+            debug_marker = "vela-candidates",
+            candidates = ?candidates,
+            "uploading changed local candidates"
+        );
         self.client.update_candidates(candidates.clone()).await?;
         self.candidates = candidates.clone();
         self.state.candidates = candidates;
@@ -350,6 +360,11 @@ impl DiagnosticPeer {
         let mut candidates = self.node.local_candidates();
         retain_server_reflexive_candidates(&mut candidates, &self.candidates);
         let candidates = unique_candidates(candidates);
+        debug!(
+            debug_marker = "vela-control",
+            candidate_count = candidates.len(),
+            "reconnecting coordination client"
+        );
         let registration = self
             .client
             .reconnect(
@@ -369,6 +384,11 @@ impl DiagnosticPeer {
         // advertising the reconnected peer as fully up to date.
         self.refresh_candidates().await?;
         self.state.save(&self.state_dir)?;
+        debug!(
+            debug_marker = "vela-control",
+            generation = snapshot.generation,
+            "coordination client restored"
+        );
         Ok(snapshot)
     }
 
@@ -399,6 +419,12 @@ impl DiagnosticPeer {
 
     async fn collect_candidates(&self) -> Result<Vec<Candidate>, DiagnosticError> {
         let mut candidates = self.node.local_candidates();
+        debug!(
+            debug_marker = "vela-candidates",
+            host_candidate_count = candidates.len(),
+            stun_server_count = self.state.stun_servers.len(),
+            "collecting local host and STUN candidates"
+        );
         if !self.state.stun_servers.is_empty() {
             match self
                 .node
@@ -409,7 +435,14 @@ impl DiagnosticPeer {
                 })
                 .await
             {
-                Ok(stun_candidates) => candidates.extend(stun_candidates),
+                Ok(stun_candidates) => {
+                    debug!(
+                        debug_marker = "vela-stun",
+                        candidate_count = stun_candidates.len(),
+                        "STUN candidate collection completed"
+                    );
+                    candidates.extend(stun_candidates)
+                }
                 Err(error) if candidates.is_empty() => return Err(error.into()),
                 Err(error) => {
                     warn!(error = %error, "STUN refresh failed; using host and cached server-reflexive candidates");
@@ -421,6 +454,11 @@ impl DiagnosticPeer {
         if candidates.is_empty() {
             return Err(DiagnosticError::NoCandidates);
         }
+        debug!(
+            debug_marker = "vela-candidates",
+            candidates = ?candidates,
+            "candidate collection completed"
+        );
         Ok(candidates)
     }
 
@@ -452,10 +490,21 @@ impl DiagnosticPeer {
                 message = self.client.recv(), if control_connected => {
                     match message {
                         Ok(ControlMessage::ConnectSignal { from, to }) if to == self.node_id() => {
+                            debug!(
+                                debug_marker = "vela-control",
+                                from = %from.node_id,
+                                "received peer connect signal"
+                            );
                             let peer = self.client.verify_public_peer(from)?;
                             self.node.register_peer(peer).await?;
                         }
                         Ok(ControlMessage::Snapshot { snapshot }) => {
+                            debug!(
+                                debug_marker = "vela-control",
+                                generation = snapshot.generation,
+                                peer_count = snapshot.peers.len(),
+                                "received network snapshot"
+                            );
                             let refresh_candidates = self.apply_snapshot(snapshot).await?;
                             if refresh_candidates {
                                 if let Err(error) = self.refresh_candidates().await {
@@ -479,7 +528,11 @@ impl DiagnosticPeer {
                             if !Self::is_retryable_control_error(&error) {
                                 return Err(error);
                             }
-                            warn!(error = %error, "coordination connection lost; retrying");
+                            warn!(
+                                debug_marker = "vela-control",
+                                error = %error,
+                                "coordination connection lost; retrying"
+                            );
                             control_connected = false;
                             reconnect_sleep.as_mut().reset(
                                 tokio::time::Instant::now() + reconnect_backoff,
@@ -500,13 +553,20 @@ impl DiagnosticPeer {
                     }
                 }
                 _ = &mut reconnect_sleep, if !control_connected => {
+                    debug!(debug_marker = "vela-control", "starting coordination reconnect");
                     match self.reconnect().await {
                         Ok(_) => {
+                            debug!(debug_marker = "vela-control", "coordination reconnect succeeded");
                             control_connected = true;
                             reconnect_backoff = Duration::from_secs(1);
                         }
                         Err(error) if Self::is_retryable_control_error(&error) => {
-                            warn!(error = %error, backoff = ?reconnect_backoff, "coordination reconnect failed");
+                            warn!(
+                                debug_marker = "vela-control",
+                                error = %error,
+                                backoff = ?reconnect_backoff,
+                                "coordination reconnect failed"
+                            );
                             reconnect_sleep.as_mut().reset(
                                 tokio::time::Instant::now() + reconnect_backoff,
                             );

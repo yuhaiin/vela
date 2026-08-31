@@ -12,6 +12,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
+tracing.workspace = true
 url.workspace = true
 vela-crypto = { path = "../vela-crypto" }
 vela-dns = { path = "../vela-dns" }

@@ -5,12 +5,14 @@ use futures_util::{
     SinkExt, StreamExt,
     stream::{SplitSink, SplitStream},
 };
-use std::collections::VecDeque;
+use std::{collections::VecDeque, net::IpAddr, time::Duration};
 use thiserror::Error;
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, client_async_tls_with_config, tungstenite::Message,
 };
+use tracing::debug;
 use url::Url;
 use vela_crypto::{Identity, MembershipCredential, verify_snapshot};
 use vela_proto::{
@@ -19,6 +21,8 @@ use vela_proto::{
 };
 
 type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+const CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct CoordinationClient {
     endpoint: String,
@@ -52,24 +56,76 @@ impl CoordinationClient {
         let port = url
             .port_or_known_default()
             .ok_or(CoordClientError::InvalidEndpoint)?;
-        let addresses = match host.parse() {
-            Ok(address) => vec![address],
-            Err(_) => vela_dns::resolve(host, doh_servers)
-                .await
-                .map_err(|error| CoordClientError::WebSocket(error.to_string()))?,
+        let addresses = match host.parse::<IpAddr>() {
+            Ok(address) => {
+                debug!(
+                    debug_marker = "vela-control",
+                    host,
+                    resolution = "literal-ip",
+                    "coordination endpoint uses a literal IP; skipping DoH"
+                );
+                vec![address]
+            }
+            Err(_) => {
+                let addresses = vela_dns::resolve(host, doh_servers)
+                    .await
+                    .map_err(|error| CoordClientError::WebSocket(error.to_string()))?;
+                debug!(
+                    debug_marker = "vela-control",
+                    host,
+                    resolution = "doh",
+                    address_count = addresses.len(),
+                    "resolved coordination endpoint with DoH"
+                );
+                addresses
+            }
         };
         let mut last_error = None;
         for address in addresses {
             let address = std::net::SocketAddr::new(address, port);
-            let socket = match TcpStream::connect(address).await {
-                Ok(socket) => socket,
-                Err(error) => {
+            debug!(
+                debug_marker = "vela-control",
+                endpoint = %endpoint,
+                address = %address,
+                "trying coordination server address"
+            );
+            let socket = match timeout(CONTROL_CONNECT_TIMEOUT, TcpStream::connect(address)).await {
+                Ok(Ok(socket)) => socket,
+                Ok(Err(error)) => {
+                    debug!(
+                        debug_marker = "vela-control",
+                        address = %address,
+                        error = %error,
+                        "coordination TCP connection failed"
+                    );
                     last_error = Some(error.to_string());
                     continue;
                 }
+                Err(_) => {
+                    debug!(
+                        debug_marker = "vela-control",
+                        address = %address,
+                        timeout = ?CONTROL_CONNECT_TIMEOUT,
+                        "coordination TCP connection timed out"
+                    );
+                    last_error = Some(format!(
+                        "coordination TCP connection to {address} timed out after {CONTROL_CONNECT_TIMEOUT:?}"
+                    ));
+                    continue;
+                }
             };
-            match client_async_tls_with_config(&endpoint, socket, None, None).await {
-                Ok((stream, _)) => {
+            match timeout(
+                CONTROL_CONNECT_TIMEOUT,
+                client_async_tls_with_config(&endpoint, socket, None, None),
+            )
+            .await
+            {
+                Ok(Ok((stream, _))) => {
+                    debug!(
+                        debug_marker = "vela-control",
+                        address = %address,
+                        "coordination WebSocket connected"
+                    );
                     let (writer, reader) = stream.split();
                     return Ok(Self {
                         endpoint,
@@ -79,7 +135,26 @@ impl CoordinationClient {
                         pending: VecDeque::new(),
                     });
                 }
-                Err(error) => last_error = Some(error.to_string()),
+                Ok(Err(error)) => {
+                    debug!(
+                        debug_marker = "vela-control",
+                        address = %address,
+                        error = %error,
+                        "coordination WebSocket handshake failed"
+                    );
+                    last_error = Some(error.to_string());
+                }
+                Err(_) => {
+                    debug!(
+                        debug_marker = "vela-control",
+                        address = %address,
+                        timeout = ?CONTROL_CONNECT_TIMEOUT,
+                        "coordination WebSocket handshake timed out"
+                    );
+                    last_error = Some(format!(
+                        "coordination WebSocket handshake to {address} timed out after {CONTROL_CONNECT_TIMEOUT:?}"
+                    ));
+                }
             }
         }
         Err(CoordClientError::WebSocket(last_error.unwrap_or_else(
@@ -94,6 +169,12 @@ impl CoordinationClient {
         candidates: Vec<Candidate>,
         doh_servers: &[String],
     ) -> Result<Registration, CoordClientError> {
+        debug!(
+            debug_marker = "vela-control",
+            endpoint = %self.endpoint,
+            candidate_count = candidates.len(),
+            "replacing coordination WebSocket connection"
+        );
         let mut replacement = Self::connect_with_doh(&self.endpoint, doh_servers).await?;
         if let Some(server_public_key) = self.server_public_key {
             replacement.trust_server_key(server_public_key);
@@ -259,9 +340,22 @@ impl CoordinationClient {
                         .await
                         .map_err(|error| CoordClientError::WebSocket(error.to_string()))?;
                 }
-                Some(Ok(Message::Close(_))) | None => return Err(CoordClientError::Closed),
+                Some(Ok(Message::Close(_))) | None => {
+                    debug!(
+                        debug_marker = "vela-control",
+                        "coordination WebSocket closed"
+                    );
+                    return Err(CoordClientError::Closed);
+                }
                 Some(Ok(_)) => {}
-                Some(Err(error)) => return Err(CoordClientError::WebSocket(error.to_string())),
+                Some(Err(error)) => {
+                    debug!(
+                        debug_marker = "vela-control",
+                        error = %error,
+                        "coordination WebSocket read failed"
+                    );
+                    return Err(CoordClientError::WebSocket(error.to_string()));
+                }
             }
         }
     }
