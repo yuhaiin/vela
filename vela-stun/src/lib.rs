@@ -8,10 +8,13 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
-use tokio::{
-    net::{UdpSocket, lookup_host},
-    time::timeout,
-};
+use tokio::{net::UdpSocket, time::timeout};
+
+pub use vela_dns::DEFAULT_DOH_SERVER;
+
+pub fn default_doh_servers() -> Vec<String> {
+    vela_dns::default_servers()
+}
 
 const MAGIC_COOKIE: u32 = 0x2112_A442;
 const BINDING_REQUEST: u16 = 0x0001;
@@ -23,6 +26,8 @@ pub struct StunConfig {
     /// STUN endpoints in `host:port` form. Hostnames are resolved when a
     /// binding refresh runs, so a changed DNS answer is picked up too.
     pub servers: Vec<String>,
+    /// DNS-over-HTTPS endpoints used to resolve STUN hostnames.
+    pub doh_servers: Vec<String>,
     pub timeout: Duration,
 }
 
@@ -30,6 +35,7 @@ impl Default for StunConfig {
     fn default() -> Self {
         Self {
             servers: Vec::new(),
+            doh_servers: default_doh_servers(),
             timeout: Duration::from_secs(3),
         }
     }
@@ -59,12 +65,25 @@ pub async fn binding<S: StunSocket + ?Sized>(
     let mut results = Vec::new();
     let mut last_error = None;
     for server in &config.servers {
-        let addresses = match lookup_host(server).await {
-            Ok(addresses) => addresses,
+        let (host, port) = match split_server(server) {
+            Ok(value) => value,
             Err(source) => {
                 last_error = Some(StunError::Resolve {
                     server: server.clone(),
                     source,
+                });
+                continue;
+            }
+        };
+        let addresses = match vela_dns::resolve(host, &config.doh_servers).await {
+            Ok(addresses) => addresses
+                .into_iter()
+                .map(|address| SocketAddr::new(address, port))
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                last_error = Some(StunError::Resolve {
+                    server: server.clone(),
+                    source: std::io::Error::other(error),
                 });
                 continue;
             }
@@ -95,6 +114,38 @@ pub async fn binding<S: StunSocket + ?Sized>(
         return Err(last_error.unwrap_or(StunError::NoServersResponded));
     }
     Ok(results)
+}
+
+fn split_server(server: &str) -> Result<(&str, u16), std::io::Error> {
+    let (host, port) = if let Some(value) = server.strip_prefix('[') {
+        let (host, port) = value.split_once("]:").ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "STUN endpoint must be host:port",
+            )
+        })?;
+        (host, port)
+    } else {
+        server.rsplit_once(':').ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "STUN endpoint must be host:port",
+            )
+        })?
+    };
+    if host.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "STUN endpoint host is empty",
+        ));
+    }
+    let port = port.parse().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "STUN endpoint port is invalid",
+        )
+    })?;
+    Ok((host, port))
 }
 
 async fn binding_address<S: StunSocket + ?Sized>(
@@ -306,14 +357,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn binding_resolves_hostname_servers() {
+    async fn binding_uses_literal_servers_without_system_resolution() {
         let socket = MockSocket {
             response: Mutex::new(None),
         };
         let candidates = binding(
             &socket,
             &StunConfig {
-                servers: vec!["localhost:3478".to_owned()],
+                servers: vec!["127.0.0.1:3478".to_owned()],
+                doh_servers: default_doh_servers(),
                 timeout: Duration::from_secs(1),
             },
         )

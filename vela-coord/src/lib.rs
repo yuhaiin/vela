@@ -53,8 +53,14 @@ struct ServerInner {
     pub(crate) database: Mutex<Connection>,
     pub(crate) online: AsyncMutex<HashMap<NodeId, HashMap<u64, mpsc::Sender<ControlMessage>>>>,
     pub(crate) snapshot_generation: std::sync::atomic::AtomicU64,
-    pub(crate) stun_servers: Vec<String>,
+    pub(crate) network_config: Mutex<ServerNetworkConfig>,
     pub(crate) admin: admin::AdminAuth,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ServerNetworkConfig {
+    pub(crate) doh_servers: Vec<String>,
+    pub(crate) stun_servers: Vec<String>,
 }
 
 impl CoordServer {
@@ -87,6 +93,24 @@ impl CoordServer {
         signer_path: impl AsRef<Path>,
         tenant: impl Into<String>,
         credentials_path: impl AsRef<Path>,
+        stun_servers: Vec<String>,
+    ) -> Result<Self, CoordError> {
+        Self::open_with_admin_credentials_and_network_config(
+            database_path,
+            signer_path,
+            tenant,
+            credentials_path,
+            vela_dns::default_servers(),
+            stun_servers,
+        )
+    }
+
+    pub fn open_with_admin_credentials_and_network_config(
+        database_path: impl AsRef<Path>,
+        signer_path: impl AsRef<Path>,
+        tenant: impl Into<String>,
+        credentials_path: impl AsRef<Path>,
+        doh_servers: Vec<String>,
         stun_servers: Vec<String>,
     ) -> Result<Self, CoordError> {
         let database_path = database_path.as_ref();
@@ -124,6 +148,10 @@ impl CoordServer {
             CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY,
                 value INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );",
         )?;
         let _ = connection.execute("ALTER TABLE peers ADD COLUMN virtual_ipv4 BLOB", []);
@@ -188,6 +216,7 @@ impl CoordServer {
             .and_then(|value| u64::try_from(value).ok())
             .filter(|value| *value != 0)
             .unwrap_or(1);
+        let network_config = load_network_config(&connection, doh_servers, stun_servers)?;
         let (admin, generated_password) =
             admin::AdminAuth::load_or_create(credentials_path.as_ref())?;
         let server = Self {
@@ -197,7 +226,7 @@ impl CoordServer {
                 database: Mutex::new(connection),
                 online: AsyncMutex::new(HashMap::new()),
                 snapshot_generation: std::sync::atomic::AtomicU64::new(snapshot_generation),
-                stun_servers,
+                network_config: Mutex::new(network_config),
                 admin,
             }),
         };
@@ -419,6 +448,7 @@ async fn handle_message(
             };
             let peer = StoredPeer {
                 node_id,
+                name: String::new(),
                 signing_public,
                 noise_public,
                 candidates,
@@ -480,6 +510,7 @@ async fn handle_message(
                 state,
                 &StoredPeer {
                     node_id,
+                    name: peer.name,
                     signing_public: peer.signing_public,
                     noise_public: peer.noise_public,
                     candidates,
@@ -533,7 +564,10 @@ async fn handle_message(
                 .filter(|peer| peer.node_id != requester)
                 .map(|peer| PeerSummary {
                     node_id: peer.node_id,
+                    name: peer.name,
                     online: online.contains_key(&peer.node_id),
+                    virtual_ipv4: peer.virtual_ipv4,
+                    virtual_ipv6: peer.virtual_ipv6,
                     capabilities: peer.capabilities,
                 })
                 .collect();
@@ -694,6 +728,7 @@ fn random_token(bytes: usize) -> String {
 #[derive(Clone)]
 struct StoredPeer {
     node_id: NodeId,
+    name: String,
     signing_public: [u8; 32],
     noise_public: [u8; 32],
     candidates: Vec<Candidate>,
@@ -824,11 +859,11 @@ fn load_peer(state: &Arc<ServerInner>, node_id: NodeId) -> Result<Option<StoredP
         .database
         .lock()
         .map_err(|_| CoordError::DatabasePoisoned)?;
-    database.query_row("SELECT signing_public, noise_public, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities FROM peers WHERE node_id = ?1 AND revoked = 0", params![node_id.as_bytes().as_slice()], |row| {
-        let signing: Vec<u8> = row.get(0)?; let noise: Vec<u8> = row.get(1)?; let candidates: String = row.get(2)?; let virtual_ipv4: Option<Vec<u8>> = row.get(3)?; let virtual_ipv6: Option<Vec<u8>> = row.get(4)?; let credential: Vec<u8> = row.get(5)?; let capabilities: String = row.get(6)?;
-        Ok((signing, noise, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities))
-    }).optional()?.map(|(signing, noise, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities)| {
-        Ok(StoredPeer { node_id, signing_public: signing.try_into().map_err(|_| CoordError::InvalidPeer)?, noise_public: noise.try_into().map_err(|_| CoordError::InvalidPeer)?, candidates: serde_json::from_str(&candidates)?, virtual_ipv4: decode_ipv4(virtual_ipv4)?, virtual_ipv6: decode_ipv6(virtual_ipv6)?, credential, capabilities: serde_json::from_str(&capabilities)? })
+    database.query_row("SELECT name, signing_public, noise_public, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities FROM peers WHERE node_id = ?1 AND revoked = 0", params![node_id.as_bytes().as_slice()], |row| {
+        let name: String = row.get(0)?; let signing: Vec<u8> = row.get(1)?; let noise: Vec<u8> = row.get(2)?; let candidates: String = row.get(3)?; let virtual_ipv4: Option<Vec<u8>> = row.get(4)?; let virtual_ipv6: Option<Vec<u8>> = row.get(5)?; let credential: Vec<u8> = row.get(6)?; let capabilities: String = row.get(7)?;
+        Ok((name, signing, noise, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities))
+    }).optional()?.map(|(name, signing, noise, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities)| {
+        Ok(StoredPeer { node_id, name, signing_public: signing.try_into().map_err(|_| CoordError::InvalidPeer)?, noise_public: noise.try_into().map_err(|_| CoordError::InvalidPeer)?, candidates: serde_json::from_str(&candidates)?, virtual_ipv4: decode_ipv4(virtual_ipv4)?, virtual_ipv6: decode_ipv6(virtual_ipv6)?, credential, capabilities: serde_json::from_str(&capabilities)? })
     }).transpose()
 }
 
@@ -838,20 +873,22 @@ fn load_peers(state: &Arc<ServerInner>) -> Result<Vec<StoredPeer>, CoordError> {
         .lock()
         .map_err(|_| CoordError::DatabasePoisoned)?;
     let mut statement = database.prepare(
-        "SELECT node_id, signing_public, noise_public, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities
+        "SELECT node_id, name, signing_public, noise_public, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities
          FROM peers WHERE revoked = 0 ORDER BY node_id",
     )?;
     let rows = statement.query_map([], |row| {
         let node_id: Vec<u8> = row.get(0)?;
-        let signing: Vec<u8> = row.get(1)?;
-        let noise: Vec<u8> = row.get(2)?;
-        let candidates: String = row.get(3)?;
-        let virtual_ipv4: Option<Vec<u8>> = row.get(4)?;
-        let virtual_ipv6: Option<Vec<u8>> = row.get(5)?;
-        let credential: Vec<u8> = row.get(6)?;
-        let capabilities: String = row.get(7)?;
+        let name: String = row.get(1)?;
+        let signing: Vec<u8> = row.get(2)?;
+        let noise: Vec<u8> = row.get(3)?;
+        let candidates: String = row.get(4)?;
+        let virtual_ipv4: Option<Vec<u8>> = row.get(5)?;
+        let virtual_ipv6: Option<Vec<u8>> = row.get(6)?;
+        let credential: Vec<u8> = row.get(7)?;
+        let capabilities: String = row.get(8)?;
         Ok((
             node_id,
+            name,
             signing,
             noise,
             candidates,
@@ -864,6 +901,7 @@ fn load_peers(state: &Arc<ServerInner>) -> Result<Vec<StoredPeer>, CoordError> {
     rows.map(|row| {
         let (
             node_id,
+            name,
             signing,
             noise,
             candidates,
@@ -877,6 +915,7 @@ fn load_peers(state: &Arc<ServerInner>) -> Result<Vec<StoredPeer>, CoordError> {
                 .try_into()
                 .map(NodeId::new)
                 .map_err(|_| rusqlite::Error::InvalidQuery)?,
+            name,
             signing_public: signing
                 .try_into()
                 .map_err(|_| rusqlite::Error::InvalidQuery)?,
@@ -922,11 +961,102 @@ fn private_peer(peer: &StoredPeer) -> PeerInfo {
     }
 }
 
+fn load_network_config(
+    connection: &Connection,
+    doh_servers: Vec<String>,
+    stun_servers: Vec<String>,
+) -> Result<ServerNetworkConfig, CoordError> {
+    let stored = |key: &str| {
+        connection
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+    };
+    let doh_default = if doh_servers.is_empty() {
+        vela_dns::default_servers()
+    } else {
+        doh_servers
+    };
+    let doh_servers = stored("doh_servers")?
+        .map(|value| serde_json::from_str(&value))
+        .transpose()?
+        .filter(|servers: &Vec<String>| !servers.is_empty())
+        .unwrap_or(doh_default);
+    let stun_servers = stored("stun_servers")?
+        .map(|value| serde_json::from_str(&value))
+        .transpose()?
+        .unwrap_or(stun_servers);
+    let config = ServerNetworkConfig {
+        doh_servers,
+        stun_servers,
+    };
+    connection.execute(
+        "INSERT OR IGNORE INTO settings(key, value) VALUES('doh_servers', ?1)",
+        params![serde_json::to_string(&config.doh_servers)?],
+    )?;
+    connection.execute(
+        "INSERT OR IGNORE INTO settings(key, value) VALUES('stun_servers', ?1)",
+        params![serde_json::to_string(&config.stun_servers)?],
+    )?;
+    Ok(config)
+}
+
+pub(crate) fn network_config(state: &Arc<ServerInner>) -> Result<ServerNetworkConfig, CoordError> {
+    state
+        .network_config
+        .lock()
+        .map_err(|_| CoordError::DatabasePoisoned)
+        .map(|config| config.clone())
+}
+
+pub(crate) async fn update_network_config(
+    state: &Arc<ServerInner>,
+    config: ServerNetworkConfig,
+) -> Result<(), CoordError> {
+    let changed = {
+        let mut current = state
+            .network_config
+            .lock()
+            .map_err(|_| CoordError::DatabasePoisoned)?;
+        if *current == config {
+            false
+        } else {
+            let mut database = state
+                .database
+                .lock()
+                .map_err(|_| CoordError::DatabasePoisoned)?;
+            let transaction = database.transaction()?;
+            transaction.execute(
+                "INSERT INTO settings(key, value) VALUES('doh_servers', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![serde_json::to_string(&config.doh_servers)?],
+            )?;
+            transaction.execute(
+                "INSERT INTO settings(key, value) VALUES('stun_servers', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![serde_json::to_string(&config.stun_servers)?],
+            )?;
+            transaction.commit()?;
+            *current = config;
+            true
+        }
+    };
+    if changed {
+        bump_snapshot(state)?;
+        broadcast_snapshot(state).await?;
+    }
+    Ok(())
+}
+
 fn network_snapshot(state: &Arc<ServerInner>) -> Result<NetworkSnapshot, CoordError> {
     let digest = blake3::hash(state.tenant.as_bytes());
     let mut network_id = [0u8; 16];
     network_id.copy_from_slice(&digest.as_bytes()[..16]);
     let peers = load_peers(state)?.iter().map(private_peer).collect();
+    let config = network_config(state)?;
     Ok(state.signer.sign_snapshot(NetworkSnapshot {
         network_id,
         generation: state
@@ -937,7 +1067,8 @@ fn network_snapshot(state: &Arc<ServerInner>) -> Result<NetworkSnapshot, CoordEr
             prefix_len: VIRTUAL_IPV4_PREFIX_LEN,
         }),
         virtual_ipv6: None,
-        stun_servers: state.stun_servers.clone(),
+        doh_servers: config.doh_servers,
+        stun_servers: config.stun_servers,
         peers,
         expires_at: unix_time().saturating_add(3600),
         signature: Vec::new(),
@@ -1193,6 +1324,7 @@ mod tests {
             .unwrap();
         let peer = StoredPeer {
             node_id: public.node_id,
+            name: String::new(),
             signing_public: public.signing_public,
             noise_public: public.noise_public,
             candidates: vec![Candidate::Host(
@@ -1275,8 +1407,52 @@ mod tests {
         )
         .unwrap();
         let snapshot = network_snapshot(&server.inner).unwrap();
+        assert_eq!(snapshot.doh_servers, vela_dns::default_servers());
         assert_eq!(snapshot.stun_servers, vec!["stun.example.test:3478"]);
         vela_crypto::verify_snapshot(&snapshot, &server.server_public_key(), unix_time()).unwrap();
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_file(signer_path);
+        let _ = std::fs::remove_file(credentials_path);
+    }
+
+    #[test]
+    fn coordinator_network_config_persists_across_restart() {
+        let base = std::env::temp_dir().join(format!(
+            "vela-coord-network-config-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = base.with_extension("db");
+        let signer_path = base.with_extension("key");
+        let credentials_path = base.with_extension("credentials");
+        let server = CoordServer::open_with_admin_credentials_and_network_config(
+            &db,
+            &signer_path,
+            "test-tenant",
+            &credentials_path,
+            vec!["https://resolver.example.test/dns-query".to_owned()],
+            vec!["[2001:db8::1]:3478".to_owned()],
+        )
+        .unwrap();
+        let snapshot = network_snapshot(&server.inner).unwrap();
+        assert_eq!(
+            snapshot.doh_servers,
+            vec!["https://resolver.example.test/dns-query"]
+        );
+        assert_eq!(snapshot.stun_servers, vec!["[2001:db8::1]:3478"]);
+        vela_crypto::verify_snapshot(&snapshot, &server.server_public_key(), unix_time()).unwrap();
+        drop(server);
+
+        let reopened = CoordServer::open_with_admin_credentials(
+            &db,
+            &signer_path,
+            "test-tenant",
+            &credentials_path,
+        )
+        .unwrap();
+        let reopened_snapshot = network_snapshot(&reopened.inner).unwrap();
+        assert_eq!(reopened_snapshot.doh_servers, snapshot.doh_servers);
+        assert_eq!(reopened_snapshot.stun_servers, snapshot.stun_servers);
         let _ = std::fs::remove_file(db);
         let _ = std::fs::remove_file(signer_path);
         let _ = std::fs::remove_file(credentials_path);
@@ -1298,6 +1474,7 @@ mod tests {
             &server.inner,
             &StoredPeer {
                 node_id: public.node_id,
+                name: String::new(),
                 signing_public: public.signing_public,
                 noise_public: public.noise_public,
                 candidates: Vec::new(),
@@ -1376,6 +1553,35 @@ mod tests {
         let token = login["token"].as_str().unwrap().to_owned();
         let authorization = format!("Bearer {token}");
 
+        let network_config_response = server
+            .router()
+            .oneshot(
+                Request::patch("/api/v1/admin/config")
+                    .header("authorization", &authorization)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"doh_servers":["https://dns.example.test/dns-query"],"stun_servers":["stun.example.test:3478"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(network_config_response.status(), StatusCode::OK);
+        let network_config: serde_json::Value = serde_json::from_slice(
+            &to_bytes(network_config_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            network_config["doh_servers"],
+            serde_json::json!(["https://dns.example.test/dns-query"])
+        );
+        assert_eq!(
+            network_snapshot(&server.inner).unwrap().stun_servers,
+            vec!["stun.example.test:3478"]
+        );
+
         let invite_response = server
             .router()
             .oneshot(
@@ -1422,6 +1628,7 @@ mod tests {
             &server.inner,
             &StoredPeer {
                 node_id: public.node_id,
+                name: String::new(),
                 signing_public: public.signing_public,
                 noise_public: public.noise_public,
                 candidates: Vec::new(),

@@ -18,12 +18,14 @@ use std::{
     path::Path,
     sync::{Arc, Mutex},
 };
+use url::Url;
 use vela_crypto::MembershipCredential;
 use vela_proto::{Candidate, NodeId, PeerCapability};
 
 use super::{
-    CoordError, ServerInner, consume_download_token, create_invite, delete_peer_inner,
-    revoke_peer_inner, unix_time, update_peer_metadata,
+    CoordError, ServerInner, ServerNetworkConfig, consume_download_token, create_invite,
+    delete_peer_inner, network_config, revoke_peer_inner, unix_time, update_network_config,
+    update_peer_metadata,
 };
 
 const ADMIN_USERNAME: &str = "admin";
@@ -202,7 +204,7 @@ pub(crate) fn router() -> Router<Arc<ServerInner>> {
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/me", get(me))
-        .route("/api/v1/admin/config", get(config))
+        .route("/api/v1/admin/config", get(config).patch(update_config))
         .route("/api/v1/admin/peers", get(list_peers))
         .route(
             "/api/v1/admin/peers/{node_id}",
@@ -276,20 +278,116 @@ struct ServerConfig {
     session_ttl_seconds: u64,
     cli_filename: &'static str,
     windows: bool,
+    doh_servers: Vec<String>,
+    stun_servers: Vec<String>,
 }
 
 async fn config(State(state): State<Arc<ServerInner>>, headers: HeaderMap) -> Response {
     if require_admin(&state, &headers).is_none() {
         return error_response(StatusCode::UNAUTHORIZED, "authentication required");
     }
-    Json(ServerConfig {
+    match server_config(&state) {
+        Ok(config) => Json(config).into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+fn server_config(state: &Arc<ServerInner>) -> Result<ServerConfig, CoordError> {
+    let network = network_config(state)?;
+    Ok(ServerConfig {
         tenant: state.tenant.clone(),
         server_key: BASE64.encode(state.signer.public()),
         session_ttl_seconds: SESSION_TTL_SECONDS,
         cli_filename: cli_filename(),
         windows: cfg!(windows),
+        doh_servers: network.doh_servers,
+        stun_servers: network.stun_servers,
     })
-    .into_response()
+}
+
+#[derive(Deserialize)]
+struct NetworkConfigRequest {
+    doh_servers: Vec<String>,
+    stun_servers: Vec<String>,
+}
+
+async fn update_config(
+    State(state): State<Arc<ServerInner>>,
+    headers: HeaderMap,
+    Json(request): Json<NetworkConfigRequest>,
+) -> Response {
+    if require_admin(&state, &headers).is_none() {
+        return error_response(StatusCode::UNAUTHORIZED, "authentication required");
+    }
+    let config = match validate_network_config(request) {
+        Ok(config) => config,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, &error),
+    };
+    match update_network_config(&state, config).await {
+        Ok(()) => match server_config(&state) {
+            Ok(config) => Json(config).into_response(),
+            Err(error) => internal_error(error),
+        },
+        Err(error) => internal_error(error),
+    }
+}
+
+fn validate_network_config(request: NetworkConfigRequest) -> Result<ServerNetworkConfig, String> {
+    let doh_servers = request
+        .doh_servers
+        .into_iter()
+        .map(|server| server.trim().to_owned())
+        .filter(|server| !server.is_empty())
+        .collect::<Vec<_>>();
+    if doh_servers.is_empty() {
+        return Err("at least one DoH endpoint is required".to_owned());
+    }
+    if doh_servers.len() > 8 {
+        return Err("at most 8 DoH endpoints are allowed".to_owned());
+    }
+    for server in &doh_servers {
+        let endpoint = Url::parse(server).map_err(|_| format!("invalid DoH endpoint: {server}"))?;
+        if endpoint.scheme() != "https" || endpoint.host_str().is_none() {
+            return Err(format!("DoH endpoint must be an https URL: {server}"));
+        }
+        if server.len() > 2_048 {
+            return Err("DoH endpoint is too long".to_owned());
+        }
+    }
+
+    let stun_servers = request
+        .stun_servers
+        .into_iter()
+        .map(|server| server.trim().to_owned())
+        .filter(|server| !server.is_empty())
+        .collect::<Vec<_>>();
+    if stun_servers.len() > 16 {
+        return Err("at most 16 STUN endpoints are allowed".to_owned());
+    }
+    for server in &stun_servers {
+        if server.len() > 256 || !valid_stun_endpoint(server) {
+            return Err(format!("invalid STUN endpoint: {server}"));
+        }
+    }
+    Ok(ServerNetworkConfig {
+        doh_servers,
+        stun_servers,
+    })
+}
+
+fn valid_stun_endpoint(value: &str) -> bool {
+    let (host, port) = if let Some(value) = value.strip_prefix('[') {
+        match value.split_once("]:") {
+            Some((host, port)) => (host, port),
+            None => return false,
+        }
+    } else {
+        match value.rsplit_once(':') {
+            Some((host, port)) if !host.contains(':') => (host, port),
+            _ => return false,
+        }
+    };
+    !host.is_empty() && port.parse::<u16>().is_ok_and(|port| port != 0)
 }
 
 #[derive(Serialize)]

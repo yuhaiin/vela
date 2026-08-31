@@ -7,7 +7,10 @@ use futures_util::{
 };
 use std::collections::VecDeque;
 use thiserror::Error;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use tokio::net::TcpStream;
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, client_async_tls_with_config, tungstenite::Message,
+};
 use url::Url;
 use vela_crypto::{Identity, MembershipCredential, verify_snapshot};
 use vela_proto::{
@@ -32,17 +35,53 @@ pub struct Registration {
 
 impl CoordinationClient {
     pub async fn connect(endpoint: impl AsRef<str>) -> Result<Self, CoordClientError> {
+        Self::connect_with_doh(endpoint, &vela_dns::default_servers()).await
+    }
+
+    pub async fn connect_with_doh(
+        endpoint: impl AsRef<str>,
+        doh_servers: &[String],
+    ) -> Result<Self, CoordClientError> {
         let url = Url::parse(endpoint.as_ref()).map_err(|_| CoordClientError::InvalidEndpoint)?;
-        let (stream, _) = connect_async(url.as_str())
-            .await
-            .map_err(|error| CoordClientError::WebSocket(error.to_string()))?;
-        let (writer, reader) = stream.split();
-        Ok(Self {
-            writer,
-            reader,
-            server_public_key: None,
-            pending: VecDeque::new(),
-        })
+        if !matches!(url.scheme(), "ws" | "wss") {
+            return Err(CoordClientError::InvalidEndpoint);
+        }
+        let host = url.host_str().ok_or(CoordClientError::InvalidEndpoint)?;
+        let port = url
+            .port_or_known_default()
+            .ok_or(CoordClientError::InvalidEndpoint)?;
+        let addresses = match host.parse() {
+            Ok(address) => vec![address],
+            Err(_) => vela_dns::resolve(host, doh_servers)
+                .await
+                .map_err(|error| CoordClientError::WebSocket(error.to_string()))?,
+        };
+        let mut last_error = None;
+        for address in addresses {
+            let address = std::net::SocketAddr::new(address, port);
+            let socket = match TcpStream::connect(address).await {
+                Ok(socket) => socket,
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                    continue;
+                }
+            };
+            match client_async_tls_with_config(url.as_str(), socket, None, None).await {
+                Ok((stream, _)) => {
+                    let (writer, reader) = stream.split();
+                    return Ok(Self {
+                        writer,
+                        reader,
+                        server_public_key: None,
+                        pending: VecDeque::new(),
+                    });
+                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+        }
+        Err(CoordClientError::WebSocket(last_error.unwrap_or_else(
+            || "no resolved coordination address".to_owned(),
+        )))
     }
 
     pub fn trust_server_key(&mut self, key: [u8; 32]) {

@@ -11,6 +11,7 @@ The workspace currently contains:
 
 - `vela-proto`: versioned JSON control messages and a bounds-checked binary data header.
 - `vela-crypto`: Ed25519 identity, X25519 Noise `IK`, signed membership credentials, and ChaCha20-Poly1305 datagrams.
+- `vela-dns`: DNS-over-HTTPS resolver for control-plane and candidate endpoints.
 - `vela-stun`: client-side STUN Binding transactions.
 - `vela-coord-client`: WebSocket control-plane client with server-key credential verification.
 - `vela-ip`: strict IPv4/IPv6 packet validation and exact host-route selection.
@@ -83,6 +84,8 @@ cargo run -p vela-cli -- server \
   --path ./vela-server \
   --bind 0.0.0.0:7000 \
   --tenant my-network
+# Optional initial values; both can also be changed in /admin.
+#   --doh https://doh.pub --stun stun.nextcloud.com:3478
 
 # The first server start prints a generated admin password once.
 # Open http://127.0.0.1:7000/admin and use it to manage peers.
@@ -124,13 +127,19 @@ does not expose the admin session token.
 `peer run` is a diagnostic peer process, not a server or relay. The
 coordination server only exchanges registration and candidate information;
 the Probe, Noise handshake, and encrypted Echo/Pong packets travel directly
-between peer UDP sockets. `--stun <host:port>` can be repeated during register
-or run to publish server-reflexive candidates; hostnames are resolved on every
-refresh. The server may also be started with repeated `--stun <host:port>`
-options, which are signed into snapshots and picked up by peers dynamically.
-The default peer bind is the dual-stack `[::]:0`, and host candidates are
-collected from active local interfaces, so peers on the same LAN can connect
-directly without going through STUN.
+between peer UDP sockets. Hostname resolution does not use the system resolver:
+peers use the built-in DoH endpoint `https://doh.pub` by default for the
+coordination endpoint and STUN hostnames. `--stun <host:port>` can be repeated
+during register or run to publish server-reflexive candidates; hostnames are
+resolved through DoH on every refresh. The server may be started with repeated
+`--doh <https-url>` and `--stun <host:port>` options, or both settings can be
+edited in `/admin`; changes are persisted, signed into snapshots, and pushed to
+online peers dynamically.
+The default peer bind is the dual-stack `[::]:0`. The peer UDP socket and its
+automatically collected host candidates use the host's main-table default-route
+interface, so addresses from unrelated VPN, container, or virtual interfaces
+are not advertised. Peers on the selected LAN can connect directly without
+going through STUN.
 
 On Linux, macOS, and Windows, `peer up` creates a layer-3 TUN interface, assigns
 the stable virtual address from the signed network snapshot, installs only the

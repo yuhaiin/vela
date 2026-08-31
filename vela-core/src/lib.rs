@@ -15,7 +15,7 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -62,16 +62,153 @@ pub trait DatagramSocket: Send + Sync {
 pub trait DatagramProvider: Send + Sync {
     async fn bind(&self, options: BindOptions) -> Result<Arc<dyn DatagramSocket>, CoreError>;
     fn local_candidates(&self) -> Vec<Candidate>;
+
+    /// Returns the interface selected for the default local socket, if any.
+    ///
+    /// Providers that manage their own socket and candidates can leave this
+    /// unset. The built-in provider uses it to keep fallback host candidates
+    /// consistent with the interface-bound socket.
+    fn local_interface(&self) -> Option<String> {
+        None
+    }
 }
 
 pub struct TokioDatagramProvider {
     pub host_candidates: Vec<Candidate>,
+    selected_interface: StdMutex<Option<DefaultRouteInterface>>,
 }
 
 impl TokioDatagramProvider {
     pub fn new(host_candidates: Vec<Candidate>) -> Self {
-        Self { host_candidates }
+        Self {
+            host_candidates,
+            selected_interface: StdMutex::new(None),
+        }
     }
+}
+
+#[derive(Clone, Debug)]
+struct DefaultRouteInterface {
+    name: String,
+    index: Option<std::num::NonZeroU32>,
+}
+
+fn default_route_interface(bind_addr: SocketAddr) -> io::Result<Option<DefaultRouteInterface>> {
+    let mut routes = route_manager::RouteManager::new()?;
+    let route = if bind_addr.is_ipv4() {
+        default_route(&mut routes, true)?
+    } else {
+        // The dual-stack socket uses the IPv4 default route when available;
+        // this is also the route used for IPv4-mapped destinations. Fall back
+        // to IPv6-only systems where no IPv4 default route exists.
+        match default_route(&mut routes, true)? {
+            Some(route) => Some(route),
+            None => default_route(&mut routes, false)?,
+        }
+    };
+    let Some(route) = route else {
+        return Ok(None);
+    };
+    let Some(name) = route.if_name().cloned() else {
+        return Ok(None);
+    };
+    Ok(Some(DefaultRouteInterface {
+        name,
+        index: route.if_index().and_then(std::num::NonZeroU32::new),
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn default_route(
+    routes: &mut route_manager::RouteManager,
+    ipv4: bool,
+) -> io::Result<Option<route_manager::Route>> {
+    // route_manager lists policy-routing tables as well as the main table.
+    // Vela/Tailscale may install a catch-all route in another table, but that
+    // is not the host's ordinary default egress route. Use the main table.
+    let mut candidates = routes
+        .list()?
+        .into_iter()
+        .filter(|route| {
+            route.prefix() == 0 && route.destination().is_ipv4() == ipv4 && route.table() == 254
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|route| route.metric().unwrap_or(u32::MAX));
+    Ok(candidates.into_iter().next())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn default_route(
+    routes: &mut route_manager::RouteManager,
+    ipv4: bool,
+) -> io::Result<Option<route_manager::Route>> {
+    let destination = if ipv4 {
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+    };
+    routes.find_route(&destination)
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "fuchsia",
+    target_os = "linux",
+    target_os = "ios",
+    target_os = "visionos",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "illumos",
+    target_os = "solaris",
+))]
+fn bind_socket_to_interface(socket: &Socket, interface: &DefaultRouteInterface) -> io::Result<()> {
+    let Some(index) = interface.index else {
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux",))]
+        {
+            return socket.bind_device(Some(interface.name.as_bytes()));
+        }
+        #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux",)))]
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "default route has no interface index",
+            ));
+        }
+    };
+
+    #[cfg(target_os = "linux")]
+    {
+        // On Linux both methods map to SO_BINDTOIFINDEX. Setting it twice can
+        // fail with EPERM even when the first call succeeded.
+        socket.bind_device_by_index_v4(Some(index))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        socket.bind_device_by_index_v4(Some(index))?;
+        socket.bind_device_by_index_v6(Some(index))
+    }
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "fuchsia",
+    target_os = "linux",
+    target_os = "ios",
+    target_os = "visionos",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "illumos",
+    target_os = "solaris",
+)))]
+fn bind_socket_to_interface(
+    _socket: &Socket,
+    _interface: &DefaultRouteInterface,
+) -> io::Result<()> {
+    // Windows and BSD platforms use the system route for outgoing packets;
+    // socket2 does not expose an interface-binding option for them.
+    Ok(())
 }
 
 #[async_trait]
@@ -83,11 +220,33 @@ impl DatagramProvider for TokioDatagramProvider {
             Domain::IPV6
         };
         let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+        let selected_interface = if options.local_addr.ip().is_unspecified() {
+            Some(default_route_interface(options.local_addr)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "no main-table default-route interface is available",
+                )
+            })?)
+        } else {
+            None
+        };
+        if let Some(interface) = &selected_interface {
+            tracing::info!(
+                interface = %interface.name,
+                index = ?interface.index,
+                "binding peer UDP socket to the default-route interface"
+            );
+            bind_socket_to_interface(&socket, interface)?;
+        }
         if options.local_addr.is_ipv6() && options.local_addr.ip().is_unspecified() {
             socket.set_only_v6(false)?;
         }
         socket.set_nonblocking(true)?;
         socket.bind(&options.local_addr.into())?;
+        *self
+            .selected_interface
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = selected_interface;
         Ok(Arc::new(TokioDatagramSocket {
             socket: UdpSocket::from_std(socket.into())?,
         }))
@@ -96,9 +255,21 @@ impl DatagramProvider for TokioDatagramProvider {
     fn local_candidates(&self) -> Vec<Candidate> {
         self.host_candidates.clone()
     }
+
+    fn local_interface(&self) -> Option<String> {
+        self.selected_interface
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|interface| interface.name.clone())
+    }
 }
 
-fn host_candidates(bind_addr: SocketAddr, port: u16) -> Vec<Candidate> {
+fn host_candidates(
+    bind_addr: SocketAddr,
+    port: u16,
+    interface_name: Option<&str>,
+) -> Vec<Candidate> {
     if !bind_addr.ip().is_unspecified() {
         return vec![Candidate::Host(SocketAddr::new(bind_addr.ip(), port))];
     }
@@ -112,6 +283,9 @@ fn host_candidates(bind_addr: SocketAddr, port: u16) -> Vec<Candidate> {
     };
     let mut candidates = Vec::new();
     for interface in interfaces {
+        if interface_name.is_some_and(|name| interface.name != name) {
+            continue;
+        }
         if interface.is_loopback() || interface.is_link_local() {
             continue;
         }
@@ -363,7 +537,12 @@ impl VelaNode {
             let Ok(local_addr) = self.local_addr() else {
                 return Vec::new();
             };
-            host_candidates(self.inner.config.bind.local_addr, local_addr.port())
+            let interface_name = self.inner.provider.local_interface();
+            host_candidates(
+                self.inner.config.bind.local_addr,
+                local_addr.port(),
+                interface_name.as_deref(),
+            )
         }
     }
 
@@ -1873,7 +2052,7 @@ mod tests {
     #[test]
     fn explicit_ipv6_bind_is_advertised_as_a_host_candidate() {
         let bind: SocketAddr = "[2001:db8::10]:0".parse().unwrap();
-        let candidates = host_candidates(bind, 45101);
+        let candidates = host_candidates(bind, 45101, None);
         assert_eq!(
             candidates,
             vec![Candidate::Host("[2001:db8::10]:45101".parse().unwrap())]
@@ -1992,6 +2171,9 @@ mod tests {
             .identity(identity_a.clone())
             .datagram_provider(Arc::new(TokioDatagramProvider::new(Vec::new())))
             .config(NodeConfig {
+                bind: BindOptions {
+                    local_addr: "[::1]:0".parse().unwrap(),
+                },
                 virtual_ipv4: Some(Ipv4Addr::new(10, 254, 0, 3)),
                 ..NodeConfig::default()
             })
@@ -2002,6 +2184,9 @@ mod tests {
             .identity(identity_b.clone())
             .datagram_provider(Arc::new(TokioDatagramProvider::new(Vec::new())))
             .config(NodeConfig {
+                bind: BindOptions {
+                    local_addr: "[::1]:0".parse().unwrap(),
+                },
                 virtual_ipv4: Some(Ipv4Addr::new(10, 254, 0, 4)),
                 ..NodeConfig::default()
             })
@@ -2105,6 +2290,7 @@ mod tests {
                     prefix_len: 16,
                 }),
                 virtual_ipv6: None,
+                doh_servers: Vec::new(),
                 stun_servers: Vec::new(),
                 peers,
                 expires_at: unix_time() + 60,

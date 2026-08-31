@@ -1,13 +1,16 @@
 [package]
-name = "vela-stun"
+name = "vela-dns"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-async-trait.workspace = true
-rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+url.workspace = true
+
+[dev-dependencies]
 tokio.workspace = true
-vela-dns = { path = "../vela-dns" }

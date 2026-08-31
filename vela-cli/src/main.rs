@@ -4,9 +4,11 @@ use vela_crypto::Identity;
 use vela_diagnostic::{DiagnosticControl, DiagnosticPeer, PeerState};
 use vela_proto::NodeId;
 
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
 fn usage() -> ! {
     eprintln!(
-        "Usage:\n  vela-cli identity <path>\n  vela-cli server --path <dir> --bind <addr> --tenant <name> [--stun <host:port>] [--admin-password-stdin]\n  vela-cli invite --path <dir> --tenant <name> [--ttl <seconds>]\n  vela-cli peers --path <dir> --tenant <name>\n  vela-cli revoke <node-id> --path <dir> --tenant <name>\n  vela-cli admin password reset --path <dir> [--password-stdin]\n  vela-cli peer register --state <dir> --server <url> --server-key <base64> --invite <token> [--bind <addr>] [--stun <host:port>]\n  vela-cli peer run --state <dir> [--bind <addr>] [--stun <host:port>]\n  vela-cli peer up --state <dir> [--tun <name>] [--mtu <bytes>] [--bind <addr>] [--stun <host:port>]\n  vela-cli peer list --state <dir> [--json]\n  vela-cli peer ping <node-id> --state <dir> [--count <n>] [--timeout <duration>] [--json]\n\nServer path defaults: <path>/vela.db, <path>/server.key, <path>/admin.credentials.\nLegacy --db/--signer and --admin-credentials overrides are still accepted."
+        "Usage:\n  vela-cli identity <path>\n  vela-cli server --path <dir> --bind <addr> --tenant <name> [--doh <https-url>] [--stun <host:port>] [--admin-password-stdin]\n  vela-cli invite --path <dir> --tenant <name> [--ttl <seconds>]\n  vela-cli peers --path <dir> --tenant <name>\n  vela-cli revoke <node-id> --path <dir> --tenant <name>\n  vela-cli admin password reset --path <dir> [--password-stdin]\n  vela-cli peer register --state <dir> --server <url> --server-key <base64> --invite <token> [--bind <addr>] [--stun <host:port>]\n  vela-cli peer run --state <dir> [--bind <addr>] [--stun <host:port>]\n  vela-cli peer up --state <dir> [--tun <name>] [--mtu <bytes>] [--bind <addr>] [--stun <host:port>]\n  vela-cli peer list --state <dir> [--json]\n  vela-cli peer ping <node-id> --state <dir> [--count <n>] [--timeout <duration>] [--json]\n\nServer path defaults: <path>/vela.db, <path>/server.key, <path>/admin.credentials.\nThe server DoH/STUN settings can also be changed from the admin web page.\nLegacy --db/--signer and --admin-credentials overrides are still accepted."
     );
     eprintln!("  vela-cli peer status --state <dir> [--json]");
     std::process::exit(2);
@@ -61,6 +63,24 @@ fn bind_option(args: &[String]) -> Result<Option<SocketAddr>, Box<dyn std::error
         .transpose()
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+async fn release_route_leases(leases: &mut Vec<vela_tun::RouteLease>) {
+    let pending = std::mem::take(leases);
+    if tokio::time::timeout(SHUTDOWN_TIMEOUT, async move {
+        for lease in pending {
+            let _ = lease.release().await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        tracing::warn!(
+            timeout = ?SHUTDOWN_TIMEOUT,
+            "timed out while releasing TUN routes during shutdown"
+        );
+    }
+}
+
 fn coordination_paths(args: &[String]) -> (PathBuf, PathBuf, PathBuf) {
     let path = option(args, "--path").map(PathBuf::from);
     let database = option(args, "--db")
@@ -86,11 +106,12 @@ fn coordination_paths(args: &[String]) -> (PathBuf, PathBuf, PathBuf) {
 
 fn open_coordination_server(args: &[String]) -> Result<CoordServer, Box<dyn std::error::Error>> {
     let (database, signer, credentials) = coordination_paths(args);
-    Ok(CoordServer::open_with_admin_credentials_and_stun_servers(
+    Ok(CoordServer::open_with_admin_credentials_and_network_config(
         database,
         signer,
         required(args, "--tenant"),
         credentials,
+        options(args, "--doh"),
         options(args, "--stun"),
     )?)
 }
@@ -171,7 +192,7 @@ async fn run_peer_command(args: &[String]) -> Result<(), Box<dyn std::error::Err
                     .ok_or("state has no network snapshot; register first")?;
                 let tun_name = option(args, "--tun").unwrap_or_else(|| {
                     if cfg!(target_os = "macos") {
-                        "utun0".into()
+                        String::new()
                     } else {
                         "vela0".into()
                     }
@@ -218,11 +239,26 @@ async fn run_peer_command(args: &[String]) -> Result<(), Box<dyn std::error::Err
             if args.iter().any(|arg| arg == "--json") {
                 println!("{}", serde_json::to_string_pretty(&peers)?);
             } else {
+                println!("name\tnode\tstatus\tipv4\tipv6\tcapabilities");
                 for peer in peers {
+                    let name = if peer.name.is_empty() {
+                        "-"
+                    } else {
+                        peer.name.as_str()
+                    };
+                    let ipv4 = peer
+                        .virtual_ipv4
+                        .map_or_else(|| "-".to_owned(), |address| address.to_string());
+                    let ipv6 = peer
+                        .virtual_ipv6
+                        .map_or_else(|| "-".to_owned(), |address| address.to_string());
                     println!(
-                        "{}\t{}\t{:?}",
+                        "{}\t{}\t{}\t{}\t{}\t{:?}",
+                        name,
                         peer.node_id,
                         if peer.online { "online" } else { "offline" },
+                        ipv4,
+                        ipv6,
                         peer.capabilities
                     );
                 }
@@ -238,6 +274,7 @@ async fn run_peer_command(args: &[String]) -> Result<(), Box<dyn std::error::Err
                 println!("node\t{}", status.node_id);
                 println!("server\t{}", status.server);
                 println!("bind\t{}", status.bind);
+                println!("doh_servers\t{:?}", status.doh_servers);
                 println!("stun_servers\t{:?}", status.stun_servers);
                 println!("candidates\t{:?}", status.candidates);
                 println!("peers\t{}", status.peers.len());
@@ -286,6 +323,8 @@ async fn run_tun_peer(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let node = peer.node.clone();
     let mut refresh = tokio::time::interval(Duration::from_secs(60));
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
     loop {
         tokio::select! {
             packet = tun.recv() => {
@@ -314,8 +353,9 @@ async fn run_tun_peer(
                         node.register_peer(info).await?;
                     }
                     vela_proto::ControlMessage::Snapshot { snapshot } => {
-                        peer.apply_snapshot(snapshot.clone()).await?;
-                        peer.refresh_candidates().await?;
+                        if peer.apply_snapshot(snapshot.clone()).await? {
+                            peer.refresh_candidates().await?;
+                        }
                         for lease in leases.drain(..) {
                             let _ = lease.release().await;
                         }
@@ -342,11 +382,9 @@ async fn run_tun_peer(
                     _ => {}
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
-                for lease in leases.drain(..) {
-                    let _ = lease.release().await;
-                }
+            _ = &mut ctrl_c => {
                 peer.node.shutdown().await;
+                release_route_leases(&mut leases).await;
                 return Ok(());
             }
             tick = refresh.tick() => {
@@ -357,8 +395,16 @@ async fn run_tun_peer(
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(async_main());
+    runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
+    result
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Rustls crypto provider already installed");
@@ -382,11 +428,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(password) = password_from_stdin(&args)? {
                 CoordServer::reset_admin_password(&credentials, Some(&password))?;
             }
-            let server = CoordServer::open_with_admin_credentials_and_stun_servers(
+            let server = CoordServer::open_with_admin_credentials_and_network_config(
                 database,
                 signer,
                 tenant,
                 credentials,
+                options(&args, "--doh"),
                 options(&args, "--stun"),
             )?;
             println!(

@@ -11,6 +11,7 @@ use thiserror::Error;
 
 #[derive(Clone, Debug)]
 pub struct TunConfig {
+    /// Empty on macOS lets the kernel choose an available `utunN` interface.
     pub name: String,
     pub mtu: usize,
 }
@@ -19,7 +20,7 @@ impl Default for TunConfig {
     fn default() -> Self {
         Self {
             name: if cfg!(target_os = "macos") {
-                "utun0"
+                ""
             } else {
                 "vela0"
             }
@@ -389,6 +390,7 @@ mod platform {
 
     impl TunDevice {
         pub fn open(config: TunConfig) -> Result<Self, TunError> {
+            #[cfg(not(target_os = "macos"))]
             if config.name.is_empty() {
                 return Err(TunError::InvalidName);
             }
@@ -398,14 +400,16 @@ mod platform {
             let mtu = u16::try_from(config.mtu).map_err(|_| TunError::InvalidMtu)?;
 
             #[cfg(target_os = "macos")]
-            if !config.name.starts_with("utun") || config.name[4..].parse::<u32>().is_err() {
+            if !config.name.is_empty()
+                && (!config.name.starts_with("utun") || config.name[4..].parse::<u32>().is_err())
+            {
                 return Err(TunError::InvalidName);
             }
 
-            let mut builder = DeviceBuilder::new()
-                .name(config.name.clone())
-                .mtu(mtu)
-                .layer(Layer::L3);
+            let mut builder = DeviceBuilder::new().mtu(mtu).layer(Layer::L3);
+            if !config.name.is_empty() {
+                builder = builder.name(config.name.clone());
+            }
             #[cfg(target_os = "macos")]
             {
                 builder = builder.with(|options| {

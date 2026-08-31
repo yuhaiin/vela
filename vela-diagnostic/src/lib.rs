@@ -26,13 +26,21 @@ const STATE_FILE: &str = "state.json";
 const IDENTITY_FILE: &str = "identity";
 const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
+fn default_doh_servers() -> Vec<String> {
+    vela_stun::default_doh_servers()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerState {
     pub server: String,
     pub server_key: [u8; 32],
     pub credential: Option<MembershipCredential>,
     pub bind: SocketAddr,
+    #[serde(default = "default_doh_servers")]
+    pub doh_servers: Vec<String>,
     pub stun_servers: Vec<String>,
+    #[serde(default)]
+    pub manual_stun_servers: Vec<String>,
     pub candidates: Vec<Candidate>,
     pub snapshot: Option<NetworkSnapshot>,
 }
@@ -49,7 +57,9 @@ impl PeerState {
             server_key,
             credential: None,
             bind,
-            stun_servers,
+            doh_servers: default_doh_servers(),
+            stun_servers: stun_servers.clone(),
+            manual_stun_servers: stun_servers,
             candidates: Vec::new(),
             snapshot: None,
         }
@@ -124,7 +134,8 @@ impl DiagnosticControl {
         let state_dir = state_dir.as_ref();
         let mut state = PeerState::load(state_dir)?;
         let identity = Identity::load(PeerState::identity_path(state_dir))?;
-        let mut client = CoordinationClient::connect(&state.server).await?;
+        let mut client =
+            CoordinationClient::connect_with_doh(&state.server, &state.doh_servers).await?;
         client.trust_server_key(state.server_key);
         let registration = client
             .register(
@@ -136,8 +147,11 @@ impl DiagnosticControl {
             .await?;
         state.credential = Some(registration.credential);
         state.snapshot = Some(registration.snapshot.clone());
-        state.stun_servers =
-            merge_stun_servers(&state.stun_servers, &registration.snapshot.stun_servers);
+        state.doh_servers = effective_doh_servers(&registration.snapshot.doh_servers);
+        state.stun_servers = merge_stun_servers(
+            &state.manual_stun_servers,
+            &registration.snapshot.stun_servers,
+        );
         state.save(state_dir)?;
         Ok(Self {
             client,
@@ -159,6 +173,7 @@ impl DiagnosticControl {
             node_id: self.node_id(),
             server: self.state.server.clone(),
             bind: self.state.bind,
+            doh_servers: self.state.doh_servers.clone(),
             stun_servers: self.state.stun_servers.clone(),
             candidates: self.state.candidates.clone(),
             credential_expires_at: self
@@ -184,8 +199,9 @@ impl DiagnosticPeer {
         }
         // Keep an explicitly configured local STUN endpoint across restarts;
         // coordinator endpoints are merged into it when a snapshot arrives.
-        let manual_stun_servers = stun_servers.unwrap_or_else(|| state.stun_servers.clone());
+        let manual_stun_servers = stun_servers.unwrap_or_else(|| state.manual_stun_servers.clone());
         if !manual_stun_servers.is_empty() {
+            state.manual_stun_servers = manual_stun_servers.clone();
             state.stun_servers = manual_stun_servers.clone();
         }
         let identity = Identity::load(PeerState::identity_path(state_dir))?;
@@ -245,6 +261,7 @@ impl DiagnosticPeer {
             match node
                 .gather_server_reflexive_candidates(&vela_stun::StunConfig {
                     servers: state.stun_servers.clone(),
+                    doh_servers: state.doh_servers.clone(),
                     ..vela_stun::StunConfig::default()
                 })
                 .await
@@ -260,7 +277,8 @@ impl DiagnosticPeer {
         if candidates.is_empty() {
             return Err(DiagnosticError::NoCandidates);
         }
-        let mut client = CoordinationClient::connect(&state.server).await?;
+        let mut client =
+            CoordinationClient::connect_with_doh(&state.server, &state.doh_servers).await?;
         client.trust_server_key(state.server_key);
         Ok(Self {
             node,
@@ -293,6 +311,7 @@ impl DiagnosticPeer {
             node_id: self.node_id(),
             server: self.state.server.clone(),
             bind: self.state.bind,
+            doh_servers: self.state.doh_servers.clone(),
             stun_servers: self.state.stun_servers.clone(),
             candidates: self.candidates.clone(),
             credential_expires_at: self
@@ -313,6 +332,9 @@ impl DiagnosticPeer {
             }
             Err(error) => return Err(error),
         };
+        if candidates == self.candidates {
+            return Ok(());
+        }
         self.client.update_candidates(candidates.clone()).await?;
         self.candidates = candidates.clone();
         self.state.candidates = candidates;
@@ -323,13 +345,17 @@ impl DiagnosticPeer {
     pub async fn apply_snapshot(
         &mut self,
         snapshot: NetworkSnapshot,
-    ) -> Result<(), DiagnosticError> {
+    ) -> Result<bool, DiagnosticError> {
+        let previous_doh_servers = self.state.doh_servers.clone();
+        let previous_stun_servers = self.state.stun_servers.clone();
         self.node.apply_snapshot(snapshot.clone()).await?;
+        self.state.doh_servers = effective_doh_servers(&snapshot.doh_servers);
         self.state.stun_servers =
             merge_stun_servers(&self.manual_stun_servers, &snapshot.stun_servers);
         self.state.snapshot = Some(snapshot);
         self.state.save(&self.state_dir)?;
-        Ok(())
+        Ok(self.state.doh_servers != previous_doh_servers
+            || self.state.stun_servers != previous_stun_servers)
     }
 
     async fn collect_candidates(&self) -> Result<Vec<Candidate>, DiagnosticError> {
@@ -339,6 +365,7 @@ impl DiagnosticPeer {
                 .node
                 .gather_server_reflexive_candidates(&vela_stun::StunConfig {
                     servers: self.state.stun_servers.clone(),
+                    doh_servers: self.state.doh_servers.clone(),
                     ..vela_stun::StunConfig::default()
                 })
                 .await
@@ -346,7 +373,8 @@ impl DiagnosticPeer {
                 Ok(stun_candidates) => candidates.extend(stun_candidates),
                 Err(error) if candidates.is_empty() => return Err(error.into()),
                 Err(error) => {
-                    warn!(error = %error, "STUN refresh failed; using host candidates");
+                    warn!(error = %error, "STUN refresh failed; using host and cached server-reflexive candidates");
+                    retain_server_reflexive_candidates(&mut candidates, &self.candidates);
                 }
             }
         }
@@ -385,8 +413,9 @@ impl DiagnosticPeer {
                         self.node.register_peer(peer).await?;
                     }
                     ControlMessage::Snapshot { snapshot } => {
-                        self.apply_snapshot(snapshot).await?;
-                        self.refresh_candidates().await?;
+                        if self.apply_snapshot(snapshot).await? {
+                            self.refresh_candidates().await?;
+                        }
                     }
                     ControlMessage::Revoke { node_id } if node_id == self.node_id() => {
                         return Err(DiagnosticError::Revoked);
@@ -404,6 +433,7 @@ pub struct PeerStatus {
     pub node_id: NodeId,
     pub server: String,
     pub bind: SocketAddr,
+    pub doh_servers: Vec<String>,
     pub stun_servers: Vec<String>,
     pub candidates: Vec<Candidate>,
     pub credential_expires_at: Option<u64>,
@@ -498,6 +528,14 @@ fn merge_stun_servers(local: &[String], remote: &[String]) -> Vec<String> {
     servers
 }
 
+fn effective_doh_servers(servers: &[String]) -> Vec<String> {
+    if servers.is_empty() {
+        default_doh_servers()
+    } else {
+        servers.to_vec()
+    }
+}
+
 fn unique_candidates(candidates: Vec<Candidate>) -> Vec<Candidate> {
     let mut unique = Vec::with_capacity(candidates.len());
     for candidate in candidates {
@@ -508,6 +546,14 @@ fn unique_candidates(candidates: Vec<Candidate>) -> Vec<Candidate> {
     unique
 }
 
+fn retain_server_reflexive_candidates(candidates: &mut Vec<Candidate>, previous: &[Candidate]) {
+    for candidate in previous {
+        if matches!(candidate, Candidate::ServerReflexive(_)) && !candidates.contains(candidate) {
+            candidates.push(candidate.clone());
+        }
+    }
+}
+
 fn set_private(_path: &Path) -> Result<(), std::io::Error> {
     #[cfg(unix)]
     {
@@ -515,4 +561,37 @@ fn set_private(_path: &Path) -> Result<(), std::io::Error> {
         fs::set_permissions(_path, fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_stun_refresh_keeps_cached_server_reflexive_candidates() {
+        let mut candidates = vec![Candidate::Host("192.0.2.10:40000".parse().unwrap())];
+        let previous = vec![Candidate::ServerReflexive(
+            "198.51.100.10:40000".parse().unwrap(),
+        )];
+
+        retain_server_reflexive_candidates(&mut candidates, &previous);
+
+        assert_eq!(
+            candidates,
+            vec![
+                Candidate::Host("192.0.2.10:40000".parse().unwrap()),
+                Candidate::ServerReflexive("198.51.100.10:40000".parse().unwrap()),
+            ]
+        );
+    }
+
+    #[test]
+    fn cached_server_reflexive_candidates_are_not_duplicated() {
+        let cached = Candidate::ServerReflexive("198.51.100.10:40000".parse().unwrap());
+        let mut candidates = vec![cached.clone()];
+
+        retain_server_reflexive_candidates(&mut candidates, std::slice::from_ref(&cached));
+
+        assert_eq!(candidates, vec![cached]);
+    }
 }

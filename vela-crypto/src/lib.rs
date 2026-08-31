@@ -506,6 +506,7 @@ mod tests {
                 prefix_len: 16,
             }),
             virtual_ipv6: None,
+            doh_servers: Vec::new(),
             stun_servers: Vec::new(),
             peers: vec![PeerInfo {
                 node_id: public.node_id,

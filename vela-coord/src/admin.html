@@ -61,6 +61,29 @@
       </section>
 
       <section class="mt-6 rounded-2xl bg-slate-900 p-5 ring-1 ring-slate-800">
+        <div class="flex flex-wrap items-center justify-between gap-4">
+          <div>
+            <h2 class="text-lg font-medium">Network resolution and NAT traversal</h2>
+            <p class="mt-1 text-sm text-slate-400">Peers use these signed settings for hostname resolution and STUN candidate gathering.</p>
+          </div>
+          <span id="network-config-status" class="text-sm text-slate-400"></span>
+        </div>
+        <form id="network-config-form" class="mt-4 grid gap-4 md:grid-cols-2">
+          <label class="block text-sm text-slate-300">DoH endpoints (one per line)
+            <textarea id="doh-servers" rows="3" required class="mt-1 w-full rounded-lg bg-slate-800 px-3 py-2 font-mono text-sm outline-none ring-slate-500 focus:ring-2"></textarea>
+            <span class="mt-1 block text-xs text-slate-500">HTTPS only. Defaults to https://doh.pub.</span>
+          </label>
+          <label class="block text-sm text-slate-300">STUN endpoints (one per line)
+            <textarea id="stun-servers" rows="3" class="mt-1 w-full rounded-lg bg-slate-800 px-3 py-2 font-mono text-sm outline-none ring-slate-500 focus:ring-2"></textarea>
+            <span class="mt-1 block text-xs text-slate-500">Use host:port or [IPv6]:port. Empty disables STUN gathering.</span>
+          </label>
+          <div class="md:col-span-2">
+            <button class="rounded-lg bg-cyan-500 px-4 py-2 font-medium text-slate-950 hover:bg-cyan-400">Save network settings</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="mt-6 rounded-2xl bg-slate-900 p-5 ring-1 ring-slate-800">
         <div class="flex items-center justify-between gap-4">
           <h2 class="text-lg font-medium">Invites</h2>
           <span class="text-xs text-slate-500">Refreshes every 5 seconds</span>
@@ -149,9 +172,14 @@
     try {
       serverConfig = await api('/api/v1/admin/config');
       $('server-info').textContent = `tenant: ${serverConfig.tenant} · server key: ${serverConfig.server_key}`;
+      renderNetworkConfig();
       await refresh();
       if (!pollTimer) pollTimer = setInterval(refresh, 5000);
     } catch (error) { showError($('app-error'), error.message); }
+  }
+  function renderNetworkConfig() {
+    $('doh-servers').value = (serverConfig?.doh_servers || []).join('\n');
+    $('stun-servers').value = (serverConfig?.stun_servers || []).join('\n');
   }
   async function refresh() {
     try {
@@ -250,6 +278,21 @@
       const invite = await api('/api/v1/admin/invites', {method: 'POST', body: {name: $('invite-name').value, notes: $('invite-notes').value, ttl_seconds: Number($('invite-ttl').value)}});
       showInvite(invite); $('invite-form').reset(); $('invite-ttl').value = 3600; await refresh();
     } catch (error) { showError($('app-error'), error.message); }
+  });
+  $('network-config-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const lines = (id) => $(id).value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+    try {
+      serverConfig = await api('/api/v1/admin/config', {
+        method: 'PATCH',
+        body: {doh_servers: lines('doh-servers'), stun_servers: lines('stun-servers')},
+      });
+      renderNetworkConfig();
+      $('network-config-status').textContent = 'Saved and broadcast to online peers';
+      setTimeout(() => { $('network-config-status').textContent = ''; }, 4000);
+    } catch (error) {
+      showError($('app-error'), error.message);
+    }
   });
   $('peers').addEventListener('click', async (event) => {
     const button = event.target.closest('button[data-action]'); if (!button) return;

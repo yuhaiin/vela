@@ -42,8 +42,14 @@ async fn clients_discover_online_peers_and_receive_connect_signal() {
     let db = base.with_extension("db");
     let signer = base.with_extension("key");
     let server = CoordServer::open(&db, &signer, "integration").unwrap();
-    let token_a = server.create_invite(60).unwrap();
-    let token_b = server.create_invite(60).unwrap();
+    let token_a = server
+        .create_invite_with_metadata("laptop-a", "", 60)
+        .unwrap()
+        .invite_token;
+    let token_b = server
+        .create_invite_with_metadata("laptop-b", "", 60)
+        .unwrap()
+        .invite_token;
     let server_key = server.server_public_key();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -84,11 +90,18 @@ async fn clients_discover_online_peers_and_receive_connect_signal() {
     assert!(matches!(snapshot_a, ControlMessage::Snapshot { .. }));
 
     let peers = client_b.list_peers().await.unwrap();
-    assert!(
-        peers
-            .iter()
-            .any(|peer| { peer.node_id == identity_a.public().node_id && peer.online })
-    );
+    assert!(peers.iter().any(|peer| {
+        peer.node_id == identity_a.public().node_id
+            && peer.name == "laptop-a"
+            && peer.online
+            && peer.virtual_ipv4
+                == registration_b
+                    .snapshot
+                    .peers
+                    .iter()
+                    .find(|value| value.node_id == identity_a.public().node_id)
+                    .and_then(|value| value.virtual_ipv4)
+    }));
     assert!(matches!(
         client_b.recv().await.unwrap(),
         ControlMessage::Snapshot { .. }

@@ -238,7 +238,13 @@ pub enum PeerCapability {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PeerSummary {
     pub node_id: NodeId,
+    #[serde(default)]
+    pub name: String,
     pub online: bool,
+    #[serde(default)]
+    pub virtual_ipv4: Option<Ipv4Addr>,
+    #[serde(default)]
+    pub virtual_ipv6: Option<Ipv6Addr>,
     pub capabilities: Vec<PeerCapability>,
 }
 
@@ -302,6 +308,10 @@ pub struct NetworkSnapshot {
     pub generation: u64,
     pub virtual_ipv4: Option<Ipv4Cidr>,
     pub virtual_ipv6: Option<Ipv6Cidr>,
+    /// DNS-over-HTTPS endpoints recommended by the coordinator. These are
+    /// signed with the snapshot and used for all hostname resolution.
+    #[serde(default)]
+    pub doh_servers: Vec<String>,
     /// STUN endpoints recommended by the coordinator. These are signed with
     /// the snapshot so peers can refresh their candidate configuration safely.
     #[serde(default)]
@@ -379,18 +389,25 @@ impl NetworkSnapshot {
 
     pub fn unsigned_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(128);
-        // Keep snapshots without coordinator-managed STUN endpoints
-        // verifiable by older peers. Adding STUN configuration opts into the
-        // v2 signed payload format.
-        if self.stun_servers.is_empty() {
+        // Keep old snapshots verifiable while using a new payload version for
+        // coordinator-managed DoH configuration.
+        if self.doh_servers.is_empty() && self.stun_servers.is_empty() {
             out.extend_from_slice(b"VELA-NETWORK-SNAPSHOT-v1");
-        } else {
+        } else if self.doh_servers.is_empty() {
             out.extend_from_slice(b"VELA-NETWORK-SNAPSHOT-v2");
+        } else {
+            out.extend_from_slice(b"VELA-NETWORK-SNAPSHOT-v3");
         }
         out.extend_from_slice(&self.network_id);
         out.extend_from_slice(&self.generation.to_be_bytes());
         encode_ipv4_cidr(&mut out, self.virtual_ipv4);
         encode_ipv6_cidr(&mut out, self.virtual_ipv6);
+        if !self.doh_servers.is_empty() {
+            out.extend_from_slice(&(self.doh_servers.len() as u32).to_be_bytes());
+            for server in &self.doh_servers {
+                encode_string(&mut out, server);
+            }
+        }
         if !self.stun_servers.is_empty() {
             out.extend_from_slice(&(self.stun_servers.len() as u32).to_be_bytes());
             for server in &self.stun_servers {
