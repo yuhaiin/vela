@@ -13,13 +13,12 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
-use axum_server::tls_rustls::RustlsConfig;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_util::{SinkExt, StreamExt};
 use rand::RngCore;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{Ipv4Addr, Ipv6Addr},
     path::Path,
     sync::{Arc, Mutex},
@@ -37,17 +36,24 @@ use vela_proto::{
     PeerSummary, PublicPeerInfo,
 };
 
+mod admin;
+
+const VIRTUAL_IPV4_NETWORK_BASE: u32 = u32::from_be_bytes([10, 254, 0, 0]);
+const VIRTUAL_IPV4_PREFIX_LEN: u8 = 16;
+const VIRTUAL_IPV4_USABLE_HOSTS: u32 = (1 << 16) - 2;
+
 #[derive(Clone)]
 pub struct CoordServer {
     inner: Arc<ServerInner>,
 }
 
 struct ServerInner {
-    tenant: String,
-    signer: ServerSigner,
-    database: Mutex<Connection>,
-    online: AsyncMutex<HashMap<NodeId, HashMap<u64, mpsc::Sender<ControlMessage>>>>,
-    snapshot_generation: std::sync::atomic::AtomicU64,
+    pub(crate) tenant: String,
+    pub(crate) signer: ServerSigner,
+    pub(crate) database: Mutex<Connection>,
+    pub(crate) online: AsyncMutex<HashMap<NodeId, HashMap<u64, mpsc::Sender<ControlMessage>>>>,
+    pub(crate) snapshot_generation: std::sync::atomic::AtomicU64,
+    pub(crate) admin: admin::AdminAuth,
 }
 
 impl CoordServer {
@@ -56,11 +62,21 @@ impl CoordServer {
         signer_path: impl AsRef<Path>,
         tenant: impl Into<String>,
     ) -> Result<Self, CoordError> {
+        let credentials_path = database_path.as_ref().with_extension("admin-credentials");
+        Self::open_with_admin_credentials(database_path, signer_path, tenant, credentials_path)
+    }
+
+    pub fn open_with_admin_credentials(
+        database_path: impl AsRef<Path>,
+        signer_path: impl AsRef<Path>,
+        tenant: impl Into<String>,
+        credentials_path: impl AsRef<Path>,
+    ) -> Result<Self, CoordError> {
         let database_path = database_path.as_ref();
         if let Some(parent) = database_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let connection = Connection::open(database_path)?;
+        let mut connection = Connection::open(database_path)?;
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS peers (
                 node_id BLOB PRIMARY KEY,
@@ -71,12 +87,22 @@ impl CoordServer {
                 virtual_ipv6 BLOB,
                 credential BLOB NOT NULL,
                 capabilities TEXT NOT NULL,
-                revoked INTEGER NOT NULL DEFAULT 0
+                revoked INTEGER NOT NULL DEFAULT 0,
+                name TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                last_seen INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS invites (
                 token_hash BLOB PRIMARY KEY,
                 expires_at INTEGER NOT NULL,
-                used INTEGER NOT NULL DEFAULT 0
+                used INTEGER NOT NULL DEFAULT 0,
+                id TEXT UNIQUE,
+                name TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL DEFAULT 0,
+                revoked INTEGER NOT NULL DEFAULT 0,
+                download_token_hash BLOB,
+                download_used INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY,
@@ -85,6 +111,52 @@ impl CoordServer {
         )?;
         let _ = connection.execute("ALTER TABLE peers ADD COLUMN virtual_ipv4 BLOB", []);
         let _ = connection.execute("ALTER TABLE peers ADD COLUMN virtual_ipv6 BLOB", []);
+        let _ = connection.execute(
+            "ALTER TABLE peers ADD COLUMN name TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = connection.execute(
+            "ALTER TABLE peers ADD COLUMN notes TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = connection.execute(
+            "ALTER TABLE peers ADD COLUMN last_seen INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = connection.execute("ALTER TABLE invites ADD COLUMN id TEXT", []);
+        let _ = connection.execute(
+            "ALTER TABLE invites ADD COLUMN name TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = connection.execute(
+            "ALTER TABLE invites ADD COLUMN notes TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = connection.execute(
+            "ALTER TABLE invites ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = connection.execute(
+            "ALTER TABLE invites ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = connection.execute(
+            "ALTER TABLE invites ADD COLUMN download_token_hash BLOB",
+            [],
+        );
+        let _ = connection.execute(
+            "ALTER TABLE invites ADD COLUMN download_used INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        connection.execute(
+            "UPDATE invites SET id = lower(hex(token_hash)) WHERE id IS NULL OR id = ''",
+            [],
+        )?;
+        connection.execute(
+            "UPDATE invites SET created_at = expires_at WHERE created_at = 0",
+            [],
+        )?;
+        migrate_virtual_ipv4(&mut connection)?;
         connection.execute(
             "INSERT OR IGNORE INTO metadata(key, value) VALUES('snapshot_generation', 1)",
             [],
@@ -99,20 +171,28 @@ impl CoordServer {
             .and_then(|value| u64::try_from(value).ok())
             .filter(|value| *value != 0)
             .unwrap_or(1);
-        Ok(Self {
+        let (admin, generated_password) =
+            admin::AdminAuth::load_or_create(credentials_path.as_ref())?;
+        let server = Self {
             inner: Arc::new(ServerInner {
                 tenant: tenant.into(),
                 signer: ServerSigner::load_or_generate(signer_path)?,
                 database: Mutex::new(connection),
                 online: AsyncMutex::new(HashMap::new()),
                 snapshot_generation: std::sync::atomic::AtomicU64::new(snapshot_generation),
+                admin,
             }),
-        })
+        };
+        if let Some(password) = generated_password {
+            eprintln!("generated admin password (save it now): {}", password);
+        }
+        Ok(server)
     }
 
     pub fn router(&self) -> Router {
         Router::new()
             .route("/ws", get(ws_handler))
+            .merge(admin::router())
             .with_state(self.inner.clone())
     }
 
@@ -122,58 +202,48 @@ impl CoordServer {
             .map_err(|error| CoordError::Server(error.to_string()))
     }
 
-    pub async fn serve_tls(
-        &self,
-        bind: std::net::SocketAddr,
-        certificate: impl AsRef<Path>,
-        private_key: impl AsRef<Path>,
-    ) -> Result<(), CoordError> {
-        let config = RustlsConfig::from_pem_file(certificate, private_key)
-            .await
-            .map_err(|error| CoordError::Server(error.to_string()))?;
-        axum_server::bind_rustls(bind, config)
-            .serve(self.router().into_make_service())
-            .await
-            .map_err(|error| CoordError::Server(error.to_string()))
-    }
     pub fn server_public_key(&self) -> [u8; 32] {
         self.inner.signer.public()
     }
 
     pub fn create_invite(&self, ttl_seconds: u64) -> Result<String, CoordError> {
-        let mut token_bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut token_bytes);
-        let token = BASE64.encode(token_bytes);
-        let hash = *blake3::hash(token.as_bytes()).as_bytes();
-        let expires = unix_time().saturating_add(ttl_seconds);
-        self.inner
-            .database
-            .lock()
-            .map_err(|_| CoordError::DatabasePoisoned)?
-            .execute(
-                "INSERT INTO invites(token_hash, expires_at) VALUES(?1, ?2)",
-                params![hash.as_slice(), expires as i64],
-            )?;
-        Ok(token)
+        Ok(create_invite(&self.inner, "", "", ttl_seconds)?.invite_token)
+    }
+
+    pub fn create_invite_with_metadata(
+        &self,
+        name: &str,
+        notes: &str,
+        ttl_seconds: u64,
+    ) -> Result<CreatedInvite, CoordError> {
+        create_invite(&self.inner, name, notes, ttl_seconds)
+    }
+
+    pub fn reset_admin_password(
+        credentials_path: impl AsRef<Path>,
+        password: Option<&str>,
+    ) -> Result<String, CoordError> {
+        admin::AdminAuth::reset_password(credentials_path.as_ref(), password)
     }
 
     pub async fn revoke_peer(&self, node_id: NodeId) -> Result<(), CoordError> {
-        self.inner
-            .database
-            .lock()
-            .map_err(|_| CoordError::DatabasePoisoned)?
-            .execute(
-                "UPDATE peers SET revoked = 1 WHERE node_id = ?1",
-                params![node_id.as_bytes().as_slice()],
-            )?;
-        if let Some(sessions) = self.inner.online.lock().await.remove(&node_id) {
-            for sender in sessions.into_values() {
-                let _ = sender.send(ControlMessage::Revoke { node_id }).await;
-            }
+        if !revoke_peer_inner(&self.inner, node_id).await? {
+            return Err(CoordError::PeerNotRegistered);
         }
-        bump_snapshot(&self.inner)?;
-        broadcast_snapshot(&self.inner).await?;
         Ok(())
+    }
+
+    pub async fn delete_peer(&self, node_id: NodeId) -> Result<bool, CoordError> {
+        delete_peer_inner(&self.inner, node_id).await
+    }
+
+    pub fn update_peer_metadata(
+        &self,
+        node_id: NodeId,
+        name: &str,
+        notes: &str,
+    ) -> Result<bool, CoordError> {
+        update_peer_metadata(&self.inner, node_id, name, notes)
     }
 
     pub fn list_peers(&self) -> Result<Vec<NodeId>, CoordError> {
@@ -292,15 +362,14 @@ async fn handle_message(
             if expected != node_id {
                 return Err(CoordError::InvalidPeer);
             }
-            let stored_credential = if credential.is_empty() {
+            let (stored_credential, invite_registration) = if credential.is_empty() {
                 let token = invite_token.ok_or(CoordError::InviteRequired)?;
-                serde_json::to_vec(&register_with_invite(
-                    state,
-                    node_id,
-                    signing_public,
-                    noise_public,
-                    &token,
-                )?)?
+                let registration =
+                    register_with_invite(state, node_id, signing_public, noise_public, &token)?;
+                (
+                    serde_json::to_vec(&registration.credential)?,
+                    Some(registration),
+                )
             } else {
                 let credential_bytes = BASE64
                     .decode(credential)
@@ -320,14 +389,15 @@ async fn handle_message(
                     .database
                     .lock()
                     .map_err(|_| CoordError::DatabasePoisoned)?;
-                database
+                let credential = database
                     .query_row(
                         "SELECT credential FROM peers WHERE node_id = ?1 AND revoked = 0",
                         params![node_id.as_bytes().as_slice()],
                         |row| row.get(0),
                     )
                     .optional()?
-                    .ok_or(CoordError::PeerNotRegistered)?
+                    .ok_or(CoordError::PeerNotRegistered)?;
+                (credential, None)
             };
             let peer = StoredPeer {
                 node_id,
@@ -342,6 +412,10 @@ async fn handle_message(
                 capabilities,
             };
             update_peer(state, &peer)?;
+            if let Some(registration) = invite_registration {
+                update_peer_metadata(state, node_id, &registration.name, &registration.notes)?;
+            }
+            touch_peer(state, node_id)?;
             bump_snapshot(state)?;
             let existing_senders = state
                 .online
@@ -397,6 +471,7 @@ async fn handle_message(
                     capabilities: peer.capabilities,
                 },
             )?;
+            touch_peer(state, node_id)?;
             bump_snapshot(state)?;
             broadcast_snapshot(state).await?;
             Ok(registered)
@@ -457,7 +532,12 @@ async fn handle_message(
                 .map_err(|_| CoordError::ConnectionClosed)?;
             Ok(registered)
         }
-        ControlMessage::Pong { .. } => Ok(registered),
+        ControlMessage::Pong { .. } => {
+            if let Some(node_id) = registered {
+                touch_peer(state, node_id)?;
+            }
+            Ok(registered)
+        }
         _ => Err(CoordError::UnsupportedMessage),
     }
 }
@@ -468,27 +548,37 @@ fn register_with_invite(
     signing_public: [u8; 32],
     noise_public: [u8; 32],
     token: &str,
-) -> Result<MembershipCredential, CoordError> {
+) -> Result<InviteRegistration, CoordError> {
     let hash = *blake3::hash(token.as_bytes()).as_bytes();
     let database = state
         .database
         .lock()
         .map_err(|_| CoordError::DatabasePoisoned)?;
-    let row: Option<(i64, i64)> = database
+    let row: Option<(String, i64, i64, i64, String, String)> = database
         .query_row(
-            "SELECT expires_at, used FROM invites WHERE token_hash = ?1",
+            "SELECT id, expires_at, used, revoked, name, notes
+             FROM invites WHERE token_hash = ?1",
             params![hash.as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((expires_at, used)) = row else {
+    let Some((_id, expires_at, used, revoked, name, notes)) = row else {
         return Err(CoordError::InvalidInvite);
     };
-    if used != 0 || expires_at < unix_time() as i64 {
+    if revoked != 0 || used != 0 || expires_at < unix_time() as i64 {
         return Err(CoordError::InviteExpired);
     }
     database.execute(
-        "UPDATE invites SET used = 1 WHERE token_hash = ?1",
+        "UPDATE invites SET used = 1, download_used = 1 WHERE token_hash = ?1",
         params![hash.as_slice()],
     )?;
     let identity = vela_crypto::PublicIdentity {
@@ -496,13 +586,91 @@ fn register_with_invite(
         signing_public,
         noise_public,
     };
-    Ok(MembershipCredential::unsigned(
-        &identity,
-        &state.tenant,
-        unix_time().saturating_add(365 * 24 * 3600),
-        state.signer.key_id(),
-    )
-    .sign(&state.signer))
+    Ok(InviteRegistration {
+        name,
+        notes,
+        credential: MembershipCredential::unsigned(
+            &identity,
+            &state.tenant,
+            unix_time().saturating_add(365 * 24 * 3600),
+            state.signer.key_id(),
+        )
+        .sign(&state.signer),
+    })
+}
+
+#[derive(Clone, Debug)]
+struct InviteRegistration {
+    name: String,
+    notes: String,
+    credential: MembershipCredential,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct CreatedInvite {
+    pub id: String,
+    pub invite_token: String,
+    pub download_token: String,
+    pub name: String,
+    pub notes: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
+fn create_invite(
+    state: &Arc<ServerInner>,
+    name: &str,
+    notes: &str,
+    ttl_seconds: u64,
+) -> Result<CreatedInvite, CoordError> {
+    let mut token_bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut token_bytes);
+    let invite_token = BASE64.encode(token_bytes);
+    let mut download_bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut download_bytes);
+    let download_token = base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        download_bytes,
+    );
+    let id = random_token(16);
+    let token_hash = *blake3::hash(invite_token.as_bytes()).as_bytes();
+    let download_token_hash = *blake3::hash(download_token.as_bytes()).as_bytes();
+    let created_at = unix_time();
+    let expires_at = created_at.saturating_add(ttl_seconds);
+    state
+        .database
+        .lock()
+        .map_err(|_| CoordError::DatabasePoisoned)?
+        .execute(
+            "INSERT INTO invites(
+                id, token_hash, expires_at, used, name, notes, created_at,
+                revoked, download_token_hash, download_used
+             ) VALUES(?1, ?2, ?3, 0, ?4, ?5, ?6, 0, ?7, 0)",
+            params![
+                id,
+                token_hash.as_slice(),
+                expires_at as i64,
+                name,
+                notes,
+                created_at as i64,
+                download_token_hash.as_slice(),
+            ],
+        )?;
+    Ok(CreatedInvite {
+        id,
+        invite_token,
+        download_token,
+        name: name.to_owned(),
+        notes: notes.to_owned(),
+        created_at,
+        expires_at,
+    })
+}
+
+fn random_token(bytes: usize) -> String {
+    let mut value = vec![0u8; bytes];
+    rand::rngs::OsRng.fill_bytes(&mut value);
+    base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, value)
 }
 
 #[derive(Clone)]
@@ -524,6 +692,113 @@ fn update_peer(state: &Arc<ServerInner>, peer: &StoredPeer) -> Result<(), CoordE
     let virtual_ipv6 = peer.virtual_ipv6.map(|address| address.octets().to_vec());
     state.database.lock().map_err(|_| CoordError::DatabasePoisoned)?.execute("INSERT INTO peers(node_id, signing_public, noise_public, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities, revoked) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0) ON CONFLICT(node_id) DO UPDATE SET signing_public = excluded.signing_public, noise_public = excluded.noise_public, candidates = excluded.candidates, virtual_ipv4 = COALESCE(excluded.virtual_ipv4, peers.virtual_ipv4), virtual_ipv6 = COALESCE(excluded.virtual_ipv6, peers.virtual_ipv6), credential = excluded.credential, capabilities = excluded.capabilities, revoked = 0", params![peer.node_id.as_bytes().as_slice(), peer.signing_public.as_slice(), peer.noise_public.as_slice(), candidates, virtual_ipv4, virtual_ipv6, peer.credential, capabilities])?;
     Ok(())
+}
+
+pub(crate) fn update_peer_metadata(
+    state: &Arc<ServerInner>,
+    node_id: NodeId,
+    name: &str,
+    notes: &str,
+) -> Result<bool, CoordError> {
+    let changed = state
+        .database
+        .lock()
+        .map_err(|_| CoordError::DatabasePoisoned)?
+        .execute(
+            "UPDATE peers SET name = ?1, notes = ?2 WHERE node_id = ?3",
+            params![name, notes, node_id.as_bytes().as_slice()],
+        )?;
+    Ok(changed != 0)
+}
+
+pub(crate) fn touch_peer(state: &Arc<ServerInner>, node_id: NodeId) -> Result<(), CoordError> {
+    state
+        .database
+        .lock()
+        .map_err(|_| CoordError::DatabasePoisoned)?
+        .execute(
+            "UPDATE peers SET last_seen = ?1 WHERE node_id = ?2",
+            params![unix_time() as i64, node_id.as_bytes().as_slice()],
+        )?;
+    Ok(())
+}
+
+pub(crate) async fn revoke_peer_inner(
+    state: &Arc<ServerInner>,
+    node_id: NodeId,
+) -> Result<bool, CoordError> {
+    let changed = state
+        .database
+        .lock()
+        .map_err(|_| CoordError::DatabasePoisoned)?
+        .execute(
+            "UPDATE peers SET revoked = 1 WHERE node_id = ?1 AND revoked = 0",
+            params![node_id.as_bytes().as_slice()],
+        )?;
+    if changed == 0 {
+        return Ok(false);
+    }
+    bump_snapshot(state)?;
+    disconnect_peer(state, node_id).await;
+    broadcast_snapshot(state).await?;
+    Ok(true)
+}
+
+pub(crate) async fn delete_peer_inner(
+    state: &Arc<ServerInner>,
+    node_id: NodeId,
+) -> Result<bool, CoordError> {
+    let changed = state
+        .database
+        .lock()
+        .map_err(|_| CoordError::DatabasePoisoned)?
+        .execute(
+            "DELETE FROM peers WHERE node_id = ?1",
+            params![node_id.as_bytes().as_slice()],
+        )?;
+    if changed == 0 {
+        return Ok(false);
+    }
+    bump_snapshot(state)?;
+    disconnect_peer(state, node_id).await;
+    broadcast_snapshot(state).await?;
+    Ok(true)
+}
+
+async fn disconnect_peer(state: &Arc<ServerInner>, node_id: NodeId) {
+    let senders = state
+        .online
+        .lock()
+        .await
+        .remove(&node_id)
+        .unwrap_or_default()
+        .into_values()
+        .collect::<Vec<_>>();
+    for sender in senders {
+        let _ = sender.send(ControlMessage::Revoke { node_id }).await;
+    }
+}
+
+pub(crate) fn consume_download_token(
+    state: &Arc<ServerInner>,
+    token: &str,
+) -> Result<bool, CoordError> {
+    let hash = *blake3::hash(token.as_bytes()).as_bytes();
+    let changed = state
+        .database
+        .lock()
+        .map_err(|_| CoordError::DatabasePoisoned)?
+        .execute(
+            "UPDATE invites
+             SET download_used = 1
+             WHERE download_token_hash = ?1
+               AND download_used = 0
+               AND revoked = 0
+               AND used = 0
+               AND expires_at > ?2",
+            params![hash.as_slice(), unix_time() as i64],
+        )?;
+    Ok(changed != 0)
 }
 
 fn load_peer(state: &Arc<ServerInner>, node_id: NodeId) -> Result<Option<StoredPeer>, CoordError> {
@@ -640,8 +915,8 @@ fn network_snapshot(state: &Arc<ServerInner>) -> Result<NetworkSnapshot, CoordEr
             .snapshot_generation
             .load(std::sync::atomic::Ordering::Acquire),
         virtual_ipv4: Some(Ipv4Cidr {
-            address: Ipv4Addr::new(100, 64, 0, 0),
-            prefix_len: 10,
+            address: Ipv4Addr::from(VIRTUAL_IPV4_NETWORK_BASE),
+            prefix_len: VIRTUAL_IPV4_PREFIX_LEN,
         }),
         virtual_ipv6: None,
         peers,
@@ -695,18 +970,16 @@ fn allocate_virtual_ipv4(
     state: &Arc<ServerInner>,
     node_id: NodeId,
 ) -> Result<Ipv4Addr, CoordError> {
-    const USABLE_HOSTS: u32 = (1 << 22) - 2;
-    const NETWORK_BASE: u32 = u32::from_be_bytes([100, 64, 0, 0]);
     let digest = blake3::hash(node_id.as_bytes());
-    let start =
-        u32::from_be_bytes(digest.as_bytes()[..4].try_into().expect("hash length")) % USABLE_HOSTS;
+    let start = u32::from_be_bytes(digest.as_bytes()[..4].try_into().expect("hash length"))
+        % VIRTUAL_IPV4_USABLE_HOSTS;
     let database = state
         .database
         .lock()
         .map_err(|_| CoordError::DatabasePoisoned)?;
-    for offset in 0..USABLE_HOSTS {
-        let host = 1 + (start + offset) % USABLE_HOSTS;
-        let address = Ipv4Addr::from(NETWORK_BASE | host);
+    for offset in 0..VIRTUAL_IPV4_USABLE_HOSTS {
+        let host = 1 + (start + offset) % VIRTUAL_IPV4_USABLE_HOSTS;
+        let address = Ipv4Addr::from(VIRTUAL_IPV4_NETWORK_BASE + host);
         let used: Option<i64> = database
             .query_row(
                 "SELECT 1 FROM peers WHERE virtual_ipv4 = ?1 LIMIT 1",
@@ -716,6 +989,68 @@ fn allocate_virtual_ipv4(
             .optional()?;
         if used.is_none() {
             return Ok(address);
+        }
+    }
+    Err(CoordError::AddressPoolExhausted)
+}
+
+fn migrate_virtual_ipv4(connection: &mut Connection) -> Result<(), CoordError> {
+    let transaction = connection.transaction()?;
+    let peers = {
+        let mut statement =
+            transaction.prepare("SELECT node_id, virtual_ipv4 FROM peers ORDER BY node_id")?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut used_hosts = HashSet::new();
+    let mut updates = Vec::new();
+    for (node_id, stored_address) in peers {
+        let address = stored_address
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+            .map(Ipv4Addr::from);
+        let Some(host) = address.and_then(virtual_ipv4_host) else {
+            let node_id: [u8; 32] = node_id.try_into().map_err(|_| CoordError::InvalidPeer)?;
+            let address = allocate_virtual_ipv4_from_used(NodeId::new(node_id), &mut used_hosts)?;
+            updates.push((node_id.to_vec(), address.octets().to_vec()));
+            continue;
+        };
+        if !used_hosts.insert(host) {
+            let node_id: [u8; 32] = node_id.try_into().map_err(|_| CoordError::InvalidPeer)?;
+            let address = allocate_virtual_ipv4_from_used(NodeId::new(node_id), &mut used_hosts)?;
+            updates.push((node_id.to_vec(), address.octets().to_vec()));
+        }
+    }
+    for (node_id, address) in updates {
+        transaction.execute(
+            "UPDATE peers SET virtual_ipv4 = ?1 WHERE node_id = ?2",
+            params![address, node_id],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn virtual_ipv4_host(address: Ipv4Addr) -> Option<u32> {
+    let host = u32::from(address).checked_sub(VIRTUAL_IPV4_NETWORK_BASE)?;
+    (1..=VIRTUAL_IPV4_USABLE_HOSTS)
+        .contains(&host)
+        .then_some(host)
+}
+
+fn allocate_virtual_ipv4_from_used(
+    node_id: NodeId,
+    used_hosts: &mut HashSet<u32>,
+) -> Result<Ipv4Addr, CoordError> {
+    let digest = blake3::hash(node_id.as_bytes());
+    let start = u32::from_be_bytes(digest.as_bytes()[..4].try_into().expect("hash length"))
+        % VIRTUAL_IPV4_USABLE_HOSTS;
+    for offset in 0..VIRTUAL_IPV4_USABLE_HOSTS {
+        let host = 1 + (start + offset) % VIRTUAL_IPV4_USABLE_HOSTS;
+        if used_hosts.insert(host) {
+            return Ok(Ipv4Addr::from(VIRTUAL_IPV4_NETWORK_BASE + host));
         }
     }
     Err(CoordError::AddressPoolExhausted)
@@ -796,6 +1131,8 @@ pub enum CoordError {
     ConnectionClosed,
     #[error("server error: {0}")]
     Server(String),
+    #[error("admin credentials error: {0}")]
+    AdminCredentials(String),
 }
 
 impl CoordError {
@@ -807,7 +1144,12 @@ impl CoordError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
     use std::net::SocketAddr;
+    use tower::ServiceExt;
 
     #[test]
     fn invite_registration_is_persisted_and_single_use() {
@@ -818,7 +1160,7 @@ mod tests {
         let token = server.create_invite(60).unwrap();
         let identity = vela_crypto::Identity::generate();
         let public = identity.public();
-        let credential = register_with_invite(
+        let registration = register_with_invite(
             &server.inner,
             public.node_id,
             public.signing_public,
@@ -826,7 +1168,8 @@ mod tests {
             &token,
         )
         .unwrap();
-        credential
+        registration
+            .credential
             .verify(&server.server_public_key(), unix_time())
             .unwrap();
         let peer = StoredPeer {
@@ -838,7 +1181,7 @@ mod tests {
             )],
             virtual_ipv4: None,
             virtual_ipv6: None,
-            credential: serde_json::to_vec(&credential).unwrap(),
+            credential: serde_json::to_vec(&registration.credential).unwrap(),
             capabilities: vec![PeerCapability::DiagnosticPing],
         };
         update_peer(&server.inner, &peer).unwrap();
@@ -892,5 +1235,226 @@ mod tests {
         );
         let _ = std::fs::remove_file(db);
         let _ = std::fs::remove_file(signer_path);
+    }
+
+    #[test]
+    fn existing_virtual_ipv4_addresses_migrate_to_current_network() {
+        let base = std::env::temp_dir().join(format!(
+            "vela-coord-address-migration-test-{}-{}",
+            std::process::id(),
+            unix_time()
+        ));
+        let db = base.with_extension("db");
+        let signer_path = base.with_extension("key");
+        let server = CoordServer::open(&db, &signer_path, "test-tenant").unwrap();
+        let identity = vela_crypto::Identity::generate();
+        let public = identity.public();
+        update_peer(
+            &server.inner,
+            &StoredPeer {
+                node_id: public.node_id,
+                signing_public: public.signing_public,
+                noise_public: public.noise_public,
+                candidates: Vec::new(),
+                virtual_ipv4: Some(Ipv4Addr::new(100, 74, 105, 149)),
+                virtual_ipv6: None,
+                credential: Vec::new(),
+                capabilities: Vec::new(),
+            },
+        )
+        .unwrap();
+        drop(server);
+
+        let reopened = CoordServer::open(&db, &signer_path, "test-tenant").unwrap();
+        let peer = load_peer(&reopened.inner, public.node_id).unwrap().unwrap();
+        let address = peer.virtual_ipv4.unwrap();
+        assert!(virtual_ipv4_host(address).is_some());
+        assert_ne!(address, Ipv4Addr::new(100, 74, 105, 149));
+
+        let snapshot = network_snapshot(&reopened.inner).unwrap();
+        assert_eq!(
+            snapshot.virtual_ipv4,
+            Some(Ipv4Cidr {
+                address: Ipv4Addr::from(VIRTUAL_IPV4_NETWORK_BASE),
+                prefix_len: VIRTUAL_IPV4_PREFIX_LEN,
+            })
+        );
+        snapshot.validate().unwrap();
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_file(signer_path);
+    }
+
+    #[tokio::test]
+    async fn admin_api_manages_invites_and_peers() {
+        let base = std::env::temp_dir().join(format!(
+            "vela-coord-admin-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = base.with_extension("db");
+        let signer_path = base.with_extension("key");
+        let credentials_path = base.with_extension("credentials");
+        let initial = CoordServer::open_with_admin_credentials(
+            &db,
+            &signer_path,
+            "test-tenant",
+            &credentials_path,
+        )
+        .unwrap();
+        drop(initial);
+        CoordServer::reset_admin_password(&credentials_path, Some("test-password-123")).unwrap();
+        let server = CoordServer::open_with_admin_credentials(
+            &db,
+            &signer_path,
+            "test-tenant",
+            &credentials_path,
+        )
+        .unwrap();
+
+        let login = server
+            .router()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"admin","password":"test-password-123"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let login: serde_json::Value =
+            serde_json::from_slice(&to_bytes(login.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let token = login["token"].as_str().unwrap().to_owned();
+        let authorization = format!("Bearer {token}");
+
+        let invite_response = server
+            .router()
+            .oneshot(
+                Request::post("/api/v1/admin/invites")
+                    .header("authorization", &authorization)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"laptop","notes":"test machine","ttl_seconds":3600}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invite_response.status(), StatusCode::OK);
+        let invite: CreatedInvite = serde_json::from_slice(
+            &to_bytes(invite_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!invite.invite_token.is_empty());
+        assert!(!invite.download_token.is_empty());
+
+        let invites_response = server
+            .router()
+            .oneshot(
+                Request::get("/api/v1/admin/invites")
+                    .header("authorization", &authorization)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let invites_body = to_bytes(invites_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let invites_text = String::from_utf8(invites_body.to_vec()).unwrap();
+        assert!(!invites_text.contains(&invite.invite_token));
+        assert!(!invites_text.contains(&invite.download_token));
+
+        let identity = vela_crypto::Identity::generate();
+        let public = identity.public();
+        update_peer(
+            &server.inner,
+            &StoredPeer {
+                node_id: public.node_id,
+                signing_public: public.signing_public,
+                noise_public: public.noise_public,
+                candidates: Vec::new(),
+                virtual_ipv4: Some(Ipv4Addr::new(10, 254, 0, 10)),
+                virtual_ipv6: None,
+                credential: Vec::new(),
+                capabilities: Vec::new(),
+            },
+        )
+        .unwrap();
+        let node_id = public.node_id.to_string();
+        let update_path = format!("/api/v1/admin/peers/{node_id}");
+        let update_response = server
+            .router()
+            .oneshot(
+                Request::patch(update_path)
+                    .header("authorization", &authorization)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"laptop","notes":"updated"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update_response.status(), StatusCode::OK);
+
+        let revoke_path = format!("/api/v1/admin/peers/{node_id}/revoke");
+        let revoke_response = server
+            .router()
+            .oneshot(
+                Request::post(revoke_path)
+                    .header("authorization", &authorization)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoke_response.status(), StatusCode::OK);
+        assert!(server.list_peers().unwrap().is_empty());
+
+        let delete_path = format!("/api/v1/admin/peers/{node_id}");
+        let delete_response = server
+            .router()
+            .oneshot(
+                Request::delete(delete_path)
+                    .header("authorization", &authorization)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_response.status(), StatusCode::OK);
+
+        let download_path = "/download/vela-cli";
+        let download_response = server
+            .router()
+            .oneshot(
+                Request::get(download_path)
+                    .header("x-vela-download-token", &invite.download_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(download_response.status(), StatusCode::OK);
+        let second_download = server
+            .router()
+            .oneshot(
+                Request::get(download_path)
+                    .header("x-vela-download-token", &invite.download_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second_download.status(), StatusCode::UNAUTHORIZED);
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_file(signer_path);
+        let _ = std::fs::remove_file(credentials_path);
     }
 }

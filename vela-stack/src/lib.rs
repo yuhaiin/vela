@@ -1322,8 +1322,8 @@ mod tests {
         let identity_b = Identity::generate();
         let address_a = SocketAddr::from(([127, 0, 0, 1], base_port));
         let address_b = SocketAddr::from(([127, 0, 0, 1], base_port + 1));
-        let virtual_a = Ipv4Addr::new(100, 64, 0, 11);
-        let virtual_b = Ipv4Addr::new(100, 64, 0, 12);
+        let virtual_a = Ipv4Addr::new(10, 254, 0, 11);
+        let virtual_b = Ipv4Addr::new(10, 254, 0, 12);
         let node_a = VelaNode::builder()
             .identity(identity_a.clone())
             .datagram_provider(Arc::new(TokioDatagramProvider::new(vec![Candidate::Host(
@@ -1392,8 +1392,8 @@ mod tests {
     #[tokio::test]
     async fn userspace_tcp_round_trip_uses_the_ip_data_plane() {
         let (stack_a, stack_b) = stacks(45111).await;
-        let virtual_a = Ipv4Addr::new(100, 64, 0, 11);
-        let virtual_b = Ipv4Addr::new(100, 64, 0, 12);
+        let virtual_a = Ipv4Addr::new(10, 254, 0, 11);
+        let virtual_b = Ipv4Addr::new(10, 254, 0, 12);
         let listener = stack_b
             .listen(SocketAddr::new(IpAddr::V4(virtual_b), 8080))
             .await
@@ -1418,8 +1418,8 @@ mod tests {
     #[tokio::test]
     async fn userspace_udp_round_trip_uses_virtual_addresses() {
         let (stack_a, stack_b) = stacks(45121).await;
-        let virtual_a = Ipv4Addr::new(100, 64, 0, 11);
-        let virtual_b = Ipv4Addr::new(100, 64, 0, 12);
+        let virtual_a = Ipv4Addr::new(10, 254, 0, 11);
+        let virtual_b = Ipv4Addr::new(10, 254, 0, 12);
         let receiver = stack_b
             .listen_packet(SocketAddr::new(IpAddr::V4(virtual_b), 9090))
             .await
@@ -1476,8 +1476,8 @@ mod tests {
     #[tokio::test]
     async fn userspace_udp_allows_send_while_receive_is_pending() {
         let (stack_a, stack_b) = stacks(45125).await;
-        let virtual_a = Ipv4Addr::new(100, 64, 0, 11);
-        let virtual_b = Ipv4Addr::new(100, 64, 0, 12);
+        let virtual_a = Ipv4Addr::new(10, 254, 0, 11);
+        let virtual_b = Ipv4Addr::new(10, 254, 0, 12);
         let socket_a = stack_a
             .listen_packet(SocketAddr::new(IpAddr::V4(virtual_a), 9101))
             .await
@@ -1519,8 +1519,8 @@ mod tests {
     #[tokio::test]
     async fn userspace_raw_socket_preserves_an_ip_packet() {
         let (stack_a, stack_b) = stacks(45131).await;
-        let virtual_a = Ipv4Addr::new(100, 64, 0, 11);
-        let virtual_b = Ipv4Addr::new(100, 64, 0, 12);
+        let virtual_a = Ipv4Addr::new(10, 254, 0, 11);
+        let virtual_b = Ipv4Addr::new(10, 254, 0, 12);
         let receiver = stack_b.raw_socket(IpVersion::V4, 99).await.unwrap();
         let sender = stack_a.raw_socket(IpVersion::V4, 99).await.unwrap();
         let packet = ipv4_packet(virtual_a, virtual_b, 99, b"raw over vela");
@@ -1535,8 +1535,8 @@ mod tests {
     #[tokio::test]
     async fn userspace_icmp_socket_round_trip_uses_virtual_addresses() {
         let (stack_a, stack_b) = stacks(45141).await;
-        let virtual_a = Ipv4Addr::new(100, 64, 0, 11);
-        let virtual_b = Ipv4Addr::new(100, 64, 0, 12);
+        let virtual_a = Ipv4Addr::new(10, 254, 0, 11);
+        let virtual_b = Ipv4Addr::new(10, 254, 0, 12);
         let receiver = stack_b.bind_icmp(7).await.unwrap();
         let sender = stack_a.bind_icmp(7).await.unwrap();
         let packet = icmp_echo_request(7, 1, b"icmp over vela");
@@ -1559,8 +1559,8 @@ mod tests {
         assert!(matches!(
             stack
                 .send_ip(ipv4_packet(
-                    Ipv4Addr::new(100, 64, 0, 11),
-                    Ipv4Addr::new(100, 64, 0, 12),
+                    Ipv4Addr::new(10, 254, 0, 11),
+                    Ipv4Addr::new(10, 254, 0, 12),
                     17,
                     b"after shutdown",
                 ))

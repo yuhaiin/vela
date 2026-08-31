@@ -23,9 +23,8 @@ The workspace currently contains:
 - `vela-cli`: identity, server, invite, peer-list, revoke, diagnostic peer, and
   Linux/macOS/Windows TUN peer commands.
 
-The default server listener is plain WebSocket for local development. The
-server also exposes `serve_tls` and the CLI accepts `--cert`/`--key` for direct
-Rustls termination.
+The coordination server listener is plain HTTP/WebSocket. Public deployments
+should put it behind a TLS terminator such as Cloudflare Tunnel.
 
 The wire parser has a cargo-fuzz target at `fuzz/fuzz_targets/wire_packet.rs`.
 It is intentionally outside the workspace and can be run with cargo-fuzz.
@@ -60,9 +59,9 @@ started and use the virtual address directly:
 use vela_stack::{StackConfig, VelaStack};
 
 # async fn run(node: vela_core::VelaNode) -> Result<(), Box<dyn std::error::Error>> {
-let stack = VelaStack::attach(node, StackConfig::ipv4("100.64.0.11".parse()?))?;
-let listener = stack.listen("100.64.0.11:8080".parse()?).await?;
-let connection = stack.dial("100.64.0.12:8080".parse()?).await?;
+let stack = VelaStack::attach(node, StackConfig::ipv4("10.254.0.11".parse()?))?;
+let listener = stack.listen("10.254.0.11:8080".parse()?).await?;
+let connection = stack.dial("10.254.0.12:8080".parse()?).await?;
 connection.send(b"hello").await?;
 let (server, _remote) = listener.accept().await?;
 let _data = server.recv(4096).await?;
@@ -81,15 +80,15 @@ adapter instead.
 cargo test --workspace
 
 cargo run -p vela-cli -- server \
+  --path ./vela-server \
   --bind 0.0.0.0:7000 \
-  --db ./vela.db \
-  --signer ./server.key \
   --tenant my-network
 
-cargo run -p vela-cli -- invite \
-  --db ./vela.db \
-  --signer ./server.key \
-  --tenant my-network
+# The first server start prints a generated admin password once.
+# Open http://127.0.0.1:7000/admin and use it to manage peers.
+# To set it explicitly instead: cat <password-file> | ... server ... --admin-password-stdin
+
+cargo run -p vela-cli -- invite --path ./vela-server --tenant my-network
 
 # Use the server's printed public key and an invite token for each diagnostic peer.
 cargo run -p vela-cli -- peer register \
@@ -100,12 +99,27 @@ cargo run -p vela-cli -- peer register \
   --bind 192.0.2.10:0
 
 cargo run -p vela-cli -- peer run --state ./peer-a
-# Linux/Windows: vela0; macOS: utun0.
-cargo run -p vela-cli -- peer up --state ./peer-a --tun vela0 --mtu 1200
+# Linux/Windows default: vela0; macOS default: utun0.
+cargo run -p vela-cli -- peer up --state ./peer-a --mtu 1200
 cargo run -p vela-cli -- peer list --state ./peer-a --json
 cargo run -p vela-cli -- peer status --state ./peer-a --json
 cargo run -p vela-cli -- peer ping vela:<node-id-hex> --state ./peer-a --count 3 --json
+
+# Reset the admin password if it was lost. The server must be restarted after this.
+cargo run -p vela-cli -- admin password reset --path ./vela-server
 ```
+
+The coordination server exposes a plain HTTP/WebSocket admin service at
+`/admin`, `/api/v1`, and `/download/vela-cli`. The page uses the current
+`window.location.origin`, so it works behind a Cloudflare Tunnel without a
+separate frontend build or Node.js runtime. Admin sessions are held in memory
+for 24 hours and the browser stores the session token in `localStorage` until
+it expires.
+
+Creating an invite in the admin page produces a one-time download command for
+the same `vela-cli` executable, a peer registration command, and a TUN startup
+command. The CLI download is protected by its own `X-Vela-Download-Token` and
+does not expose the admin session token.
 
 `peer run` is a diagnostic peer process, not a server or relay. The
 coordination server only exchanges registration and candidate information;
@@ -140,6 +154,7 @@ explicit MVP limitation, not an automatic downgrade.
 The peer state directory stores the identity, server key, membership
 credential, and published candidates. Identity and state files are written
 with mode `0600`; production deployments should still protect them with
-filesystem permissions and backups. The coordination server must be exposed
-through TLS, either with the built-in Rustls listener or a trusted TLS
-terminator.
+filesystem permissions and backups. The coordination server speaks plain
+HTTP/WebSocket by default. For public deployment, put it behind a trusted TLS
+terminator such as Cloudflare Tunnel; the admin page automatically derives
+`ws://` or `wss://` from the current browser origin.

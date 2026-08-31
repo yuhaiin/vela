@@ -232,7 +232,7 @@ mod platform {
             let mtu = u32::try_from(mtu).map_err(|_| TunError::InvalidMtu)?;
             self.handle
                 .link()
-                .add(
+                .set(
                     LinkUnspec::new_with_index(self.interface_index)
                         .mtu(mtu)
                         .build(),

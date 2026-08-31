@@ -29,7 +29,7 @@ strip = "symbols"
 
 [workspace.dependencies]
 async-trait = "0.1"
-axum-server = { version = "0.8", features = ["tls-rustls"] }
+argon2 = "0.5"
 base64 = "0.22"
 blake3 = "1"
 bytes = "1"
@@ -50,7 +50,7 @@ smoltcp = { version = "0.12", default-features = false, features = ["alloc", "st
 snow = "0.9"
 thiserror = "2"
 tun-rs = { version = "2.8", features = ["async"] }
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "sync", "time", "signal"] }
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
 tracing = "0.1"
 url = "2"

@@ -1,4 +1,4 @@
-use std::{env, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
+use std::{env, io::Read, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
 use vela_coord::CoordServer;
 use vela_crypto::Identity;
 use vela_diagnostic::{DiagnosticControl, DiagnosticPeer, PeerState};
@@ -6,7 +6,7 @@ use vela_proto::NodeId;
 
 fn usage() -> ! {
     eprintln!(
-        "Usage:\n  vela-cli identity <path>\n  vela-cli server --bind <addr> --db <path> --signer <path> --tenant <name> [--cert <path> --key <path>]\n  vela-cli invite --db <path> --signer <path> --tenant <name> [--ttl <seconds>]\n  vela-cli peers --db <path> --signer <path> --tenant <name>\n  vela-cli revoke <node-id> --db <path> --signer <path> --tenant <name>\n  vela-cli peer register --state <dir> --server <url> --server-key <base64> --invite <token> [--bind <addr>] [--stun <addr>]\n  vela-cli peer run --state <dir> [--bind <addr>] [--stun <addr>]\n  vela-cli peer up --state <dir> [--tun <name>] [--mtu <bytes>] [--bind <addr>] [--stun <addr>]\n  vela-cli peer list --state <dir> [--json]\n  vela-cli peer ping <node-id> --state <dir> [--count <n>] [--timeout <duration>] [--json]"
+        "Usage:\n  vela-cli identity <path>\n  vela-cli server --path <dir> --bind <addr> --tenant <name> [--admin-password-stdin]\n  vela-cli invite --path <dir> --tenant <name> [--ttl <seconds>]\n  vela-cli peers --path <dir> --tenant <name>\n  vela-cli revoke <node-id> --path <dir> --tenant <name>\n  vela-cli admin password reset --path <dir> [--password-stdin]\n  vela-cli peer register --state <dir> --server <url> --server-key <base64> --invite <token> [--bind <addr>] [--stun <addr>]\n  vela-cli peer run --state <dir> [--bind <addr>] [--stun <addr>]\n  vela-cli peer up --state <dir> [--tun <name>] [--mtu <bytes>] [--bind <addr>] [--stun <addr>]\n  vela-cli peer list --state <dir> [--json]\n  vela-cli peer ping <node-id> --state <dir> [--count <n>] [--timeout <duration>] [--json]\n\nServer path defaults: <path>/vela.db, <path>/server.key, <path>/admin.credentials.\nLegacy --db/--signer and --admin-credentials overrides are still accepted."
     );
     eprintln!("  vela-cli peer status --state <dir> [--json]");
     std::process::exit(2);
@@ -59,6 +59,55 @@ fn bind_option(args: &[String]) -> Result<Option<SocketAddr>, Box<dyn std::error
     option(args, "--bind")
         .map(|value| value.parse().map_err(Into::into))
         .transpose()
+}
+
+fn coordination_paths(args: &[String]) -> (PathBuf, PathBuf, PathBuf) {
+    let path = option(args, "--path").map(PathBuf::from);
+    let database = option(args, "--db")
+        .map(PathBuf::from)
+        .or_else(|| path.as_ref().map(|path| path.join("vela.db")))
+        .unwrap_or_else(|| {
+            eprintln!("missing --path");
+            usage()
+        });
+    let signer = option(args, "--signer")
+        .map(PathBuf::from)
+        .or_else(|| path.as_ref().map(|path| path.join("server.key")))
+        .unwrap_or_else(|| {
+            eprintln!("missing --path");
+            usage()
+        });
+    let credentials = option(args, "--admin-credentials")
+        .map(PathBuf::from)
+        .or_else(|| path.map(|path| path.join("admin.credentials")))
+        .unwrap_or_else(|| database.with_extension("admin-credentials"));
+    (database, signer, credentials)
+}
+
+fn open_coordination_server(args: &[String]) -> Result<CoordServer, Box<dyn std::error::Error>> {
+    let (database, signer, credentials) = coordination_paths(args);
+    Ok(CoordServer::open_with_admin_credentials(
+        database,
+        signer,
+        required(args, "--tenant"),
+        credentials,
+    )?)
+}
+
+fn password_from_stdin(args: &[String]) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if !args
+        .iter()
+        .any(|arg| arg == "--password-stdin" || arg == "--admin-password-stdin")
+    {
+        return Ok(None);
+    }
+    let mut password = String::new();
+    std::io::stdin().read_to_string(&mut password)?;
+    let password = password.trim_end_matches(['\r', '\n']).to_owned();
+    if password.is_empty() {
+        return Err("password stdin was empty".into());
+    }
+    Ok(Some(password))
 }
 
 async fn run_peer_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -326,10 +375,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         "server" => {
             let bind = SocketAddr::from_str(&required(&args, "--bind"))?;
-            let db = required(&args, "--db");
-            let signer = required(&args, "--signer");
             let tenant = required(&args, "--tenant");
-            let server = CoordServer::open(db, signer, tenant)?;
+            let (database, signer, credentials) = coordination_paths(&args);
+            if let Some(password) = password_from_stdin(&args)? {
+                CoordServer::reset_admin_password(&credentials, Some(&password))?;
+            }
+            let server =
+                CoordServer::open_with_admin_credentials(database, signer, tenant, credentials)?;
             println!(
                 "coordination server public key: {}",
                 base64::Engine::encode(
@@ -337,36 +389,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     server.server_public_key()
                 )
             );
-            match (option(&args, "--cert"), option(&args, "--key")) {
-                (Some(cert), Some(key)) => server.serve_tls(bind, cert, key).await?,
-                (None, None) => {
-                    server
-                        .serve(tokio::net::TcpListener::bind(bind).await?)
-                        .await?
-                }
-                _ => {
-                    eprintln!("--cert and --key must be provided together");
-                    usage();
-                }
-            }
+            server
+                .serve(tokio::net::TcpListener::bind(bind).await?)
+                .await?;
         }
         "invite" => {
-            let server = CoordServer::open(
-                required(&args, "--db"),
-                required(&args, "--signer"),
-                required(&args, "--tenant"),
-            )?;
+            let server = open_coordination_server(&args)?;
             let ttl = option(&args, "--ttl")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(3600);
             println!("{}", server.create_invite(ttl)?);
         }
         "peers" => {
-            let server = CoordServer::open(
-                required(&args, "--db"),
-                required(&args, "--signer"),
-                required(&args, "--tenant"),
-            )?;
+            let server = open_coordination_server(&args)?;
             for peer in server.list_peers()? {
                 println!("{peer}");
             }
@@ -379,12 +414,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("missing node id");
                     usage()
                 });
-            let server = CoordServer::open(
-                required(&args, "--db"),
-                required(&args, "--signer"),
-                required(&args, "--tenant"),
-            )?;
+            let server = open_coordination_server(&args)?;
             server.revoke_peer(node_id).await?;
+        }
+        "admin" => {
+            if args.first().map(String::as_str) != Some("password")
+                || args.get(1).map(String::as_str) != Some("reset")
+            {
+                usage();
+            }
+            let (_, _, credentials) = coordination_paths(&args);
+            let password = password_from_stdin(&args)?.unwrap_or_default();
+            let password = CoordServer::reset_admin_password(
+                credentials,
+                (!password.is_empty()).then_some(password.as_str()),
+            )?;
+            println!("admin username: admin");
+            println!("admin password: {password}");
+            println!("restart the server to load the new password");
         }
         "peer" => run_peer_command(&args).await?,
         _ => usage(),

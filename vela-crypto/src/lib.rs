@@ -502,8 +502,8 @@ mod tests {
             network_id: [7; 16],
             generation: 1,
             virtual_ipv4: Some(Ipv4Cidr {
-                address: Ipv4Addr::new(100, 64, 0, 0),
-                prefix_len: 10,
+                address: Ipv4Addr::new(10, 254, 0, 0),
+                prefix_len: 16,
             }),
             virtual_ipv6: None,
             peers: vec![PeerInfo {
@@ -511,7 +511,7 @@ mod tests {
                 signing_public: public.signing_public,
                 noise_public: public.noise_public,
                 candidates: Vec::new(),
-                virtual_ipv4: Some(Ipv4Addr::new(100, 64, 0, 1)),
+                virtual_ipv4: Some(Ipv4Addr::new(10, 254, 0, 1)),
                 virtual_ipv6: None,
                 credential: Vec::new(),
                 capabilities: Vec::new(),

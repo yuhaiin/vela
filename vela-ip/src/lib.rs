@@ -238,25 +238,25 @@ mod tests {
     #[test]
     fn validates_ipv4_and_exposes_route_fields() {
         let packet = IpPacket::parse(ipv4_packet(
-            Ipv4Addr::new(100, 64, 0, 1),
-            Ipv4Addr::new(100, 64, 0, 2),
+            Ipv4Addr::new(10, 254, 0, 1),
+            Ipv4Addr::new(10, 254, 0, 2),
             b"payload",
         ))
         .unwrap();
         assert_eq!(packet.version(), IpVersion::V4);
         assert_eq!(packet.protocol(), 17);
-        assert_eq!(packet.source(), IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)));
+        assert_eq!(packet.source(), IpAddr::V4(Ipv4Addr::new(10, 254, 0, 1)));
         assert_eq!(
             packet.destination(),
-            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))
+            IpAddr::V4(Ipv4Addr::new(10, 254, 0, 2))
         );
     }
 
     #[test]
     fn rejects_bad_checksum_and_trailing_bytes() {
         let mut bytes = ipv4_packet(
-            Ipv4Addr::new(100, 64, 0, 1),
-            Ipv4Addr::new(100, 64, 0, 2),
+            Ipv4Addr::new(10, 254, 0, 1),
+            Ipv4Addr::new(10, 254, 0, 2),
             b"payload",
         )
         .to_vec();

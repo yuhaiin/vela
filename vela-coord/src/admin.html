@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vela Coordination</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-slate-950 text-slate-100">
+  <main class="mx-auto max-w-7xl px-4 py-8 sm:px-6">
+    <section id="login-panel" class="mx-auto mt-16 max-w-md rounded-2xl bg-slate-900 p-8 shadow-2xl ring-1 ring-slate-800">
+      <h1 class="text-2xl font-semibold">Vela Admin</h1>
+      <p class="mt-2 text-sm text-slate-400">Sign in with the administrator account printed when the server started.</p>
+      <form id="login-form" class="mt-6 space-y-4">
+        <label class="block text-sm text-slate-300">Username
+          <input id="username" value="admin" autocomplete="username" class="mt-1 w-full rounded-lg bg-slate-800 px-3 py-2 outline-none ring-slate-500 focus:ring-2">
+        </label>
+        <label class="block text-sm text-slate-300">Password
+          <input id="password" type="password" autocomplete="current-password" required class="mt-1 w-full rounded-lg bg-slate-800 px-3 py-2 outline-none ring-slate-500 focus:ring-2">
+        </label>
+        <button class="w-full rounded-lg bg-cyan-500 px-4 py-2 font-medium text-slate-950 hover:bg-cyan-400">Sign in</button>
+      </form>
+      <p id="login-error" class="mt-4 hidden text-sm text-red-400"></p>
+    </section>
+
+    <section id="app-panel" class="hidden">
+      <header class="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800 pb-6">
+        <div>
+          <h1 class="text-2xl font-semibold">Vela Admin</h1>
+          <p id="server-info" class="mt-1 text-sm text-slate-400"></p>
+        </div>
+        <button id="logout" class="rounded-lg border border-slate-700 px-3 py-2 text-sm hover:bg-slate-900">Sign out</button>
+      </header>
+
+      <section class="mt-6 grid gap-6 lg:grid-cols-[22rem_1fr]">
+        <div class="rounded-2xl bg-slate-900 p-5 ring-1 ring-slate-800">
+          <h2 class="text-lg font-medium">Add peer</h2>
+          <form id="invite-form" class="mt-4 space-y-3">
+            <input id="invite-name" placeholder="Name (for example, laptop)" required maxlength="200" class="w-full rounded-lg bg-slate-800 px-3 py-2 outline-none ring-slate-500 focus:ring-2">
+            <textarea id="invite-notes" placeholder="Notes" maxlength="2000" rows="3" class="w-full rounded-lg bg-slate-800 px-3 py-2 outline-none ring-slate-500 focus:ring-2"></textarea>
+            <label class="block text-sm text-slate-400">Invite lifetime (seconds)
+              <input id="invite-ttl" type="number" min="1" max="2592000" value="3600" required class="mt-1 w-full rounded-lg bg-slate-800 px-3 py-2 text-slate-100 outline-none ring-slate-500 focus:ring-2">
+            </label>
+            <button class="w-full rounded-lg bg-cyan-500 px-4 py-2 font-medium text-slate-950 hover:bg-cyan-400">Create invite</button>
+          </form>
+          <div class="mt-5 border-t border-slate-800 pt-5">
+            <label class="block text-sm text-slate-400">Peer state directory
+              <input id="state-path" value="./vela" class="mt-1 w-full rounded-lg bg-slate-800 px-3 py-2 text-slate-100 outline-none ring-slate-500 focus:ring-2">
+            </label>
+          </div>
+        </div>
+
+        <div id="invite-result" class="hidden rounded-2xl bg-slate-900 p-5 ring-1 ring-cyan-900">
+          <div class="flex items-center justify-between gap-4">
+            <h2 class="text-lg font-medium">One-time commands for the new peer</h2>
+            <button id="close-invite" class="text-slate-400 hover:text-white">Close</button>
+          </div>
+          <p class="mt-2 text-xs text-amber-300">The download token and invite token are shown only once. Save them now.</p>
+          <div id="invite-commands" class="mt-4 space-y-4"></div>
+        </div>
+      </section>
+
+      <section class="mt-6 rounded-2xl bg-slate-900 p-5 ring-1 ring-slate-800">
+        <div class="flex items-center justify-between gap-4">
+          <h2 class="text-lg font-medium">Invites</h2>
+          <span class="text-xs text-slate-500">Refreshes every 5 seconds</span>
+        </div>
+        <div class="mt-4 overflow-x-auto">
+          <table class="w-full min-w-[42rem] text-left text-sm">
+            <thead class="border-b border-slate-800 text-xs uppercase text-slate-500"><tr><th class="px-2 py-2">Name</th><th class="px-2 py-2">Notes</th><th class="px-2 py-2">Status</th><th class="px-2 py-2">Expires</th><th class="px-2 py-2"></th></tr></thead>
+            <tbody id="invites" class="divide-y divide-slate-800"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="mt-6 rounded-2xl bg-slate-900 p-5 ring-1 ring-slate-800">
+        <div class="flex items-center justify-between gap-4">
+          <h2 class="text-lg font-medium">Peers</h2>
+          <span id="peer-count" class="text-sm text-slate-500"></span>
+        </div>
+        <div class="mt-4 overflow-x-auto">
+          <table class="w-full min-w-[62rem] text-left text-sm">
+            <thead class="border-b border-slate-800 text-xs uppercase text-slate-500"><tr><th class="px-2 py-2">Name</th><th class="px-2 py-2">Node ID</th><th class="px-2 py-2">Address</th><th class="px-2 py-2">Status</th><th class="px-2 py-2">Last seen</th><th class="px-2 py-2"></th></tr></thead>
+            <tbody id="peers" class="divide-y divide-slate-800"></tbody>
+          </table>
+        </div>
+      </section>
+      <p id="app-error" class="mt-4 hidden text-sm text-red-400"></p>
+    </section>
+  </main>
+
+<script>
+(() => {
+  const sessionKey = 'vela.admin.session';
+  let session = null;
+  let serverConfig = null;
+  let pollTimer = null;
+  const $ = (id) => document.getElementById(id);
+  const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+  const shell = (value) => `'${String(value).replace(/'/g, `'"'"'`)}'`;
+  const time = (seconds) => seconds ? new Date(seconds * 1000).toLocaleString() : '—';
+  const wsOrigin = () => window.location.origin.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:');
+
+  function showError(target, message) {
+    target.textContent = message;
+    target.classList.remove('hidden');
+  }
+  function clearError(target) { target.textContent = ''; target.classList.add('hidden'); }
+  function saveSession(value) {
+    session = value;
+    localStorage.setItem(sessionKey, JSON.stringify(value));
+  }
+  function loadSession() {
+    try {
+      const value = JSON.parse(localStorage.getItem(sessionKey) || 'null');
+      return value && value.expires_at * 1000 > Date.now() ? value : null;
+    } catch (_) { return null; }
+  }
+  function clearSession() {
+    session = null;
+    localStorage.removeItem(sessionKey);
+  }
+  async function api(path, options = {}) {
+    const headers = new Headers(options.headers || {});
+    if (session) headers.set('Authorization', `Bearer ${session.token}`);
+    if (options.body && typeof options.body !== 'string') {
+      headers.set('Content-Type', 'application/json');
+      options.body = JSON.stringify(options.body);
+    }
+    const response = await fetch(path, {...options, headers});
+    if (response.status === 401) {
+      clearSession();
+      showLogin();
+      throw new Error('Your session has expired');
+    }
+    const body = response.status === 204 ? null : await response.json().catch(() => null);
+    if (!response.ok) throw new Error(body?.error || `Request failed (${response.status})`);
+    return body;
+  }
+  function showLogin() {
+    $('login-panel').classList.remove('hidden');
+    $('app-panel').classList.add('hidden');
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+  async function startApp() {
+    $('login-panel').classList.add('hidden');
+    $('app-panel').classList.remove('hidden');
+    try {
+      serverConfig = await api('/api/v1/admin/config');
+      $('server-info').textContent = `tenant: ${serverConfig.tenant} · server key: ${serverConfig.server_key}`;
+      await refresh();
+      if (!pollTimer) pollTimer = setInterval(refresh, 5000);
+    } catch (error) { showError($('app-error'), error.message); }
+  }
+  async function refresh() {
+    try {
+      const [peers, invites] = await Promise.all([api('/api/v1/admin/peers'), api('/api/v1/admin/invites')]);
+      renderPeers(peers);
+      renderInvites(invites);
+      clearError($('app-error'));
+    } catch (error) { showError($('app-error'), error.message); }
+  }
+  function renderPeers(peers) {
+    $('peer-count').textContent = `${peers.length} peer(s)`;
+    $('peers').innerHTML = peers.map((peer) => `<tr class="${peer.status === 'revoked' ? 'opacity-50' : ''}">
+      <td class="px-2 py-3"><div>${esc(peer.name || 'Unnamed')}</div><div class="text-xs text-slate-500">${esc(peer.notes)}</div></td>
+      <td class="break-all px-2 py-3 font-mono text-xs">${esc(peer.node_id)}</td>
+      <td class="px-2 py-3 font-mono">${esc(peer.virtual_ipv4 || '—')}</td>
+      <td class="px-2 py-3"><span class="rounded-full px-2 py-1 text-xs ${peer.status === 'online' ? 'bg-emerald-950 text-emerald-300' : peer.status === 'revoked' ? 'bg-red-950 text-red-300' : 'bg-slate-800 text-slate-400'}">${esc(peer.status)}</span></td>
+      <td class="px-2 py-3 text-xs text-slate-400">${esc(time(peer.last_seen))}</td>
+      <td class="whitespace-nowrap px-2 py-3 text-right"><button data-action="edit" data-node="${esc(peer.node_id)}" data-name="${esc(peer.name)}" data-notes="${esc(peer.notes)}" class="mr-2 text-cyan-400 hover:text-cyan-300">Edit</button>${peer.status !== 'revoked' ? `<button data-action="revoke" data-node="${esc(peer.node_id)}" class="mr-2 text-amber-400 hover:text-amber-300">Revoke</button>` : ''}<button data-action="delete" data-node="${esc(peer.node_id)}" class="text-red-400 hover:text-red-300">Delete permanently</button></td>
+    </tr>`).join('');
+  }
+  function renderInvites(invites) {
+    $('invites').innerHTML = invites.map((invite) => `<tr>
+      <td class="px-2 py-3">${esc(invite.name || 'Unnamed')}</td><td class="px-2 py-3 text-slate-400">${esc(invite.notes || '—')}</td>
+      <td class="px-2 py-3"><span class="rounded-full bg-slate-800 px-2 py-1 text-xs text-slate-300">${esc(invite.status)}</span></td>
+      <td class="px-2 py-3 text-xs text-slate-400">${esc(time(invite.expires_at))}</td>
+      <td class="px-2 py-3 text-right">${invite.status === 'pending' ? `<button data-invite="${esc(invite.id)}" class="text-red-400 hover:text-red-300">Revoke</button>` : ''}</td>
+    </tr>`).join('');
+  }
+  function showInvite(invite) {
+    const state = shell($('state-path').value || './vela');
+    const server = shell(wsOrigin() + '/ws');
+    const key = shell(serverConfig.server_key);
+    const cli = serverConfig.cli_filename || 'vela-cli';
+    const executable = `./${cli}`;
+    const downloadUrl = shell(window.location.origin + '/download/vela-cli');
+    const downloadCommand = serverConfig.windows
+      ? `curl.exe -fL ${downloadUrl} -H 'X-Vela-Download-Token: ${invite.download_token}' -o ${shell(cli)}`
+      : `curl -fL ${downloadUrl} -H 'X-Vela-Download-Token: ${invite.download_token}' -o ${shell(cli)} && chmod +x ${shell(cli)}`;
+    const registerCommand = `${executable} peer register --state ${state} --server ${server} --server-key ${key} --invite ${shell(invite.invite_token)}`;
+    const runCommand = `${executable} peer run --state ${state}`;
+    const upCommand = serverConfig.windows
+      ? `${executable} peer up --state ${state} --mtu 1200`
+      : `sudo ${executable} peer up --state ${state} --mtu 1200`;
+    $('invite-commands').innerHTML = [
+      ['1. Download CLI', downloadCommand],
+      ['2. Register peer', registerCommand],
+      ['3a. Run diagnostic peer (alternative to TUN)', runCommand],
+      ['3b. Start TUN peer (alternative to diagnostic mode)', upCommand],
+    ].map(([title, command]) => `<div><p class="mb-1 text-sm text-slate-300">${title}</p><pre class="overflow-x-auto rounded-lg bg-slate-950 p-3 text-xs text-cyan-300">${esc(command)}</pre></div>`).join('');
+    $('invite-result').classList.remove('hidden');
+    $('invite-result').scrollIntoView({behavior: 'smooth', block: 'start'});
+  }
+
+  $('login-form').addEventListener('submit', async (event) => {
+    event.preventDefault(); clearError($('login-error'));
+    try {
+      const result = await api('/api/v1/auth/login', {method: 'POST', body: {username: $('username').value, password: $('password').value}});
+      saveSession(result); $('password').value = ''; await startApp();
+    } catch (error) { showError($('login-error'), error.message); }
+  });
+  $('logout').addEventListener('click', async () => { try { await api('/api/v1/auth/logout', {method: 'POST'}); } catch (_) {} clearSession(); showLogin(); });
+  $('close-invite').addEventListener('click', () => $('invite-result').classList.add('hidden'));
+  $('invite-form').addEventListener('submit', async (event) => {
+    event.preventDefault(); clearError($('app-error'));
+    try {
+      const invite = await api('/api/v1/admin/invites', {method: 'POST', body: {name: $('invite-name').value, notes: $('invite-notes').value, ttl_seconds: Number($('invite-ttl').value)}});
+      showInvite(invite); $('invite-form').reset(); $('invite-ttl').value = 3600; await refresh();
+    } catch (error) { showError($('app-error'), error.message); }
+  });
+  $('peers').addEventListener('click', async (event) => {
+    const button = event.target.closest('button[data-action]'); if (!button) return;
+    const node = button.dataset.node; const action = button.dataset.action;
+    try {
+      if (action === 'edit') {
+        const name = prompt('Peer name', button.dataset.name || ''); if (name === null) return;
+        const notes = prompt('Peer notes', button.dataset.notes || ''); if (notes === null) return;
+        await api(`/api/v1/admin/peers/${encodeURIComponent(node)}`, {method: 'PATCH', body: {name, notes}});
+      } else if (action === 'revoke') {
+        if (!confirm(`Revoke ${node}? This peer will no longer be able to connect.`)) return;
+        await api(`/api/v1/admin/peers/${encodeURIComponent(node)}/revoke`, {method: 'POST'});
+      } else {
+        if (prompt(`Type the full Node ID to permanently delete it:\n${node}`) !== node) return;
+        await api(`/api/v1/admin/peers/${encodeURIComponent(node)}`, {method: 'DELETE'});
+      }
+      await refresh();
+    } catch (error) { showError($('app-error'), error.message); }
+  });
+  $('invites').addEventListener('click', async (event) => {
+    const button = event.target.closest('button[data-invite]'); if (!button) return;
+    if (!confirm('Revoke this invite?')) return;
+    try { await api(`/api/v1/admin/invites/${encodeURIComponent(button.dataset.invite)}`, {method: 'DELETE'}); await refresh(); }
+    catch (error) { showError($('app-error'), error.message); }
+  });
+  session = loadSession();
+  if (session) startApp(); else showLogin();
+})();
+</script>
+</body>
+</html>

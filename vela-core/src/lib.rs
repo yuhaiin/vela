@@ -1775,7 +1775,7 @@ mod tests {
                 local_addr: address_a,
             },
             connect_timeout: Duration::from_secs(2),
-            virtual_ipv4: Some(Ipv4Addr::new(100, 64, 0, 1)),
+            virtual_ipv4: Some(Ipv4Addr::new(10, 254, 0, 1)),
             ..NodeConfig::default()
         };
         let config_b = NodeConfig {
@@ -1783,7 +1783,7 @@ mod tests {
                 local_addr: address_b,
             },
             connect_timeout: Duration::from_secs(2),
-            virtual_ipv4: Some(Ipv4Addr::new(100, 64, 0, 2)),
+            virtual_ipv4: Some(Ipv4Addr::new(10, 254, 0, 2)),
             ..NodeConfig::default()
         };
         let node_a = VelaNode::builder()
@@ -1804,7 +1804,7 @@ mod tests {
             .register_peer(peer_info(
                 &identity_b,
                 address_b,
-                Ipv4Addr::new(100, 64, 0, 2),
+                Ipv4Addr::new(10, 254, 0, 2),
             ))
             .await
             .unwrap();
@@ -1812,7 +1812,7 @@ mod tests {
             .register_peer(peer_info(
                 &identity_a,
                 address_a,
-                Ipv4Addr::new(100, 64, 0, 1),
+                Ipv4Addr::new(10, 254, 0, 1),
             ))
             .await
             .unwrap();
@@ -1834,8 +1834,8 @@ mod tests {
         packet[2..4].copy_from_slice(&packet_len.to_be_bytes());
         packet[8] = 64;
         packet[9] = 17;
-        packet[12..16].copy_from_slice(&[100, 64, 0, 1]);
-        packet[16..20].copy_from_slice(&[100, 64, 0, 2]);
+        packet[12..16].copy_from_slice(&[10, 254, 0, 1]);
+        packet[16..20].copy_from_slice(&[10, 254, 0, 2]);
         packet[20..].copy_from_slice(b"hello from A");
         let mut checksum = 0u32;
         for chunk in packet[..20].chunks(2) {
@@ -1856,7 +1856,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            matches!(event, VelaEvent::IpPacket { peer, ref packet } if peer == a_id && packet.destination() == IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2)))
+            matches!(event, VelaEvent::IpPacket { peer, ref packet } if peer == a_id && packet.destination() == IpAddr::V4(Ipv4Addr::new(10, 254, 0, 2)))
         );
         node_a.shutdown().await;
         node_b.shutdown().await;
@@ -1869,8 +1869,8 @@ mod tests {
         let identity_b = Identity::generate();
         let address: SocketAddr = "127.0.0.1:45105".parse().unwrap();
         let network_id = [9; 16];
-        let virtual_a = Ipv4Addr::new(100, 64, 0, 11);
-        let virtual_b = Ipv4Addr::new(100, 64, 0, 12);
+        let virtual_a = Ipv4Addr::new(10, 254, 0, 11);
+        let virtual_b = Ipv4Addr::new(10, 254, 0, 12);
         let credential = |identity: &Identity| {
             MembershipCredential::unsigned(
                 &identity.public(),
@@ -1917,8 +1917,8 @@ mod tests {
                 network_id,
                 generation,
                 virtual_ipv4: Some(Ipv4Cidr {
-                    address: Ipv4Addr::new(100, 64, 0, 0),
-                    prefix_len: 10,
+                    address: Ipv4Addr::new(10, 254, 0, 0),
+                    prefix_len: 16,
                 }),
                 virtual_ipv6: None,
                 peers,
