@@ -53,6 +53,7 @@ struct ServerInner {
     pub(crate) database: Mutex<Connection>,
     pub(crate) online: AsyncMutex<HashMap<NodeId, HashMap<u64, mpsc::Sender<ControlMessage>>>>,
     pub(crate) snapshot_generation: std::sync::atomic::AtomicU64,
+    pub(crate) stun_servers: Vec<String>,
     pub(crate) admin: admin::AdminAuth,
 }
 
@@ -71,6 +72,22 @@ impl CoordServer {
         signer_path: impl AsRef<Path>,
         tenant: impl Into<String>,
         credentials_path: impl AsRef<Path>,
+    ) -> Result<Self, CoordError> {
+        Self::open_with_admin_credentials_and_stun_servers(
+            database_path,
+            signer_path,
+            tenant,
+            credentials_path,
+            Vec::new(),
+        )
+    }
+
+    pub fn open_with_admin_credentials_and_stun_servers(
+        database_path: impl AsRef<Path>,
+        signer_path: impl AsRef<Path>,
+        tenant: impl Into<String>,
+        credentials_path: impl AsRef<Path>,
+        stun_servers: Vec<String>,
     ) -> Result<Self, CoordError> {
         let database_path = database_path.as_ref();
         if let Some(parent) = database_path.parent() {
@@ -180,6 +197,7 @@ impl CoordServer {
                 database: Mutex::new(connection),
                 online: AsyncMutex::new(HashMap::new()),
                 snapshot_generation: std::sync::atomic::AtomicU64::new(snapshot_generation),
+                stun_servers,
                 admin,
             }),
         };
@@ -919,6 +937,7 @@ fn network_snapshot(state: &Arc<ServerInner>) -> Result<NetworkSnapshot, CoordEr
             prefix_len: VIRTUAL_IPV4_PREFIX_LEN,
         }),
         virtual_ipv6: None,
+        stun_servers: state.stun_servers.clone(),
         peers,
         expires_at: unix_time().saturating_add(3600),
         signature: Vec::new(),
@@ -1235,6 +1254,32 @@ mod tests {
         );
         let _ = std::fs::remove_file(db);
         let _ = std::fs::remove_file(signer_path);
+    }
+
+    #[test]
+    fn coordinator_stun_servers_are_signed_into_snapshots() {
+        let base = std::env::temp_dir().join(format!(
+            "vela-coord-stun-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = base.with_extension("db");
+        let signer_path = base.with_extension("key");
+        let credentials_path = base.with_extension("credentials");
+        let server = CoordServer::open_with_admin_credentials_and_stun_servers(
+            &db,
+            &signer_path,
+            "test-tenant",
+            &credentials_path,
+            vec!["stun.example.test:3478".to_owned()],
+        )
+        .unwrap();
+        let snapshot = network_snapshot(&server.inner).unwrap();
+        assert_eq!(snapshot.stun_servers, vec!["stun.example.test:3478"]);
+        vela_crypto::verify_snapshot(&snapshot, &server.server_public_key(), unix_time()).unwrap();
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_file(signer_path);
+        let _ = std::fs::remove_file(credentials_path);
     }
 
     #[test]

@@ -6,7 +6,7 @@ use vela_proto::NodeId;
 
 fn usage() -> ! {
     eprintln!(
-        "Usage:\n  vela-cli identity <path>\n  vela-cli server --path <dir> --bind <addr> --tenant <name> [--admin-password-stdin]\n  vela-cli invite --path <dir> --tenant <name> [--ttl <seconds>]\n  vela-cli peers --path <dir> --tenant <name>\n  vela-cli revoke <node-id> --path <dir> --tenant <name>\n  vela-cli admin password reset --path <dir> [--password-stdin]\n  vela-cli peer register --state <dir> --server <url> --server-key <base64> --invite <token> [--bind <addr>] [--stun <addr>]\n  vela-cli peer run --state <dir> [--bind <addr>] [--stun <addr>]\n  vela-cli peer up --state <dir> [--tun <name>] [--mtu <bytes>] [--bind <addr>] [--stun <addr>]\n  vela-cli peer list --state <dir> [--json]\n  vela-cli peer ping <node-id> --state <dir> [--count <n>] [--timeout <duration>] [--json]\n\nServer path defaults: <path>/vela.db, <path>/server.key, <path>/admin.credentials.\nLegacy --db/--signer and --admin-credentials overrides are still accepted."
+        "Usage:\n  vela-cli identity <path>\n  vela-cli server --path <dir> --bind <addr> --tenant <name> [--stun <host:port>] [--admin-password-stdin]\n  vela-cli invite --path <dir> --tenant <name> [--ttl <seconds>]\n  vela-cli peers --path <dir> --tenant <name>\n  vela-cli revoke <node-id> --path <dir> --tenant <name>\n  vela-cli admin password reset --path <dir> [--password-stdin]\n  vela-cli peer register --state <dir> --server <url> --server-key <base64> --invite <token> [--bind <addr>] [--stun <host:port>]\n  vela-cli peer run --state <dir> [--bind <addr>] [--stun <host:port>]\n  vela-cli peer up --state <dir> [--tun <name>] [--mtu <bytes>] [--bind <addr>] [--stun <host:port>]\n  vela-cli peer list --state <dir> [--json]\n  vela-cli peer ping <node-id> --state <dir> [--count <n>] [--timeout <duration>] [--json]\n\nServer path defaults: <path>/vela.db, <path>/server.key, <path>/admin.credentials.\nLegacy --db/--signer and --admin-credentials overrides are still accepted."
     );
     eprintln!("  vela-cli peer status --state <dir> [--json]");
     std::process::exit(2);
@@ -86,11 +86,12 @@ fn coordination_paths(args: &[String]) -> (PathBuf, PathBuf, PathBuf) {
 
 fn open_coordination_server(args: &[String]) -> Result<CoordServer, Box<dyn std::error::Error>> {
     let (database, signer, credentials) = coordination_paths(args);
-    Ok(CoordServer::open_with_admin_credentials(
+    Ok(CoordServer::open_with_admin_credentials_and_stun_servers(
         database,
         signer,
         required(args, "--tenant"),
         credentials,
+        options(args, "--stun"),
     )?)
 }
 
@@ -121,11 +122,8 @@ async fn run_peer_command(args: &[String]) -> Result<(), Box<dyn std::error::Err
             let server = required(args, "--server");
             let server_key = decode_server_key(&required(args, "--server-key"))?;
             let invite = required(args, "--invite");
-            let bind = bind_option(args)?.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
-            let stun = options(args, "--stun")
-                .into_iter()
-                .map(|value| value.parse())
-                .collect::<Result<Vec<SocketAddr>, _>>()?;
+            let bind = bind_option(args)?.unwrap_or_else(|| "[::]:0".parse().unwrap());
+            let stun = options(args, "--stun");
             let state =
                 vela_diagnostic::register(&state_dir, server, server_key, &invite, bind, stun)
                     .await?;
@@ -140,12 +138,7 @@ async fn run_peer_command(args: &[String]) -> Result<(), Box<dyn std::error::Err
             let stun = if stun_values.is_empty() {
                 None
             } else {
-                Some(
-                    stun_values
-                        .into_iter()
-                        .map(|value| value.parse())
-                        .collect::<Result<Vec<SocketAddr>, _>>()?,
-                )
+                Some(stun_values)
             };
             let peer = DiagnosticPeer::open(&state_dir, bind_option(args)?, stun).await?;
             println!(
@@ -168,12 +161,7 @@ async fn run_peer_command(args: &[String]) -> Result<(), Box<dyn std::error::Err
                 let stun = if stun_values.is_empty() {
                     None
                 } else {
-                    Some(
-                        stun_values
-                            .into_iter()
-                            .map(|value| value.parse())
-                            .collect::<Result<Vec<SocketAddr>, _>>()?,
-                    )
+                    Some(stun_values)
                 };
                 let peer = DiagnosticPeer::open(&state_dir, bind_option(args)?, stun).await?;
                 let snapshot = peer
@@ -250,6 +238,7 @@ async fn run_peer_command(args: &[String]) -> Result<(), Box<dyn std::error::Err
                 println!("node\t{}", status.node_id);
                 println!("server\t{}", status.server);
                 println!("bind\t{}", status.bind);
+                println!("stun_servers\t{:?}", status.stun_servers);
                 println!("candidates\t{:?}", status.candidates);
                 println!("peers\t{}", status.peers.len());
             }
@@ -305,6 +294,9 @@ async fn run_tun_peer(
                     Err(vela_core::SendError::Ip(error)) => {
                         tracing::debug!(error = %error, "dropping invalid or unrouted packet from TUN");
                     }
+                    Err(vela_core::SendError::QueueFull) => {
+                        tracing::debug!("dropping packet because the peer send queue is full");
+                    }
                     Err(error) => return Err(error.into()),
                 }
             }
@@ -322,7 +314,8 @@ async fn run_tun_peer(
                         node.register_peer(info).await?;
                     }
                     vela_proto::ControlMessage::Snapshot { snapshot } => {
-                        node.apply_snapshot(snapshot.clone()).await?;
+                        peer.apply_snapshot(snapshot.clone()).await?;
+                        peer.refresh_candidates().await?;
                         for lease in leases.drain(..) {
                             let _ = lease.release().await;
                         }
@@ -338,7 +331,6 @@ async fn run_tun_peer(
                             routes.add_local_address(address.into(), cidr.prefix_len).await?;
                         }
                         leases = vela_tun::install_snapshot_routes(&routes, &snapshot, peer.node_id()).await?;
-                        peer.state.snapshot = Some(snapshot);
                     }
                     vela_proto::ControlMessage::Revoke { node_id } if node_id == peer.node_id() => {
                         for lease in leases.drain(..) {
@@ -390,8 +382,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(password) = password_from_stdin(&args)? {
                 CoordServer::reset_admin_password(&credentials, Some(&password))?;
             }
-            let server =
-                CoordServer::open_with_admin_credentials(database, signer, tenant, credentials)?;
+            let server = CoordServer::open_with_admin_credentials_and_stun_servers(
+                database,
+                signer,
+                tenant,
+                credentials,
+                options(&args, "--stun"),
+            )?;
             println!(
                 "coordination server public key: {}",
                 base64::Engine::encode(

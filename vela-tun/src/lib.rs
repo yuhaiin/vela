@@ -718,6 +718,9 @@ pub async fn run_bridge(node: vela_core::VelaNode, tun: TunDevice) -> Result<(),
                     Err(vela_core::SendError::Ip(error)) => {
                         tracing::debug!(error = %error, "dropping invalid or unrouted packet from TUN");
                     }
+                    Err(vela_core::SendError::QueueFull) => {
+                        tracing::debug!("dropping packet because the peer send queue is full");
+                    }
                     Err(error) => return Err(TunError::Core(error.to_string())),
                 }
             }

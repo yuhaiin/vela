@@ -13,6 +13,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::time::interval;
+use tracing::warn;
 use vela_coord_client::{CoordClientError, CoordinationClient};
 use vela_core::{
     BindOptions, ConnectError, CoreError, DiagnosticPingError, DiagnosticPingResult, NodeConfig,
@@ -31,7 +32,7 @@ pub struct PeerState {
     pub server_key: [u8; 32],
     pub credential: Option<MembershipCredential>,
     pub bind: SocketAddr,
-    pub stun_servers: Vec<SocketAddr>,
+    pub stun_servers: Vec<String>,
     pub candidates: Vec<Candidate>,
     pub snapshot: Option<NetworkSnapshot>,
 }
@@ -41,7 +42,7 @@ impl PeerState {
         server: String,
         server_key: [u8; 32],
         bind: SocketAddr,
-        stun_servers: Vec<SocketAddr>,
+        stun_servers: Vec<String>,
     ) -> Self {
         Self {
             server,
@@ -80,28 +81,27 @@ pub async fn register(
     server_key: [u8; 32],
     invite: &str,
     bind: SocketAddr,
-    stun_servers: Vec<SocketAddr>,
+    stun_servers: Vec<String>,
 ) -> Result<PeerState, DiagnosticError> {
     let state_dir = state_dir.as_ref();
     let identity = Identity::load_or_generate(PeerState::identity_path(state_dir))?;
-    let mut state = PeerState::new(server, server_key, bind, stun_servers);
-    let peer = DiagnosticPeer::build(state.clone(), identity).await?;
-    let mut client = peer.client;
+    let mut peer = DiagnosticPeer::build(
+        PeerState::new(server, server_key, bind, stun_servers.clone()),
+        identity,
+        state_dir,
+        stun_servers,
+    )
+    .await?;
     let candidates = peer.candidates.clone();
-    state.candidates = candidates.clone();
-    let registration = client
-        .register(
-            &peer.node.identity().clone(),
-            Some(invite),
-            None,
-            candidates,
-        )
+    let registration = peer
+        .client
+        .register(peer.node.identity(), Some(invite), None, candidates.clone())
         .await?;
-    state.credential = Some(registration.credential);
-    state.snapshot = Some(registration.snapshot.clone());
-    peer.node.apply_snapshot(registration.snapshot).await?;
-    state.save(state_dir)?;
-    Ok(state)
+    peer.state.credential = Some(registration.credential);
+    peer.state.candidates = candidates;
+    peer.apply_snapshot(registration.snapshot).await?;
+    peer.refresh_candidates().await?;
+    Ok(peer.state)
 }
 
 pub struct DiagnosticPeer {
@@ -109,6 +109,8 @@ pub struct DiagnosticPeer {
     pub client: CoordinationClient,
     pub state: PeerState,
     candidates: Vec<Candidate>,
+    state_dir: PathBuf,
+    manual_stun_servers: Vec<String>,
 }
 
 pub struct DiagnosticControl {
@@ -134,6 +136,8 @@ impl DiagnosticControl {
             .await?;
         state.credential = Some(registration.credential);
         state.snapshot = Some(registration.snapshot.clone());
+        state.stun_servers =
+            merge_stun_servers(&state.stun_servers, &registration.snapshot.stun_servers);
         state.save(state_dir)?;
         Ok(Self {
             client,
@@ -155,6 +159,7 @@ impl DiagnosticControl {
             node_id: self.node_id(),
             server: self.state.server.clone(),
             bind: self.state.bind,
+            stun_servers: self.state.stun_servers.clone(),
             candidates: self.state.candidates.clone(),
             credential_expires_at: self
                 .state
@@ -170,41 +175,45 @@ impl DiagnosticPeer {
     pub async fn open(
         state_dir: impl AsRef<Path>,
         bind: Option<SocketAddr>,
-        stun_servers: Option<Vec<SocketAddr>>,
+        stun_servers: Option<Vec<String>>,
     ) -> Result<Self, DiagnosticError> {
         let state_dir = state_dir.as_ref();
         let mut state = PeerState::load(state_dir)?;
         if let Some(bind) = bind {
             state.bind = bind;
         }
-        if let Some(stun_servers) = stun_servers {
-            state.stun_servers = stun_servers;
+        // Keep an explicitly configured local STUN endpoint across restarts;
+        // coordinator endpoints are merged into it when a snapshot arrives.
+        let manual_stun_servers = stun_servers.unwrap_or_else(|| state.stun_servers.clone());
+        if !manual_stun_servers.is_empty() {
+            state.stun_servers = manual_stun_servers.clone();
         }
         let identity = Identity::load(PeerState::identity_path(state_dir))?;
-        let peer = Self::build(state.clone(), identity).await?;
-        let mut client = peer.client;
-        let registration = client
+        let mut peer = Self::build(state, identity, state_dir, manual_stun_servers).await?;
+        let registration = peer
+            .client
             .register(
                 peer.node.identity(),
                 None,
-                state.credential.as_ref(),
+                peer.state.credential.as_ref(),
                 peer.candidates.clone(),
             )
             .await?;
-        state.credential = Some(registration.credential);
-        state.candidates = peer.candidates.clone();
-        state.snapshot = Some(registration.snapshot.clone());
-        state.save(state_dir)?;
-        peer.node.apply_snapshot(registration.snapshot).await?;
-        Ok(Self {
-            node: peer.node,
-            client,
-            state,
-            candidates: peer.candidates,
-        })
+        peer.state.credential = Some(registration.credential);
+        peer.state.candidates = peer.candidates.clone();
+        peer.apply_snapshot(registration.snapshot).await?;
+        peer.refresh_candidates().await?;
+        peer.node.start().await?;
+        peer.state.save(state_dir)?;
+        Ok(peer)
     }
 
-    async fn build(state: PeerState, identity: Identity) -> Result<Self, DiagnosticError> {
+    async fn build(
+        state: PeerState,
+        identity: Identity,
+        state_dir: impl AsRef<Path>,
+        manual_stun_servers: Vec<String>,
+    ) -> Result<Self, DiagnosticError> {
         let provider = Arc::new(TokioDatagramProvider::new(Vec::new()));
         let local = state.snapshot.as_ref().and_then(|snapshot| {
             snapshot
@@ -231,25 +240,26 @@ impl DiagnosticPeer {
             .build()
             .await?;
 
-        let local_addr = node.local_addr()?;
-        let mut candidates = if state.bind.ip().is_unspecified() {
-            Vec::new()
-        } else {
-            vec![Candidate::Host(SocketAddr::new(
-                state.bind.ip(),
-                local_addr.port(),
-            ))]
-        };
+        let mut candidates = node.local_candidates();
         if !state.stun_servers.is_empty() {
-            let stun = node
+            match node
                 .gather_server_reflexive_candidates(&vela_stun::StunConfig {
                     servers: state.stun_servers.clone(),
                     ..vela_stun::StunConfig::default()
                 })
-                .await?;
-            candidates.extend(stun);
+                .await
+            {
+                Ok(stun_candidates) => candidates.extend(stun_candidates),
+                Err(error) if candidates.is_empty() => return Err(error.into()),
+                Err(error) => {
+                    warn!(error = %error, "initial STUN gathering failed; using host candidates");
+                }
+            }
         }
-        node.start().await?;
+        let candidates = unique_candidates(candidates);
+        if candidates.is_empty() {
+            return Err(DiagnosticError::NoCandidates);
+        }
         let mut client = CoordinationClient::connect(&state.server).await?;
         client.trust_server_key(state.server_key);
         Ok(Self {
@@ -257,6 +267,8 @@ impl DiagnosticPeer {
             client,
             state,
             candidates,
+            state_dir: state_dir.as_ref().to_path_buf(),
+            manual_stun_servers,
         })
     }
 
@@ -281,6 +293,7 @@ impl DiagnosticPeer {
             node_id: self.node_id(),
             server: self.state.server.clone(),
             bind: self.state.bind,
+            stun_servers: self.state.stun_servers.clone(),
             candidates: self.candidates.clone(),
             credential_expires_at: self
                 .state
@@ -292,10 +305,56 @@ impl DiagnosticPeer {
     }
 
     pub async fn refresh_candidates(&mut self) -> Result<(), DiagnosticError> {
-        self.client
-            .update_candidates(self.candidates.clone())
-            .await?;
+        let candidates = match self.collect_candidates().await {
+            Ok(candidates) => candidates,
+            Err(error) if !self.candidates.is_empty() => {
+                warn!(error = %error, "keeping the last known candidates after refresh failure");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        self.client.update_candidates(candidates.clone()).await?;
+        self.candidates = candidates.clone();
+        self.state.candidates = candidates;
+        self.state.save(&self.state_dir)?;
         Ok(())
+    }
+
+    pub async fn apply_snapshot(
+        &mut self,
+        snapshot: NetworkSnapshot,
+    ) -> Result<(), DiagnosticError> {
+        self.node.apply_snapshot(snapshot.clone()).await?;
+        self.state.stun_servers =
+            merge_stun_servers(&self.manual_stun_servers, &snapshot.stun_servers);
+        self.state.snapshot = Some(snapshot);
+        self.state.save(&self.state_dir)?;
+        Ok(())
+    }
+
+    async fn collect_candidates(&self) -> Result<Vec<Candidate>, DiagnosticError> {
+        let mut candidates = self.node.local_candidates();
+        if !self.state.stun_servers.is_empty() {
+            match self
+                .node
+                .gather_server_reflexive_candidates(&vela_stun::StunConfig {
+                    servers: self.state.stun_servers.clone(),
+                    ..vela_stun::StunConfig::default()
+                })
+                .await
+            {
+                Ok(stun_candidates) => candidates.extend(stun_candidates),
+                Err(error) if candidates.is_empty() => return Err(error.into()),
+                Err(error) => {
+                    warn!(error = %error, "STUN refresh failed; using host candidates");
+                }
+            }
+        }
+        let candidates = unique_candidates(candidates);
+        if candidates.is_empty() {
+            return Err(DiagnosticError::NoCandidates);
+        }
+        Ok(candidates)
     }
 
     pub async fn ping(
@@ -326,8 +385,8 @@ impl DiagnosticPeer {
                         self.node.register_peer(peer).await?;
                     }
                     ControlMessage::Snapshot { snapshot } => {
-                        self.node.apply_snapshot(snapshot.clone()).await?;
-                        self.state.snapshot = Some(snapshot);
+                        self.apply_snapshot(snapshot).await?;
+                        self.refresh_candidates().await?;
                     }
                     ControlMessage::Revoke { node_id } if node_id == self.node_id() => {
                         return Err(DiagnosticError::Revoked);
@@ -345,6 +404,7 @@ pub struct PeerStatus {
     pub node_id: NodeId,
     pub server: String,
     pub bind: SocketAddr,
+    pub stun_servers: Vec<String>,
     pub candidates: Vec<Candidate>,
     pub credential_expires_at: Option<u64>,
     pub peers: Vec<PeerSummary>,
@@ -424,6 +484,28 @@ pub enum DiagnosticError {
     Ping(#[from] DiagnosticPingError),
     #[error("peer registration was revoked")]
     Revoked,
+    #[error("no usable local or server-reflexive candidates were found")]
+    NoCandidates,
+}
+
+fn merge_stun_servers(local: &[String], remote: &[String]) -> Vec<String> {
+    let mut servers = local.to_vec();
+    for server in remote {
+        if !servers.contains(server) {
+            servers.push(server.clone());
+        }
+    }
+    servers
+}
+
+fn unique_candidates(candidates: Vec<Candidate>) -> Vec<Candidate> {
+    let mut unique = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if !unique.contains(&candidate) {
+            unique.push(candidate);
+        }
+    }
+    unique
 }
 
 fn set_private(_path: &Path) -> Result<(), std::io::Error> {

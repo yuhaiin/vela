@@ -42,7 +42,7 @@ let node = VelaNode::builder()
     .identity(Identity::load_or_generate("./node.key")?)
     .datagram_provider(provider)
     .config(NodeConfig {
-        bind: BindOptions { local_addr: "0.0.0.0:0".parse()? },
+        bind: BindOptions { local_addr: "[::]:0".parse()? },
         ..NodeConfig::default()
     })
     .build()
@@ -124,8 +124,13 @@ does not expose the admin session token.
 `peer run` is a diagnostic peer process, not a server or relay. The
 coordination server only exchanges registration and candidate information;
 the Probe, Noise handshake, and encrypted Echo/Pong packets travel directly
-between peer UDP sockets. `--stun <ip:port>` can be repeated during register
-or run to publish server-reflexive candidates.
+between peer UDP sockets. `--stun <host:port>` can be repeated during register
+or run to publish server-reflexive candidates; hostnames are resolved on every
+refresh. The server may also be started with repeated `--stun <host:port>`
+options, which are signed into snapshots and picked up by peers dynamically.
+The default peer bind is the dual-stack `[::]:0`, and host candidates are
+collected from active local interfaces, so peers on the same LAN can connect
+directly without going through STUN.
 
 On Linux, macOS, and Windows, `peer up` creates a layer-3 TUN interface, assigns
 the stable virtual address from the signed network snapshot, installs only the

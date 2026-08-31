@@ -32,7 +32,7 @@
         <button id="logout" class="rounded-lg border border-slate-700 px-3 py-2 text-sm hover:bg-slate-900">Sign out</button>
       </header>
 
-      <section class="mt-6 grid gap-6 lg:grid-cols-[22rem_1fr]">
+      <section class="mt-6 grid gap-6 lg:grid-cols-[22rem_minmax(0,1fr)]">
         <div class="rounded-2xl bg-slate-900 p-5 ring-1 ring-slate-800">
           <h2 class="text-lg font-medium">Add peer</h2>
           <form id="invite-form" class="mt-4 space-y-3">
@@ -50,13 +50,13 @@
           </div>
         </div>
 
-        <div id="invite-result" class="hidden rounded-2xl bg-slate-900 p-5 ring-1 ring-cyan-900">
+        <div id="invite-result" class="hidden min-w-0 rounded-2xl bg-slate-900 p-5 ring-1 ring-cyan-900">
           <div class="flex items-center justify-between gap-4">
             <h2 class="text-lg font-medium">One-time commands for the new peer</h2>
             <button id="close-invite" class="text-slate-400 hover:text-white">Close</button>
           </div>
           <p class="mt-2 text-xs text-amber-300">The download token and invite token are shown only once. Save them now.</p>
-          <div id="invite-commands" class="mt-4 space-y-4"></div>
+          <div id="invite-commands" class="mt-4 min-w-0 space-y-4"></div>
         </div>
       </section>
 
@@ -95,6 +95,7 @@
   let session = null;
   let serverConfig = null;
   let pollTimer = null;
+  const expandedPeers = new Set();
   const $ = (id) => document.getElementById(id);
   const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
   const shell = (value) => `'${String(value).replace(/'/g, `'"'"'`)}'`;
@@ -160,16 +161,46 @@
       clearError($('app-error'));
     } catch (error) { showError($('app-error'), error.message); }
   }
+  function formatCandidate(candidate) {
+    if (!candidate || typeof candidate !== 'object') return String(candidate ?? '');
+    const [kind, address] = Object.entries(candidate)[0] || [];
+    if (!kind) return JSON.stringify(candidate);
+    return `${kind.replace(/([a-z])([A-Z])/g, '$1 $2')}: ${address}`;
+  }
   function renderPeers(peers) {
     $('peer-count').textContent = `${peers.length} peer(s)`;
-    $('peers').innerHTML = peers.map((peer) => `<tr class="${peer.status === 'revoked' ? 'opacity-50' : ''}">
-      <td class="px-2 py-3"><div>${esc(peer.name || 'Unnamed')}</div><div class="text-xs text-slate-500">${esc(peer.notes)}</div></td>
+    const currentNodes = new Set(peers.map((peer) => peer.node_id));
+    for (const node of expandedPeers) if (!currentNodes.has(node)) expandedPeers.delete(node);
+    $('peers').innerHTML = peers.map((peer) => {
+      const expanded = expandedPeers.has(peer.node_id);
+      const candidates = peer.candidates || [];
+      const candidateMarkup = candidates.length
+        ? `<ul class="space-y-1">${candidates.map((candidate) => `<li class="font-mono text-xs text-slate-300">${esc(formatCandidate(candidate))}</li>`).join('')}</ul>`
+        : '<span class="text-slate-500">None reported</span>';
+      const capabilities = peer.capabilities?.length ? peer.capabilities.join(', ') : 'None reported';
+      return `<tr class="${peer.status === 'revoked' ? 'opacity-50' : ''}">
+      <td class="px-2 py-3"><div>${esc(peer.name || 'Unnamed')}</div><div class="text-xs text-slate-500">${esc(peer.notes || '—')}</div></td>
       <td class="break-all px-2 py-3 font-mono text-xs">${esc(peer.node_id)}</td>
-      <td class="px-2 py-3 font-mono">${esc(peer.virtual_ipv4 || '—')}</td>
+      <td class="px-2 py-3 font-mono"><div>${esc(peer.virtual_ipv4 || '—')}</div><div class="break-all text-xs text-slate-500">${esc(peer.virtual_ipv6 || '')}</div></td>
       <td class="px-2 py-3"><span class="rounded-full px-2 py-1 text-xs ${peer.status === 'online' ? 'bg-emerald-950 text-emerald-300' : peer.status === 'revoked' ? 'bg-red-950 text-red-300' : 'bg-slate-800 text-slate-400'}">${esc(peer.status)}</span></td>
       <td class="px-2 py-3 text-xs text-slate-400">${esc(time(peer.last_seen))}</td>
-      <td class="whitespace-nowrap px-2 py-3 text-right"><button data-action="edit" data-node="${esc(peer.node_id)}" data-name="${esc(peer.name)}" data-notes="${esc(peer.notes)}" class="mr-2 text-cyan-400 hover:text-cyan-300">Edit</button>${peer.status !== 'revoked' ? `<button data-action="revoke" data-node="${esc(peer.node_id)}" class="mr-2 text-amber-400 hover:text-amber-300">Revoke</button>` : ''}<button data-action="delete" data-node="${esc(peer.node_id)}" class="text-red-400 hover:text-red-300">Delete permanently</button></td>
-    </tr>`).join('');
+      <td class="whitespace-nowrap px-2 py-3 text-right"><button data-action="details" data-node="${esc(peer.node_id)}" aria-expanded="${expanded}" class="mr-2 text-cyan-400 hover:text-cyan-300">${expanded ? 'Hide details' : 'Details'}</button><button data-action="edit" data-node="${esc(peer.node_id)}" data-name="${esc(peer.name)}" data-notes="${esc(peer.notes)}" class="mr-2 text-cyan-400 hover:text-cyan-300">Edit</button>${peer.status !== 'revoked' ? `<button data-action="revoke" data-node="${esc(peer.node_id)}" class="mr-2 text-amber-400 hover:text-amber-300">Revoke</button>` : ''}<button data-action="delete" data-node="${esc(peer.node_id)}" class="text-red-400 hover:text-red-300">Delete permanently</button></td>
+    </tr>
+    <tr data-details-for="${esc(peer.node_id)}" class="${expanded ? '' : 'hidden'} bg-slate-950/50">
+      <td colspan="6" class="px-4 py-4">
+        <dl class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          <div><dt class="text-xs uppercase text-slate-500">Virtual IPv4</dt><dd class="mt-1 font-mono text-sm text-slate-200">${esc(peer.virtual_ipv4 || '—')}</dd></div>
+          <div><dt class="text-xs uppercase text-slate-500">Virtual IPv6</dt><dd class="mt-1 break-all font-mono text-sm text-slate-200">${esc(peer.virtual_ipv6 || '—')}</dd></div>
+          <div><dt class="text-xs uppercase text-slate-500">Credential expires</dt><dd class="mt-1 text-sm text-slate-200">${esc(time(peer.credential_expires_at))}</dd></div>
+          <div class="sm:col-span-2 lg:col-span-3"><dt class="text-xs uppercase text-slate-500">Advertised candidates / local addresses</dt><dd class="mt-1">${candidateMarkup}</dd></div>
+          <div><dt class="text-xs uppercase text-slate-500">Capabilities</dt><dd class="mt-1 text-sm text-slate-200">${esc(capabilities)}</dd></div>
+          <div><dt class="text-xs uppercase text-slate-500">Last seen</dt><dd class="mt-1 text-sm text-slate-200">${esc(time(peer.last_seen))}</dd></div>
+          <div><dt class="text-xs uppercase text-slate-500">Node ID</dt><dd class="mt-1 break-all font-mono text-xs text-slate-300">${esc(peer.node_id)}</dd></div>
+          <div class="sm:col-span-2 lg:col-span-3"><dt class="text-xs uppercase text-slate-500">Notes</dt><dd class="mt-1 text-sm text-slate-300">${esc(peer.notes || '—')}</dd></div>
+        </dl>
+      </td>
+    </tr>`;
+    }).join('');
   }
   function renderInvites(invites) {
     $('invites').innerHTML = invites.map((invite) => `<tr>
@@ -199,7 +230,7 @@
       ['2. Register peer', registerCommand],
       ['3a. Run diagnostic peer (alternative to TUN)', runCommand],
       ['3b. Start TUN peer (alternative to diagnostic mode)', upCommand],
-    ].map(([title, command]) => `<div><p class="mb-1 text-sm text-slate-300">${title}</p><pre class="overflow-x-auto rounded-lg bg-slate-950 p-3 text-xs text-cyan-300">${esc(command)}</pre></div>`).join('');
+    ].map(([title, command]) => `<div class="min-w-0"><p class="mb-1 text-sm text-slate-300">${title}</p><pre class="max-w-full overflow-x-auto whitespace-pre-wrap break-all rounded-lg bg-slate-950 p-3 text-xs text-cyan-300">${esc(command)}</pre></div>`).join('');
     $('invite-result').classList.remove('hidden');
     $('invite-result').scrollIntoView({behavior: 'smooth', block: 'start'});
   }
@@ -224,7 +255,16 @@
     const button = event.target.closest('button[data-action]'); if (!button) return;
     const node = button.dataset.node; const action = button.dataset.action;
     try {
-      if (action === 'edit') {
+      if (action === 'details') {
+        const details = [...$('peers').querySelectorAll('tr[data-details-for]')]
+          .find((row) => row.dataset.detailsFor === node);
+        if (!details) return;
+        const expanded = !details.classList.toggle('hidden');
+        expanded ? expandedPeers.add(node) : expandedPeers.delete(node);
+        button.setAttribute('aria-expanded', String(expanded));
+        button.textContent = expanded ? 'Hide details' : 'Details';
+        return;
+      } else if (action === 'edit') {
         const name = prompt('Peer name', button.dataset.name || ''); if (name === null) return;
         const notes = prompt('Peer notes', button.dataset.notes || ''); if (notes === null) return;
         await api(`/api/v1/admin/peers/${encodeURIComponent(node)}`, {method: 'PATCH', body: {name, notes}});

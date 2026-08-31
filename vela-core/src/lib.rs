@@ -7,7 +7,9 @@
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use if_addrs::get_if_addrs;
 use rand::RngCore;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     collections::{HashMap, VecDeque},
     io,
@@ -44,7 +46,7 @@ pub struct BindOptions {
 impl Default for BindOptions {
     fn default() -> Self {
         Self {
-            local_addr: "0.0.0.0:0".parse().expect("valid default socket address"),
+            local_addr: "[::]:0".parse().expect("valid default socket address"),
         }
     }
 }
@@ -75,14 +77,53 @@ impl TokioDatagramProvider {
 #[async_trait]
 impl DatagramProvider for TokioDatagramProvider {
     async fn bind(&self, options: BindOptions) -> Result<Arc<dyn DatagramSocket>, CoreError> {
+        let domain = if options.local_addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+        if options.local_addr.is_ipv6() && options.local_addr.ip().is_unspecified() {
+            socket.set_only_v6(false)?;
+        }
+        socket.set_nonblocking(true)?;
+        socket.bind(&options.local_addr.into())?;
         Ok(Arc::new(TokioDatagramSocket {
-            socket: UdpSocket::bind(options.local_addr).await?,
+            socket: UdpSocket::from_std(socket.into())?,
         }))
     }
 
     fn local_candidates(&self) -> Vec<Candidate> {
         self.host_candidates.clone()
     }
+}
+
+fn host_candidates(bind_addr: SocketAddr, port: u16) -> Vec<Candidate> {
+    if !bind_addr.ip().is_unspecified() {
+        return vec![Candidate::Host(SocketAddr::new(bind_addr.ip(), port))];
+    }
+
+    // An unspecified IPv6 socket is created as dual-stack below, so it can
+    // reach IPv4 peers as well. Advertise both address families in that case.
+    let include_ipv4 = bind_addr.is_ipv4() || bind_addr.is_ipv6();
+    let include_ipv6 = bind_addr.is_ipv6();
+    let Ok(interfaces) = get_if_addrs() else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    for interface in interfaces {
+        if interface.is_loopback() || interface.is_link_local() {
+            continue;
+        }
+        let address = interface.ip();
+        if (address.is_ipv4() && include_ipv4) || (address.is_ipv6() && include_ipv6) {
+            let candidate = Candidate::Host(SocketAddr::new(address, port));
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    candidates
 }
 
 struct TokioDatagramSocket {
@@ -103,17 +144,73 @@ impl DatagramSocket for TokioDatagramSocket {
 }
 
 struct StunSocketAdapter {
-    socket: Arc<dyn DatagramSocket>,
+    inner: Arc<Inner>,
+    pending: Mutex<Option<oneshot::Receiver<StunResponse>>>,
+}
+
+type StunResponse = (Vec<u8>, SocketAddr);
+type StunWaiter = (Instant, oneshot::Sender<StunResponse>);
+
+const STUN_MAGIC_COOKIE: [u8; 4] = 0x2112_A442u32.to_be_bytes();
+
+fn stun_transaction_id(input: &[u8]) -> Option<[u8; 12]> {
+    if input.len() < 20 || input[0] & 0xc0 != 0 || input[4..8] != STUN_MAGIC_COOKIE {
+        return None;
+    }
+    input[8..20].try_into().ok()
 }
 
 #[async_trait]
 impl vela_stun::StunSocket for StunSocketAdapter {
     async fn send_to(&self, bytes: &[u8], target: SocketAddr) -> io::Result<usize> {
-        self.socket.send_to(bytes, target).await
+        if !self.inner.started.load(Ordering::Acquire) {
+            return self.inner.socket.send_to(bytes, target).await;
+        }
+        let Some(transaction) = stun_transaction_id(bytes) else {
+            return self.inner.socket.send_to(bytes, target).await;
+        };
+        let (sender, receiver) = oneshot::channel();
+        {
+            let mut waiters = self.inner.stun_waiters.lock().await;
+            let now = Instant::now();
+            waiters.retain(|_, (deadline, _)| *deadline > now);
+            waiters.insert(transaction, (now + Duration::from_secs(10), sender));
+        }
+        *self.pending.lock().await = Some(receiver);
+        match self.inner.socket.send_to(bytes, target).await {
+            Ok(length) => Ok(length),
+            Err(error) => {
+                self.inner.stun_waiters.lock().await.remove(&transaction);
+                self.pending.lock().await.take();
+                Err(error)
+            }
+        }
     }
 
     async fn recv_from(&self, buffer: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        self.socket.recv_from(buffer).await
+        if !self.inner.started.load(Ordering::Acquire) {
+            return self.inner.socket.recv_from(buffer).await;
+        }
+        let receiver = self.pending.lock().await.take().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "STUN receive has no pending request",
+            )
+        })?;
+        let (bytes, source) = receiver.await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "STUN request was cancelled",
+            )
+        })?;
+        if bytes.len() > buffer.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "STUN response is larger than the receive buffer",
+            ));
+        }
+        buffer[..bytes.len()].copy_from_slice(&bytes);
+        Ok((bytes.len(), source))
     }
 }
 
@@ -233,6 +330,7 @@ impl VelaNodeBuilder {
             snapshot_expires_at: AtomicU64::new(u64::MAX),
             local_ipv4: Mutex::new(local_ipv4),
             local_ipv6: Mutex::new(local_ipv6),
+            stun_waiters: Mutex::new(HashMap::new()),
         });
         Ok(VelaNode { inner })
     }
@@ -259,12 +357,13 @@ impl VelaNode {
     }
     pub fn local_candidates(&self) -> Vec<Candidate> {
         let candidates = self.inner.provider.local_candidates();
-        if candidates.is_empty() {
-            self.local_addr()
-                .map(|address| vec![Candidate::Host(address)])
-                .unwrap_or_default()
-        } else {
+        if !candidates.is_empty() {
             candidates
+        } else {
+            let Ok(local_addr) = self.local_addr() else {
+                return Vec::new();
+            };
+            host_candidates(self.inner.config.bind.local_addr, local_addr.port())
         }
     }
 
@@ -273,7 +372,8 @@ impl VelaNode {
         config: &vela_stun::StunConfig,
     ) -> Result<Vec<Candidate>, CoreError> {
         let socket = StunSocketAdapter {
-            socket: Arc::clone(&self.inner.socket),
+            inner: Arc::clone(&self.inner),
+            pending: Mutex::new(None),
         };
         Ok(vela_stun::binding(&socket, config)
             .await?
@@ -640,6 +740,7 @@ struct Inner {
     snapshot_expires_at: AtomicU64,
     local_ipv4: Mutex<Option<Ipv4Addr>>,
     local_ipv6: Mutex<Option<Ipv6Addr>>,
+    stun_waiters: Mutex<HashMap<[u8; 12], StunWaiter>>,
     event_tx: mpsc::Sender<VelaEvent>,
     event_rx: Mutex<Option<mpsc::Receiver<VelaEvent>>>,
     shutdown: Notify,
@@ -654,6 +755,13 @@ impl Inner {
                 _ = self.shutdown.notified() => break,
                 result = self.socket.recv_from(&mut buffer) => match result {
                     Ok((length, source)) => {
+                        if let Some(transaction) = stun_transaction_id(&buffer[..length]) {
+                            let waiter = self.stun_waiters.lock().await.remove(&transaction);
+                            if let Some((_, sender)) = waiter {
+                                let _ = sender.send((buffer[..length].to_vec(), source));
+                            }
+                            continue;
+                        }
                         if let Err(error) = self.handle_packet(&buffer[..length], source).await { debug!(%error, %source, "dropping invalid Vela packet"); }
                     }
                     Err(error) => { warn!(%error, "Vela UDP receive loop stopped"); break; }
@@ -1762,6 +1870,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn explicit_ipv6_bind_is_advertised_as_a_host_candidate() {
+        let bind: SocketAddr = "[2001:db8::10]:0".parse().unwrap();
+        let candidates = host_candidates(bind, 45101);
+        assert_eq!(
+            candidates,
+            vec![Candidate::Host("[2001:db8::10]:45101".parse().unwrap())]
+        );
+    }
+
     #[tokio::test]
     async fn two_nodes_establish_an_encrypted_local_datagram_session() {
         let identity_a = Identity::generate();
@@ -1863,6 +1981,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_dual_stack_nodes_establish_an_ipv6_session() {
+        if UdpSocket::bind("[::1]:0").await.is_err() {
+            return;
+        }
+
+        let identity_a = Identity::generate();
+        let identity_b = Identity::generate();
+        let node_a = VelaNode::builder()
+            .identity(identity_a.clone())
+            .datagram_provider(Arc::new(TokioDatagramProvider::new(Vec::new())))
+            .config(NodeConfig {
+                virtual_ipv4: Some(Ipv4Addr::new(10, 254, 0, 3)),
+                ..NodeConfig::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let node_b = VelaNode::builder()
+            .identity(identity_b.clone())
+            .datagram_provider(Arc::new(TokioDatagramProvider::new(Vec::new())))
+            .config(NodeConfig {
+                virtual_ipv4: Some(Ipv4Addr::new(10, 254, 0, 4)),
+                ..NodeConfig::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let address_a = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            node_a.local_addr().unwrap().port(),
+        );
+        let address_b = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            node_b.local_addr().unwrap().port(),
+        );
+        node_a
+            .register_peer(peer_info(
+                &identity_b,
+                address_b,
+                Ipv4Addr::new(10, 254, 0, 4),
+            ))
+            .await
+            .unwrap();
+        node_b
+            .register_peer(peer_info(
+                &identity_a,
+                address_a,
+                Ipv4Addr::new(10, 254, 0, 3),
+            ))
+            .await
+            .unwrap();
+        node_a.start().await.unwrap();
+        node_b.start().await.unwrap();
+
+        let handle = node_a.connect(node_b.node_id()).await.unwrap();
+        let diagnostic = handle
+            .diagnostic_ping(1, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(diagnostic.path, address_b);
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn signed_snapshot_replaces_routes_and_rejects_revoked_peers() {
         let signer = ServerSigner::generate();
         let identity_a = Identity::generate();
@@ -1921,6 +2105,7 @@ mod tests {
                     prefix_len: 16,
                 }),
                 virtual_ipv6: None,
+                stun_servers: Vec::new(),
                 peers,
                 expires_at: unix_time() + 60,
                 signature: Vec::new(),

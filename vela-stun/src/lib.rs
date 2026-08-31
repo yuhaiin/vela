@@ -8,7 +8,10 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
-use tokio::{net::UdpSocket, time::timeout};
+use tokio::{
+    net::{UdpSocket, lookup_host},
+    time::timeout,
+};
 
 const MAGIC_COOKIE: u32 = 0x2112_A442;
 const BINDING_REQUEST: u16 = 0x0001;
@@ -17,7 +20,9 @@ const MAPPED_ADDRESS: u16 = 0x0001;
 
 #[derive(Clone, Debug)]
 pub struct StunConfig {
-    pub servers: Vec<SocketAddr>,
+    /// STUN endpoints in `host:port` form. Hostnames are resolved when a
+    /// binding refresh runs, so a changed DNS answer is picked up too.
+    pub servers: Vec<String>,
     pub timeout: Duration,
 }
 
@@ -52,21 +57,63 @@ pub async fn binding<S: StunSocket + ?Sized>(
     config: &StunConfig,
 ) -> Result<Vec<SocketAddr>, StunError> {
     let mut results = Vec::new();
+    let mut last_error = None;
     for server in &config.servers {
-        let transaction = transaction_id();
-        let request = binding_request(transaction);
-        socket.send_to(&request, *server).await?;
-        let mut response = [0u8; 1500];
-        let (length, source) = timeout(config.timeout, socket.recv_from(&mut response))
-            .await
-            .map_err(|_| StunError::Timeout)??;
-        let address = parse_binding_response(&response[..length], transaction)?;
-        if source.ip().is_unspecified() {
-            return Err(StunError::InvalidResponse);
+        let addresses = match lookup_host(server).await {
+            Ok(addresses) => addresses,
+            Err(source) => {
+                last_error = Some(StunError::Resolve {
+                    server: server.clone(),
+                    source,
+                });
+                continue;
+            }
+        };
+        let mut resolved = false;
+        let mut server_error = None;
+        for address in addresses {
+            resolved = true;
+            match binding_address(socket, config.timeout, address).await {
+                Ok(address) if !results.contains(&address) => results.push(address),
+                Ok(_) => {}
+                Err(error) => server_error = Some(error),
+            }
         }
-        results.push(address);
+        if !resolved {
+            last_error = Some(StunError::Resolve {
+                server: server.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    "STUN hostname resolved to no addresses",
+                ),
+            });
+        } else if let Some(error) = server_error {
+            last_error = Some(error);
+        }
+    }
+    if results.is_empty() && !config.servers.is_empty() {
+        return Err(last_error.unwrap_or(StunError::NoServersResponded));
     }
     Ok(results)
+}
+
+async fn binding_address<S: StunSocket + ?Sized>(
+    socket: &S,
+    request_timeout: Duration,
+    server: SocketAddr,
+) -> Result<SocketAddr, StunError> {
+    let transaction = transaction_id();
+    let request = binding_request(transaction);
+    socket.send_to(&request, server).await?;
+    let mut response = [0u8; 1500];
+    let (length, source) = timeout(request_timeout, socket.recv_from(&mut response))
+        .await
+        .map_err(|_| StunError::Timeout)??;
+    let address = parse_binding_response(&response[..length], transaction)?;
+    if source.ip().is_unspecified() {
+        return Err(StunError::InvalidResponse);
+    }
+    Ok(address)
 }
 
 fn transaction_id() -> [u8; 12] {
@@ -158,17 +205,26 @@ fn parse_address(attribute: u16, value: &[u8], transaction: [u8; 12]) -> Option<
 pub enum StunError {
     #[error("STUN I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("failed to resolve STUN server {server}: {source}")]
+    Resolve {
+        server: String,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("STUN request timed out")]
     Timeout,
     #[error("invalid STUN response")]
     InvalidResponse,
     #[error("STUN response has no mapped address")]
     NoMappedAddress,
+    #[error("no STUN server responded")]
+    NoServersResponded,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn parses_xor_mapped_ipv4() {
@@ -187,5 +243,82 @@ mod tests {
         }
         value.extend_from_slice(&ip);
         assert_eq!(parse_address(XOR_MAPPED_ADDRESS, &value, tx), Some(address));
+    }
+
+    #[test]
+    fn parses_xor_mapped_ipv6() {
+        let tx = [1u8; 12];
+        let address: SocketAddr = "[2001:db8::7]:4567".parse().unwrap();
+        let mut value = vec![0, 2];
+        value.extend_from_slice(&(address.port() ^ (MAGIC_COOKIE >> 16) as u16).to_be_bytes());
+        let mut ip = match address.ip() {
+            IpAddr::V6(ip) => ip.octets(),
+            IpAddr::V4(_) => unreachable!(),
+        };
+        let mut mask = [0u8; 16];
+        mask[..4].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        mask[4..].copy_from_slice(&tx);
+        for (byte, mask) in ip.iter_mut().zip(mask) {
+            *byte ^= mask;
+        }
+        value.extend_from_slice(&ip);
+        assert_eq!(parse_address(XOR_MAPPED_ADDRESS, &value, tx), Some(address));
+    }
+
+    struct MockSocket {
+        response: Mutex<Option<Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl StunSocket for MockSocket {
+        async fn send_to(&self, bytes: &[u8], _target: SocketAddr) -> std::io::Result<usize> {
+            let transaction: [u8; 12] = bytes[8..20].try_into().unwrap();
+            let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 4567);
+            let mut value = vec![0, 1];
+            value.extend_from_slice(&(address.port() ^ (MAGIC_COOKIE >> 16) as u16).to_be_bytes());
+            let mut ip = address
+                .ip()
+                .to_string()
+                .parse::<Ipv4Addr>()
+                .unwrap()
+                .octets();
+            for (byte, mask) in ip.iter_mut().zip(MAGIC_COOKIE.to_be_bytes()) {
+                *byte ^= mask;
+            }
+            value.extend_from_slice(&ip);
+            let mut response = vec![0u8; 20];
+            response[0..2].copy_from_slice(&0x0101u16.to_be_bytes());
+            response[2..4].copy_from_slice(&(12u16).to_be_bytes());
+            response[4..8].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
+            response[8..20].copy_from_slice(&transaction);
+            response.extend_from_slice(&XOR_MAPPED_ADDRESS.to_be_bytes());
+            response.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            response.extend_from_slice(&value);
+            *self.response.lock().unwrap() = Some(response);
+            Ok(bytes.len())
+        }
+
+        async fn recv_from(&self, buffer: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            let response = self.response.lock().unwrap().take().unwrap();
+            buffer[..response.len()].copy_from_slice(&response);
+            Ok((response.len(), "127.0.0.1:3478".parse().unwrap()))
+        }
+    }
+
+    #[tokio::test]
+    async fn binding_resolves_hostname_servers() {
+        let socket = MockSocket {
+            response: Mutex::new(None),
+        };
+        let candidates = binding(
+            &socket,
+            &StunConfig {
+                servers: vec!["localhost:3478".to_owned()],
+                timeout: Duration::from_secs(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(candidates, vec!["203.0.113.7:4567".parse().unwrap()]);
     }
 }

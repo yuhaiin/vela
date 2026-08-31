@@ -302,6 +302,10 @@ pub struct NetworkSnapshot {
     pub generation: u64,
     pub virtual_ipv4: Option<Ipv4Cidr>,
     pub virtual_ipv6: Option<Ipv6Cidr>,
+    /// STUN endpoints recommended by the coordinator. These are signed with
+    /// the snapshot so peers can refresh their candidate configuration safely.
+    #[serde(default)]
+    pub stun_servers: Vec<String>,
     pub peers: Vec<PeerInfo>,
     pub expires_at: u64,
     pub signature: Vec<u8>,
@@ -375,11 +379,24 @@ impl NetworkSnapshot {
 
     pub fn unsigned_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(128);
-        out.extend_from_slice(b"VELA-NETWORK-SNAPSHOT-v1");
+        // Keep snapshots without coordinator-managed STUN endpoints
+        // verifiable by older peers. Adding STUN configuration opts into the
+        // v2 signed payload format.
+        if self.stun_servers.is_empty() {
+            out.extend_from_slice(b"VELA-NETWORK-SNAPSHOT-v1");
+        } else {
+            out.extend_from_slice(b"VELA-NETWORK-SNAPSHOT-v2");
+        }
         out.extend_from_slice(&self.network_id);
         out.extend_from_slice(&self.generation.to_be_bytes());
         encode_ipv4_cidr(&mut out, self.virtual_ipv4);
         encode_ipv6_cidr(&mut out, self.virtual_ipv6);
+        if !self.stun_servers.is_empty() {
+            out.extend_from_slice(&(self.stun_servers.len() as u32).to_be_bytes());
+            for server in &self.stun_servers {
+                encode_string(&mut out, server);
+            }
+        }
         out.extend_from_slice(&(self.peers.len() as u32).to_be_bytes());
         let mut peers = self.peers.clone();
         peers.sort_by_key(|peer| peer.node_id);
@@ -458,6 +475,11 @@ fn encode_ipv6_cidr(out: &mut Vec<u8>, cidr: Option<Ipv6Cidr>) {
         }
         None => out.push(0),
     }
+}
+
+fn encode_string(out: &mut Vec<u8>, value: &str) {
+    out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    out.extend_from_slice(value.as_bytes());
 }
 
 fn encode_candidate(out: &mut Vec<u8>, candidate: Candidate) {

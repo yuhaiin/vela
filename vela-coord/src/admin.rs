@@ -14,12 +14,12 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fs,
-    net::Ipv4Addr,
+    net::{Ipv4Addr, Ipv6Addr},
     path::Path,
     sync::{Arc, Mutex},
 };
 use vela_crypto::MembershipCredential;
-use vela_proto::NodeId;
+use vela_proto::{Candidate, NodeId, PeerCapability};
 
 use super::{
     CoordError, ServerInner, consume_download_token, create_invite, delete_peer_inner,
@@ -298,7 +298,10 @@ struct PeerView {
     name: String,
     notes: String,
     status: &'static str,
+    candidates: Vec<Candidate>,
     virtual_ipv4: Option<Ipv4Addr>,
+    virtual_ipv6: Option<Ipv6Addr>,
+    capabilities: Vec<PeerCapability>,
     last_seen: Option<u64>,
     credential_expires_at: Option<u64>,
 }
@@ -320,7 +323,8 @@ async fn admin_peers(state: &Arc<ServerInner>) -> Result<Vec<PeerView>, CoordErr
             .lock()
             .map_err(|_| CoordError::DatabasePoisoned)?;
         let mut statement = database.prepare(
-            "SELECT node_id, name, notes, virtual_ipv4, revoked, last_seen, credential
+            "SELECT node_id, name, notes, candidates, virtual_ipv4, virtual_ipv6,
+                    capabilities, revoked, last_seen, credential
              FROM peers ORDER BY name, node_id",
         )?;
         statement
@@ -329,10 +333,13 @@ async fn admin_peers(state: &Arc<ServerInner>) -> Result<Vec<PeerView>, CoordErr
                     row.get::<_, Vec<u8>>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, Option<Vec<u8>>>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Vec<u8>>(9)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?
@@ -340,9 +347,21 @@ async fn admin_peers(state: &Arc<ServerInner>) -> Result<Vec<PeerView>, CoordErr
     let online = state.online.lock().await;
     rows.into_iter()
         .map(
-            |(node_id, name, notes, virtual_ipv4, revoked, last_seen, credential)| {
+            |(
+                node_id,
+                name,
+                notes,
+                candidates,
+                virtual_ipv4,
+                virtual_ipv6,
+                capabilities,
+                revoked,
+                last_seen,
+                credential,
+            )| {
                 let node_id: [u8; 32] = node_id.try_into().map_err(|_| CoordError::InvalidPeer)?;
                 let node_id = NodeId::new(node_id);
+                let candidates = serde_json::from_str(&candidates)?;
                 let virtual_ipv4 = virtual_ipv4
                     .map(|value| {
                         <[u8; 4]>::try_from(value)
@@ -350,6 +369,14 @@ async fn admin_peers(state: &Arc<ServerInner>) -> Result<Vec<PeerView>, CoordErr
                             .map_err(|_| CoordError::InvalidPeer)
                     })
                     .transpose()?;
+                let virtual_ipv6 = virtual_ipv6
+                    .map(|value| {
+                        <[u8; 16]>::try_from(value)
+                            .map(Ipv6Addr::from)
+                            .map_err(|_| CoordError::InvalidPeer)
+                    })
+                    .transpose()?;
+                let capabilities = serde_json::from_str(&capabilities)?;
                 let credential_expires_at =
                     serde_json::from_slice::<MembershipCredential>(&credential)
                         .ok()
@@ -365,7 +392,10 @@ async fn admin_peers(state: &Arc<ServerInner>) -> Result<Vec<PeerView>, CoordErr
                     } else {
                         "offline"
                     },
+                    candidates,
                     virtual_ipv4,
+                    virtual_ipv6,
+                    capabilities,
                     last_seen: (last_seen > 0).then_some(last_seen as u64),
                     credential_expires_at,
                 })
