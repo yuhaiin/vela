@@ -76,12 +76,23 @@ async fn clients_discover_online_peers_and_receive_connect_signal() {
             .any(|peer| peer.node_id == identity_a.public().node_id)
     );
 
+    client_b.update_candidates(Vec::new()).await.unwrap();
+    let snapshot_a = tokio::time::timeout(Duration::from_secs(1), client_a.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(snapshot_a, ControlMessage::Snapshot { .. }));
+
     let peers = client_b.list_peers().await.unwrap();
     assert!(
         peers
             .iter()
             .any(|peer| { peer.node_id == identity_a.public().node_id && peer.online })
     );
+    assert!(matches!(
+        client_b.recv().await.unwrap(),
+        ControlMessage::Snapshot { .. }
+    ));
 
     let target = client_b
         .lookup_peer(identity_a.public().node_id)

@@ -19,7 +19,7 @@ use vela_core::{
     TokioDatagramProvider, VelaNode,
 };
 use vela_crypto::{CryptoError, Identity, MembershipCredential};
-use vela_proto::{Candidate, ControlMessage, NodeId, PeerInfo, PeerSummary};
+use vela_proto::{Candidate, ControlMessage, NetworkSnapshot, NodeId, PeerInfo, PeerSummary};
 
 const STATE_FILE: &str = "state.json";
 const IDENTITY_FILE: &str = "identity";
@@ -33,6 +33,7 @@ pub struct PeerState {
     pub bind: SocketAddr,
     pub stun_servers: Vec<SocketAddr>,
     pub candidates: Vec<Candidate>,
+    pub snapshot: Option<NetworkSnapshot>,
 }
 
 impl PeerState {
@@ -49,6 +50,7 @@ impl PeerState {
             bind,
             stun_servers,
             candidates: Vec::new(),
+            snapshot: None,
         }
     }
 
@@ -96,6 +98,8 @@ pub async fn register(
         )
         .await?;
     state.credential = Some(registration.credential);
+    state.snapshot = Some(registration.snapshot.clone());
+    peer.node.apply_snapshot(registration.snapshot).await?;
     state.save(state_dir)?;
     Ok(state)
 }
@@ -129,6 +133,7 @@ impl DiagnosticControl {
             )
             .await?;
         state.credential = Some(registration.credential);
+        state.snapshot = Some(registration.snapshot.clone());
         state.save(state_dir)?;
         Ok(Self {
             client,
@@ -188,10 +193,9 @@ impl DiagnosticPeer {
             .await?;
         state.credential = Some(registration.credential);
         state.candidates = peer.candidates.clone();
+        state.snapshot = Some(registration.snapshot.clone());
         state.save(state_dir)?;
-        for info in registration.peers {
-            peer.node.register_peer(info).await?;
-        }
+        peer.node.apply_snapshot(registration.snapshot).await?;
         Ok(Self {
             node: peer.node,
             client,
@@ -202,6 +206,12 @@ impl DiagnosticPeer {
 
     async fn build(state: PeerState, identity: Identity) -> Result<Self, DiagnosticError> {
         let provider = Arc::new(TokioDatagramProvider::new(Vec::new()));
+        let local = state.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .peers
+                .iter()
+                .find(|peer| peer.node_id == identity.public().node_id)
+        });
         let node = VelaNode::builder()
             .identity(identity)
             .datagram_provider(provider)
@@ -209,6 +219,13 @@ impl DiagnosticPeer {
                 bind: BindOptions {
                     local_addr: state.bind,
                 },
+                network_id: state
+                    .snapshot
+                    .as_ref()
+                    .map_or([0; 16], |snapshot| snapshot.network_id),
+                server_public_key: Some(state.server_key),
+                virtual_ipv4: local.and_then(|peer| peer.virtual_ipv4),
+                virtual_ipv6: local.and_then(|peer| peer.virtual_ipv6),
                 ..NodeConfig::default()
             })
             .build()
@@ -307,6 +324,10 @@ impl DiagnosticPeer {
                     ControlMessage::ConnectSignal { from, to } if to == self.node_id() => {
                         let peer = self.client.verify_public_peer(from)?;
                         self.node.register_peer(peer).await?;
+                    }
+                    ControlMessage::Snapshot { snapshot } => {
+                        self.node.apply_snapshot(snapshot.clone()).await?;
+                        self.state.snapshot = Some(snapshot);
                     }
                     ControlMessage::Revoke { node_id } if node_id == self.node_id() => {
                         return Err(DiagnosticError::Revoked);

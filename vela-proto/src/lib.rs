@@ -3,11 +3,15 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::{fmt, net::SocketAddr, str::FromStr};
+use std::{
+    fmt,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    str::FromStr,
+};
 use thiserror::Error;
 
 pub const MAGIC: [u8; 4] = *b"VELA";
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 pub const HEADER_LEN: usize = 26;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -219,6 +223,8 @@ pub struct PublicPeerInfo {
     pub signing_public: String,
     pub noise_public: String,
     pub candidates: Vec<Candidate>,
+    pub virtual_ipv4: Option<Ipv4Addr>,
+    pub virtual_ipv6: Option<Ipv6Addr>,
     pub credential: String,
     pub capabilities: Vec<PeerCapability>,
 }
@@ -242,6 +248,8 @@ pub struct PeerInfo {
     pub signing_public: [u8; 32],
     pub noise_public: [u8; 32],
     pub candidates: Vec<Candidate>,
+    pub virtual_ipv4: Option<Ipv4Addr>,
+    pub virtual_ipv6: Option<Ipv6Addr>,
     pub credential: Vec<u8>,
     pub capabilities: Vec<PeerCapability>,
 }
@@ -268,10 +276,219 @@ impl TryFrom<PublicPeerInfo> for PeerInfo {
                 .try_into()
                 .map_err(|_| ProtoError::InvalidEncoding)?,
             candidates: value.candidates,
+            virtual_ipv4: value.virtual_ipv4,
+            virtual_ipv6: value.virtual_ipv6,
             credential,
             capabilities: value.capabilities,
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Ipv4Cidr {
+    pub address: Ipv4Addr,
+    pub prefix_len: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Ipv6Cidr {
+    pub address: Ipv6Addr,
+    pub prefix_len: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NetworkSnapshot {
+    pub network_id: [u8; 16],
+    pub generation: u64,
+    pub virtual_ipv4: Option<Ipv4Cidr>,
+    pub virtual_ipv6: Option<Ipv6Cidr>,
+    pub peers: Vec<PeerInfo>,
+    pub expires_at: u64,
+    pub signature: Vec<u8>,
+}
+
+impl NetworkSnapshot {
+    pub fn validate(&self) -> Result<(), ProtoError> {
+        if self.generation == 0 {
+            return Err(ProtoError::InvalidSnapshot(
+                "generation must be non-zero".into(),
+            ));
+        }
+        if let Some(cidr) = self.virtual_ipv4 {
+            if cidr.prefix_len > 32 {
+                return Err(ProtoError::InvalidSnapshot(
+                    "invalid IPv4 prefix length".into(),
+                ));
+            }
+            if !ipv4_in_network(cidr.address, cidr.address, cidr.prefix_len) {
+                return Err(ProtoError::InvalidSnapshot(
+                    "IPv4 network address is not canonical".into(),
+                ));
+            }
+        }
+        if let Some(cidr) = self.virtual_ipv6 {
+            if cidr.prefix_len > 128 {
+                return Err(ProtoError::InvalidSnapshot(
+                    "invalid IPv6 prefix length".into(),
+                ));
+            }
+            if !ipv6_in_network(cidr.address, cidr.address, cidr.prefix_len) {
+                return Err(ProtoError::InvalidSnapshot(
+                    "IPv6 network address is not canonical".into(),
+                ));
+            }
+        }
+        let mut node_ids = std::collections::HashSet::new();
+        let mut ipv4 = std::collections::HashSet::new();
+        let mut ipv6 = std::collections::HashSet::new();
+        for peer in &self.peers {
+            if !node_ids.insert(peer.node_id)
+                || peer.node_id != NodeId::new(*blake3::hash(&peer.signing_public).as_bytes())
+            {
+                return Err(ProtoError::InvalidSnapshot(
+                    "invalid or duplicate peer identity".into(),
+                ));
+            }
+            if let Some(address) = peer.virtual_ipv4 {
+                let valid_network = self
+                    .virtual_ipv4
+                    .is_some_and(|cidr| ipv4_in_network(cidr.address, address, cidr.prefix_len));
+                if !ipv4.insert(address) || !valid_network {
+                    return Err(ProtoError::InvalidSnapshot(
+                        "invalid or duplicate virtual IPv4".into(),
+                    ));
+                }
+            }
+            if let Some(address) = peer.virtual_ipv6 {
+                let valid_network = self
+                    .virtual_ipv6
+                    .is_some_and(|cidr| ipv6_in_network(cidr.address, address, cidr.prefix_len));
+                if !ipv6.insert(address) || !valid_network {
+                    return Err(ProtoError::InvalidSnapshot(
+                        "invalid or duplicate virtual IPv6".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn unsigned_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(128);
+        out.extend_from_slice(b"VELA-NETWORK-SNAPSHOT-v1");
+        out.extend_from_slice(&self.network_id);
+        out.extend_from_slice(&self.generation.to_be_bytes());
+        encode_ipv4_cidr(&mut out, self.virtual_ipv4);
+        encode_ipv6_cidr(&mut out, self.virtual_ipv6);
+        out.extend_from_slice(&(self.peers.len() as u32).to_be_bytes());
+        let mut peers = self.peers.clone();
+        peers.sort_by_key(|peer| peer.node_id);
+        for peer in peers {
+            out.extend_from_slice(peer.node_id.as_bytes());
+            out.extend_from_slice(&peer.signing_public);
+            out.extend_from_slice(&peer.noise_public);
+            match peer.virtual_ipv4 {
+                Some(address) => {
+                    out.push(1);
+                    out.extend_from_slice(&address.octets());
+                }
+                None => out.push(0),
+            }
+            match peer.virtual_ipv6 {
+                Some(address) => {
+                    out.push(1);
+                    out.extend_from_slice(&address.octets());
+                }
+                None => out.push(0),
+            }
+            out.extend_from_slice(&(peer.candidates.len() as u32).to_be_bytes());
+            for candidate in peer.candidates {
+                encode_candidate(&mut out, candidate);
+            }
+            out.extend_from_slice(&(peer.credential.len() as u32).to_be_bytes());
+            out.extend_from_slice(&peer.credential);
+            out.extend_from_slice(&(peer.capabilities.len() as u32).to_be_bytes());
+            for capability in peer.capabilities {
+                out.push(capability as u8);
+            }
+        }
+        out.extend_from_slice(&self.expires_at.to_be_bytes());
+        out
+    }
+}
+
+fn ipv4_in_network(network: Ipv4Addr, address: Ipv4Addr, prefix_len: u8) -> bool {
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len)
+    };
+    u32::from(network) & mask == u32::from(address) & mask
+        && u32::from(network) & mask == u32::from(network)
+}
+
+fn ipv6_in_network(network: Ipv6Addr, address: Ipv6Addr, prefix_len: u8) -> bool {
+    let network = u128::from_be_bytes(network.octets());
+    let address = u128::from_be_bytes(address.octets());
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix_len)
+    };
+    network & mask == address & mask && network & mask == network
+}
+
+fn encode_ipv4_cidr(out: &mut Vec<u8>, cidr: Option<Ipv4Cidr>) {
+    match cidr {
+        Some(cidr) => {
+            out.push(1);
+            out.extend_from_slice(&cidr.address.octets());
+            out.push(cidr.prefix_len);
+        }
+        None => out.push(0),
+    }
+}
+
+fn encode_ipv6_cidr(out: &mut Vec<u8>, cidr: Option<Ipv6Cidr>) {
+    match cidr {
+        Some(cidr) => {
+            out.push(1);
+            out.extend_from_slice(&cidr.address.octets());
+            out.push(cidr.prefix_len);
+        }
+        None => out.push(0),
+    }
+}
+
+fn encode_candidate(out: &mut Vec<u8>, candidate: Candidate) {
+    match candidate {
+        Candidate::Host(address) => {
+            out.push(0);
+            encode_socket_address(out, address);
+        }
+        Candidate::ServerReflexive(address) => {
+            out.push(1);
+            encode_socket_address(out, address);
+        }
+        Candidate::PeerReflexive(address) => {
+            out.push(2);
+            encode_socket_address(out, address);
+        }
+    }
+}
+
+fn encode_socket_address(out: &mut Vec<u8>, address: SocketAddr) {
+    match address.ip() {
+        std::net::IpAddr::V4(ip) => {
+            out.push(4);
+            out.extend_from_slice(&ip.octets());
+        }
+        std::net::IpAddr::V6(ip) => {
+            out.push(6);
+            out.extend_from_slice(&ip.octets());
+        }
+    }
+    out.extend_from_slice(&address.port().to_be_bytes());
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -289,6 +506,7 @@ pub enum ControlMessage {
     RegisterOk {
         credential: String,
         peers: Vec<PublicPeerInfo>,
+        snapshot: NetworkSnapshot,
     },
     UpdateCandidates {
         candidates: Vec<Candidate>,
@@ -309,6 +527,9 @@ pub enum ControlMessage {
     },
     Revoke {
         node_id: NodeId,
+    },
+    Snapshot {
+        snapshot: NetworkSnapshot,
     },
     Error {
         code: String,
@@ -342,6 +563,8 @@ pub enum ProtoError {
     InvalidNodeId,
     #[error("invalid encoding")]
     InvalidEncoding,
+    #[error("invalid network snapshot: {0}")]
+    InvalidSnapshot(String),
     #[error("invalid hex: {0}")]
     Hex(String),
 }

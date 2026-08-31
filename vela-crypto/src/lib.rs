@@ -13,7 +13,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use vela_proto::NodeId;
+use vela_proto::{NetworkSnapshot, NodeId};
 use x25519_dalek::StaticSecret;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -237,6 +237,33 @@ impl ServerSigner {
     pub fn sign(&self, message: &[u8]) -> [u8; 64] {
         self.signing.sign(message).to_bytes()
     }
+
+    pub fn sign_snapshot(&self, mut snapshot: NetworkSnapshot) -> NetworkSnapshot {
+        snapshot.signature = self.sign(&snapshot.unsigned_bytes()).to_vec();
+        snapshot
+    }
+}
+
+pub fn verify_snapshot(
+    snapshot: &NetworkSnapshot,
+    server_public: &[u8; 32],
+    now: u64,
+) -> Result<(), CryptoError> {
+    if snapshot.expires_at < now || snapshot.signature.len() != 64 {
+        return Err(CryptoError::InvalidSnapshot);
+    }
+    let signature: [u8; 64] = snapshot
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| CryptoError::InvalidSnapshot)?;
+    let verifying = VerifyingKey::from_bytes(server_public).map_err(|_| CryptoError::InvalidKey)?;
+    verifying
+        .verify(
+            &snapshot.unsigned_bytes(),
+            &Signature::from_bytes(&signature),
+        )
+        .map_err(|_| CryptoError::InvalidSnapshot)
 }
 
 pub struct NoiseHandshake {
@@ -408,11 +435,15 @@ pub enum CryptoError {
     Noise,
     #[error("AEAD operation failed")]
     Aead,
+    #[error("invalid or expired network snapshot")]
+    InvalidSnapshot,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
+    use vela_proto::{Ipv4Cidr, PeerInfo};
 
     #[test]
     fn identity_node_id_is_stable() {
@@ -460,5 +491,35 @@ mod tests {
         credential.verify(&signer.public(), unix_time()).unwrap();
         let other = ServerSigner::generate();
         assert!(credential.verify(&other.public(), unix_time()).is_err());
+    }
+
+    #[test]
+    fn signed_network_snapshot_verifies() {
+        let identity = Identity::generate();
+        let public = identity.public();
+        let signer = ServerSigner::generate();
+        let snapshot = NetworkSnapshot {
+            network_id: [7; 16],
+            generation: 1,
+            virtual_ipv4: Some(Ipv4Cidr {
+                address: Ipv4Addr::new(100, 64, 0, 0),
+                prefix_len: 10,
+            }),
+            virtual_ipv6: None,
+            peers: vec![PeerInfo {
+                node_id: public.node_id,
+                signing_public: public.signing_public,
+                noise_public: public.noise_public,
+                candidates: Vec::new(),
+                virtual_ipv4: Some(Ipv4Addr::new(100, 64, 0, 1)),
+                virtual_ipv6: None,
+                credential: Vec::new(),
+                capabilities: Vec::new(),
+            }],
+            expires_at: unix_time() + 60,
+            signature: Vec::new(),
+        };
+        let signed = signer.sign_snapshot(snapshot);
+        verify_snapshot(&signed, &signer.public(), unix_time()).unwrap();
     }
 }

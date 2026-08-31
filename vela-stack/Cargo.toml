@@ -1,17 +1,18 @@
 [package]
-name = "vela-cli"
+name = "vela-stack"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-base64.workspace = true
-serde_json.workspace = true
+bytes.workspace = true
+smoltcp.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
-vela-coord = { path = "../vela-coord" }
+tracing.workspace = true
 vela-core = { path = "../vela-core" }
-vela-diagnostic = { path = "../vela-diagnostic" }
+
+[dev-dependencies]
 vela-crypto = { path = "../vela-crypto" }
 vela-proto = { path = "../vela-proto" }
-vela-tun = { path = "../vela-tun" }

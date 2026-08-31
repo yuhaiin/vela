@@ -5,12 +5,14 @@ use futures_util::{
     SinkExt, StreamExt,
     stream::{SplitSink, SplitStream},
 };
+use std::collections::VecDeque;
 use thiserror::Error;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use url::Url;
-use vela_crypto::{Identity, MembershipCredential};
+use vela_crypto::{Identity, MembershipCredential, verify_snapshot};
 use vela_proto::{
-    Candidate, ControlMessage, NodeId, PeerCapability, PeerInfo, PeerSummary, PublicPeerInfo,
+    Candidate, ControlMessage, NetworkSnapshot, NodeId, PeerCapability, PeerInfo, PeerSummary,
+    PublicPeerInfo,
 };
 
 type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -19,11 +21,13 @@ pub struct CoordinationClient {
     writer: SplitSink<Ws, Message>,
     reader: SplitStream<Ws>,
     server_public_key: Option<[u8; 32]>,
+    pending: VecDeque<ControlMessage>,
 }
 
 pub struct Registration {
     pub credential: MembershipCredential,
     pub peers: Vec<PeerInfo>,
+    pub snapshot: NetworkSnapshot,
 }
 
 impl CoordinationClient {
@@ -37,6 +41,7 @@ impl CoordinationClient {
             writer,
             reader,
             server_public_key: None,
+            pending: VecDeque::new(),
         })
     }
 
@@ -69,7 +74,11 @@ impl CoordinationClient {
         })
         .await?;
         match self.recv().await? {
-            ControlMessage::RegisterOk { credential, peers } => {
+            ControlMessage::RegisterOk {
+                credential,
+                peers,
+                snapshot,
+            } => {
                 let credential = BASE64
                     .decode(credential)
                     .map_err(|_| CoordClientError::InvalidCredential)?;
@@ -78,6 +87,12 @@ impl CoordinationClient {
                 let server_key = self
                     .server_public_key
                     .ok_or(CoordClientError::ServerKeyRequired)?;
+                verify_snapshot(&snapshot, &server_key, current_time())
+                    .map_err(|_| CoordClientError::InvalidSnapshot)?;
+                snapshot.validate().map_err(CoordClientError::Protocol)?;
+                for peer in &snapshot.peers {
+                    self.verify_peer_credential(peer)?;
+                }
                 credential
                     .verify(&server_key, current_time())
                     .map_err(|_| CoordClientError::InvalidCredential)?;
@@ -85,7 +100,11 @@ impl CoordinationClient {
                     .into_iter()
                     .map(|peer| self.verify_public_peer(peer))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(Registration { credential, peers })
+                Ok(Registration {
+                    credential,
+                    peers,
+                    snapshot,
+                })
             }
             ControlMessage::Error { code, message } => {
                 Err(CoordClientError::Server { code, message })
@@ -105,12 +124,13 @@ impl CoordinationClient {
     pub async fn lookup_peer(&mut self, node_id: NodeId) -> Result<PeerInfo, CoordClientError> {
         self.send(ControlMessage::LookupPeer { node_id }).await?;
         loop {
-            match self.recv().await? {
+            match self.recv_wire().await? {
                 ControlMessage::PeerInfo { peer } => return self.verify_public_peer(peer),
                 ControlMessage::Error { code, message } => {
                     return Err(CoordClientError::Server { code, message });
                 }
                 ControlMessage::ConnectSignal { .. } => {}
+                message @ ControlMessage::Snapshot { .. } => self.pending.push_back(message),
                 _ => return Err(CoordClientError::UnexpectedMessage),
             }
         }
@@ -119,12 +139,13 @@ impl CoordinationClient {
     pub async fn list_peers(&mut self) -> Result<Vec<PeerSummary>, CoordClientError> {
         self.send(ControlMessage::ListPeers).await?;
         loop {
-            match self.recv().await? {
+            match self.recv_wire().await? {
                 ControlMessage::ListPeersOk { peers } => return Ok(peers),
                 ControlMessage::Error { code, message } => {
                     return Err(CoordClientError::Server { code, message });
                 }
                 ControlMessage::ConnectSignal { .. } => {}
+                message @ ControlMessage::Snapshot { .. } => self.pending.push_back(message),
                 _ => return Err(CoordClientError::UnexpectedMessage),
             }
         }
@@ -145,6 +166,13 @@ impl CoordinationClient {
     }
 
     pub async fn recv(&mut self) -> Result<ControlMessage, CoordClientError> {
+        if let Some(message) = self.pending.pop_front() {
+            return Ok(message);
+        }
+        self.recv_wire().await
+    }
+
+    async fn recv_wire(&mut self) -> Result<ControlMessage, CoordClientError> {
         loop {
             match self.reader.next().await {
                 Some(Ok(Message::Text(text))) => {
@@ -209,6 +237,8 @@ pub enum CoordClientError {
     Protocol(vela_proto::ProtoError),
     #[error("invalid membership credential")]
     InvalidCredential,
+    #[error("invalid network snapshot")]
+    InvalidSnapshot,
     #[error("server signing public key has not been configured")]
     ServerKeyRequired,
     #[error("server rejected request: {code}: {message}")]

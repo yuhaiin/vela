@@ -6,7 +6,7 @@ use vela_proto::NodeId;
 
 fn usage() -> ! {
     eprintln!(
-        "Usage:\n  vela-cli identity <path>\n  vela-cli server --bind <addr> --db <path> --signer <path> --tenant <name> [--cert <path> --key <path>]\n  vela-cli invite --db <path> --signer <path> --tenant <name> [--ttl <seconds>]\n  vela-cli peers --db <path> --signer <path> --tenant <name>\n  vela-cli revoke <node-id> --db <path> --signer <path> --tenant <name>\n  vela-cli peer register --state <dir> --server <url> --server-key <base64> --invite <token> [--bind <addr>] [--stun <addr>]\n  vela-cli peer run --state <dir> [--bind <addr>] [--stun <addr>]\n  vela-cli peer list --state <dir> [--json]\n  vela-cli peer ping <node-id> --state <dir> [--count <n>] [--timeout <duration>] [--json]"
+        "Usage:\n  vela-cli identity <path>\n  vela-cli server --bind <addr> --db <path> --signer <path> --tenant <name> [--cert <path> --key <path>]\n  vela-cli invite --db <path> --signer <path> --tenant <name> [--ttl <seconds>]\n  vela-cli peers --db <path> --signer <path> --tenant <name>\n  vela-cli revoke <node-id> --db <path> --signer <path> --tenant <name>\n  vela-cli peer register --state <dir> --server <url> --server-key <base64> --invite <token> [--bind <addr>] [--stun <addr>]\n  vela-cli peer run --state <dir> [--bind <addr>] [--stun <addr>]\n  vela-cli peer up --state <dir> [--tun <name>] [--mtu <bytes>] [--bind <addr>] [--stun <addr>]\n  vela-cli peer list --state <dir> [--json]\n  vela-cli peer ping <node-id> --state <dir> [--count <n>] [--timeout <duration>] [--json]"
     );
     eprintln!("  vela-cli peer status --state <dir> [--json]");
     std::process::exit(2);
@@ -106,6 +106,68 @@ async fn run_peer_command(args: &[String]) -> Result<(), Box<dyn std::error::Err
             );
             peer.run().await?;
         }
+        "up" => {
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = args;
+                return Err("peer up currently requires Linux TUN support".into());
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let state_dir = required(args, "--state");
+                let stun_values = options(args, "--stun");
+                let stun = if stun_values.is_empty() {
+                    None
+                } else {
+                    Some(
+                        stun_values
+                            .into_iter()
+                            .map(|value| value.parse())
+                            .collect::<Result<Vec<SocketAddr>, _>>()?,
+                    )
+                };
+                let peer = DiagnosticPeer::open(&state_dir, bind_option(args)?, stun).await?;
+                let snapshot = peer
+                    .state
+                    .snapshot
+                    .clone()
+                    .ok_or("state has no network snapshot; register first")?;
+                let tun_name = option(args, "--tun").unwrap_or_else(|| "vela0".into());
+                let mtu = option(args, "--mtu")
+                    .map(|value| value.parse::<usize>())
+                    .transpose()?
+                    .unwrap_or(1200);
+                let tun = vela_tun::TunDevice::open(vela_tun::TunConfig {
+                    name: tun_name,
+                    mtu,
+                })?;
+                let routes = vela_tun::RouteManager::for_interface(tun.name()).await?;
+                routes.set_mtu(mtu).await?;
+                let local_peer = snapshot
+                    .peers
+                    .iter()
+                    .find(|value| value.node_id == peer.node_id())
+                    .ok_or("snapshot does not contain this node")?;
+                if let (Some(address), Some(cidr)) =
+                    (local_peer.virtual_ipv4, snapshot.virtual_ipv4)
+                {
+                    routes
+                        .add_local_address(address.into(), cidr.prefix_len)
+                        .await?;
+                }
+                if let (Some(address), Some(cidr)) =
+                    (local_peer.virtual_ipv6, snapshot.virtual_ipv6)
+                {
+                    routes
+                        .add_local_address(address.into(), cidr.prefix_len)
+                        .await?;
+                }
+                let _leases =
+                    vela_tun::install_snapshot_routes(&routes, &snapshot, peer.node_id()).await?;
+                println!("peer {} up on TUN {}", peer.node_id(), tun.name());
+                run_tun_peer(peer, tun, routes, _leases).await?;
+            }
+        }
         "list" => {
             let state_dir = required(args, "--state");
             let mut control = DiagnosticControl::open(&state_dir).await?;
@@ -169,6 +231,77 @@ async fn run_peer_command(args: &[String]) -> Result<(), Box<dyn std::error::Err
         _ => usage(),
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn run_tun_peer(
+    mut peer: DiagnosticPeer,
+    tun: vela_tun::TunDevice,
+    routes: vela_tun::RouteManager,
+    mut leases: Vec<vela_tun::RouteLease>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let node = peer.node.clone();
+    let mut refresh = tokio::time::interval(Duration::from_secs(60));
+    loop {
+        tokio::select! {
+            packet = tun.recv() => {
+                node.send_ip(packet?).await?;
+            }
+            event = node.next_event() => {
+                match event {
+                    Some(vela_core::VelaEvent::IpPacket { packet, .. }) => tun.send(packet.as_bytes()).await?,
+                    Some(_) => {}
+                    None => return Err("Vela node stopped".into()),
+                }
+            }
+            message = peer.client.recv() => {
+                match message? {
+                    vela_proto::ControlMessage::ConnectSignal { from, to } if to == peer.node_id() => {
+                        let info = peer.client.verify_public_peer(from)?;
+                        node.register_peer(info).await?;
+                    }
+                    vela_proto::ControlMessage::Snapshot { snapshot } => {
+                        node.apply_snapshot(snapshot.clone()).await?;
+                        for lease in leases.drain(..) {
+                            let _ = lease.release().await;
+                        }
+                        let local = snapshot
+                            .peers
+                            .iter()
+                            .find(|value| value.node_id == peer.node_id())
+                            .ok_or("snapshot does not contain this node")?;
+                        if let (Some(address), Some(cidr)) = (local.virtual_ipv4, snapshot.virtual_ipv4) {
+                            routes.add_local_address(address.into(), cidr.prefix_len).await?;
+                        }
+                        if let (Some(address), Some(cidr)) = (local.virtual_ipv6, snapshot.virtual_ipv6) {
+                            routes.add_local_address(address.into(), cidr.prefix_len).await?;
+                        }
+                        leases = vela_tun::install_snapshot_routes(&routes, &snapshot, peer.node_id()).await?;
+                        peer.state.snapshot = Some(snapshot);
+                    }
+                    vela_proto::ControlMessage::Revoke { node_id } if node_id == peer.node_id() => {
+                        for lease in leases.drain(..) {
+                            let _ = lease.release().await;
+                        }
+                        peer.node.shutdown().await;
+                        return Err("peer membership was revoked".into());
+                    }
+                    _ => {}
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                for lease in leases.drain(..) {
+                    let _ = lease.release().await;
+                }
+                peer.node.shutdown().await;
+                return Ok(());
+            }
+            tick = refresh.tick() => {
+                let _ = tick;
+                peer.refresh_candidates().await?;
+            }
+        }
+    }
 }
 
 #[tokio::main]
