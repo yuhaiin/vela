@@ -767,7 +767,12 @@ impl Inner {
         self.emit(VelaEvent::PeerConnecting(probe.sender)).await;
         if self.identity.public().node_id < probe.sender {
             let mut attempt = peer.attempt.lock().await;
-            if attempt.as_ref().map(|value| value.session_id) != Some(probe.session_id) {
+            let can_replace = attempt
+                .as_ref()
+                .is_none_or(|value| value.handshake.is_none());
+            if can_replace
+                && attempt.as_ref().map(|value| value.session_id) != Some(probe.session_id)
+            {
                 *attempt = Some(Attempt {
                     session_id: probe.session_id,
                     handshake: None,
