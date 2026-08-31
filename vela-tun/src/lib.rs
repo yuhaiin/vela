@@ -713,9 +713,13 @@ pub async fn run_bridge(node: vela_core::VelaNode, tun: TunDevice) -> Result<(),
     loop {
         tokio::select! {
             packet = tun.recv() => {
-                node.send_ip(packet?.to_vec())
-                    .await
-                    .map_err(|error| TunError::Core(error.to_string()))?;
+                match node.send_ip(packet?.to_vec()).await {
+                    Ok(()) => {}
+                    Err(vela_core::SendError::Ip(error)) => {
+                        tracing::debug!(error = %error, "dropping invalid or unrouted packet from TUN");
+                    }
+                    Err(error) => return Err(TunError::Core(error.to_string())),
+                }
             }
             event = node.next_event() => {
                 match event {

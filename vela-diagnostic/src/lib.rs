@@ -426,11 +426,11 @@ pub enum DiagnosticError {
     Revoked,
 }
 
-fn set_private(path: &Path) -> Result<(), std::io::Error> {
+fn set_private(_path: &Path) -> Result<(), std::io::Error> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        fs::set_permissions(_path, fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
 }

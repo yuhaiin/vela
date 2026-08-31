@@ -300,7 +300,13 @@ async fn run_tun_peer(
     loop {
         tokio::select! {
             packet = tun.recv() => {
-                node.send_ip(packet?).await?;
+                match node.send_ip(packet?).await {
+                    Ok(()) => {}
+                    Err(vela_core::SendError::Ip(error)) => {
+                        tracing::debug!(error = %error, "dropping invalid or unrouted packet from TUN");
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             }
             event = node.next_event() => {
                 match event {
@@ -361,6 +367,10 @@ async fn run_tun_peer(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Rustls crypto provider already installed");
+
     let mut args = env::args().skip(1).collect::<Vec<_>>();
     let command = args.first().cloned().unwrap_or_default();
     if command.is_empty() {

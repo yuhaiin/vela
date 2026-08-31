@@ -9,6 +9,7 @@ rust-version.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 tokio.workspace = true
 vela-core = { path = "../vela-core" }
 vela-proto = { path = "../vela-proto" }

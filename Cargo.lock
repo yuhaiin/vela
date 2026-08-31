@@ -1531,6 +1531,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -2148,8 +2149,10 @@ name = "vela-cli"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "rustls",
  "serde_json",
  "tokio",
+ "tracing",
  "vela-coord",
  "vela-core",
  "vela-crypto",
@@ -2307,6 +2310,7 @@ dependencies = [
  "rtnetlink",
  "thiserror",
  "tokio",
+ "tracing",
  "tun-rs",
  "vela-core",
  "vela-proto",
