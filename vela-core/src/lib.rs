@@ -213,6 +213,7 @@ fn bind_socket_to_interface(
 fn bind_socket_to_interface(
     _socket: &Socket,
     _interface: &DefaultRouteInterface,
+    _ipv4: bool,
 ) -> io::Result<()> {
     // Windows and BSD platforms use the system route for outgoing packets;
     // socket2 does not expose an interface-binding option for them.
