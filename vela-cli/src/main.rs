@@ -1,5 +1,5 @@
 use clap::{ArgAction, Args, Parser, Subcommand};
-use std::{io::Read, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{io::Read, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use vela_coord::CoordServer;
 use vela_crypto::Identity;
 use vela_diagnostic::{LocalControlClient, PeerState, RuntimeProcess};
@@ -572,7 +572,52 @@ async fn run_tun_peer(
         io,
         mut task,
     } = process;
-    let mut packets = io.packets;
+    let tun = Arc::new(tun);
+    let tun_reader = Arc::clone(&tun);
+    let reader_handle = handle.clone();
+    let mut tun_to_vela = tokio::spawn(async move {
+        loop {
+            let packet = tun_reader.recv().await.map_err(|error| error.to_string())?;
+            let packet_len = packet.len();
+            match reader_handle.send_ip(packet).await {
+                Ok(()) => tracing::debug!(
+                    debug_marker = "vela-tun",
+                    packet_len,
+                    "handed TUN packet to Vela core"
+                ),
+                Err(vela_core::SendError::Ip(error)) => tracing::debug!(
+                    debug_marker = "vela-tun",
+                    packet_len,
+                    error = %error,
+                    "dropping invalid or unrouted packet from TUN"
+                ),
+                Err(vela_core::SendError::QueueFull) => tracing::debug!(
+                    debug_marker = "vela-tun",
+                    packet_len,
+                    "dropping packet because the peer send queue is full"
+                ),
+                Err(vela_core::SendError::SnapshotExpired) => tracing::warn!(
+                    debug_marker = "vela-control",
+                    packet_len,
+                    "network snapshot expired; waiting for runtime reconnect"
+                ),
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), String>(())
+    });
+    let tun_writer = Arc::clone(&tun);
+    let mut vela_to_tun = tokio::spawn(async move {
+        let mut packets = io.packets;
+        while let Some((_peer, packet)) = packets.recv().await {
+            tun_writer
+                .send(packet.as_bytes())
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Err::<(), _>("peer runtime packet channel closed".to_owned())
+    });
     let mut snapshots = io.snapshots;
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
@@ -588,39 +633,19 @@ async fn run_tun_peer(
                 });
                 break Ok(());
             }
-            packet = tun.recv() => {
-                let packet = packet?;
-                let packet_len = packet.len();
-                match handle.send_ip(packet).await {
-                    Ok(()) => tracing::debug!(
-                        debug_marker = "vela-tun",
-                        packet_len,
-                        "handed TUN packet to Vela core"
-                    ),
-                    Err(vela_core::SendError::Ip(error)) => tracing::debug!(
-                        debug_marker = "vela-tun",
-                        packet_len,
-                        error = %error,
-                        "dropping invalid or unrouted packet from TUN"
-                    ),
-                    Err(vela_core::SendError::QueueFull) => tracing::debug!(
-                        debug_marker = "vela-tun",
-                        packet_len,
-                        "dropping packet because the peer send queue is full"
-                    ),
-                    Err(vela_core::SendError::SnapshotExpired) => tracing::warn!(
-                        debug_marker = "vela-control",
-                        packet_len,
-                        "network snapshot expired; waiting for runtime reconnect"
-                    ),
-                    Err(error) => break Err(Box::new(error)),
-                }
-            }
-            event = packets.recv() => {
-                let Some((_peer, packet)) = event else {
-                    break Err(invalid_input("peer runtime packet channel closed"));
+            result = &mut tun_to_vela => {
+                break match result {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => Err(std::io::Error::other(error).into()),
+                    Err(error) => Err(Box::new(error)),
                 };
-                tun.send(packet.as_bytes()).await?;
+            }
+            result = &mut vela_to_tun => {
+                break match result {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => Err(std::io::Error::other(error).into()),
+                    Err(error) => Err(Box::new(error)),
+                };
             }
             changed = snapshots.changed() => {
                 if changed.is_err() {
@@ -644,6 +669,8 @@ async fn run_tun_peer(
         }
     };
 
+    tun_to_vela.abort();
+    vela_to_tun.abort();
     if runtime_result.is_none() {
         handle.stop();
         runtime_result = Some(

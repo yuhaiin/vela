@@ -6,7 +6,7 @@
 //! installed for the current snapshot.
 
 use bytes::Bytes;
-use std::{io, net::IpAddr};
+use std::{io, net::IpAddr, sync::Arc};
 use thiserror::Error;
 
 #[derive(Clone, Debug)]
@@ -732,31 +732,47 @@ pub async fn install_snapshot_routes(
 /// Bridges a kernel TUN device and a Vela node. Every TUN read is one complete
 /// IP packet; every received Vela IP event is written back as one packet.
 pub async fn run_bridge(node: vela_core::VelaNode, tun: TunDevice) -> Result<(), TunError> {
-    loop {
-        tokio::select! {
-            packet = tun.recv() => {
-                match node.send_ip(packet?.to_vec()).await {
-                    Ok(()) => {}
-                    Err(vela_core::SendError::Ip(error)) => {
-                        tracing::debug!(error = %error, "dropping invalid or unrouted packet from TUN");
-                    }
-                    Err(vela_core::SendError::QueueFull) => {
-                        tracing::debug!("dropping packet because the peer send queue is full");
-                    }
-                    Err(error) => return Err(TunError::Core(error.to_string())),
+    let tun = Arc::new(tun);
+    let reader_tun = Arc::clone(&tun);
+    let reader_node = node.clone();
+    let mut tun_to_vela = tokio::spawn(async move {
+        loop {
+            let packet = reader_tun.recv().await?;
+            match reader_node.send_ip(packet).await {
+                Ok(()) => {}
+                Err(vela_core::SendError::Ip(error)) => {
+                    tracing::debug!(error = %error, "dropping invalid or unrouted packet from TUN");
                 }
-            }
-            event = node.next_event() => {
-                match event {
-                    Some(vela_core::VelaEvent::IpPacket { packet, .. }) => {
-                        tun.send(packet.as_bytes()).await?;
-                    }
-                    Some(_) => {}
-                    None => return Err(TunError::Closed),
+                Err(vela_core::SendError::QueueFull) => {
+                    tracing::debug!("dropping packet because the peer send queue is full");
                 }
+                Err(error) => return Err(TunError::Core(error.to_string())),
             }
         }
-    }
+    });
+    let writer_tun = Arc::clone(&tun);
+    let mut vela_to_tun = tokio::spawn(async move {
+        loop {
+            match node.next_event().await {
+                Some(vela_core::VelaEvent::IpPacket { packet, .. }) => {
+                    writer_tun.send(packet.as_bytes()).await?;
+                }
+                Some(_) => {}
+                None => return Err(TunError::Closed),
+            }
+        }
+    });
+    let result = tokio::select! {
+        result = &mut tun_to_vela => result
+            .map_err(|error| TunError::Core(error.to_string()))
+            .and_then(|result| result),
+        result = &mut vela_to_tun => result
+            .map_err(|error| TunError::Core(error.to_string()))
+            .and_then(|result| result),
+    };
+    tun_to_vela.abort();
+    vela_to_tun.abort();
+    result
 }
 
 #[derive(Debug, Error)]

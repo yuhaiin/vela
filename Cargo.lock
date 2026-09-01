@@ -2677,8 +2677,10 @@ name = "vela-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "blake3",
  "bytes",
+ "clap",
  "ed25519-dalek",
  "if-addrs",
  "rand 0.8.8",
@@ -2689,6 +2691,8 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "vela-coord",
  "vela-coord-client",
  "vela-crypto",
  "vela-ip",
@@ -2702,6 +2706,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "blake3",
+ "bytes",
  "chacha20poly1305",
  "ed25519-dalek",
  "hkdf",

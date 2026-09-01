@@ -296,6 +296,21 @@ impl WirePacket {
             payload: Bytes::copy_from_slice(&input[HEADER_LEN..end]),
         })
     }
+
+    pub fn decode_bytes(input: Bytes) -> Result<Self, ProtoError> {
+        let header = Header::decode(&input)?;
+        let end = HEADER_LEN + header.payload_len as usize;
+        if input.len() < end {
+            return Err(ProtoError::Truncated);
+        }
+        if input.len() != end {
+            return Err(ProtoError::TrailingBytes);
+        }
+        Ok(Self {
+            header,
+            payload: input.slice(HEADER_LEN..end),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -741,6 +756,7 @@ mod tests {
         let packet = WirePacket { header, payload };
         let encoded = packet.encode().unwrap();
         assert_eq!(WirePacket::decode(&encoded).unwrap(), packet);
+        assert_eq!(WirePacket::decode_bytes(encoded).unwrap(), packet);
     }
 
     #[test]

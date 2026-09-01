@@ -76,6 +76,13 @@ impl fmt::Display for AddressFamily {
 pub trait DatagramSocket: Send + Sync {
     async fn send_to(&self, bytes: &[u8], target: SocketAddr) -> io::Result<usize>;
     async fn recv_from(&self, buffer: &mut [u8]) -> io::Result<(usize, SocketAddr)>;
+
+    async fn recv_packet(&self) -> io::Result<(Bytes, SocketAddr)> {
+        let mut buffer = vec![0u8; 65535];
+        let (length, source) = self.recv_from(&mut buffer).await?;
+        Ok((Bytes::copy_from_slice(&buffer[..length]), source))
+    }
+
     fn local_addr(&self) -> io::Result<SocketAddr>;
 
     fn local_addrs(&self) -> io::Result<Vec<SocketAddr>> {
@@ -291,6 +298,20 @@ fn bind_udp_socket(
         )?;
     }
     socket
+        .set_recv_buffer_size(4 * 1024 * 1024)
+        .map_err(|source| CoreError::DatagramBind {
+            family,
+            port,
+            source,
+        })?;
+    socket
+        .set_send_buffer_size(4 * 1024 * 1024)
+        .map_err(|source| CoreError::DatagramBind {
+            family,
+            port,
+            source,
+        })?;
+    socket
         .set_nonblocking(true)
         .map_err(|source| CoreError::DatagramBind {
             family,
@@ -472,7 +493,7 @@ impl TokioDatagramSocket {
         let shutdown = Arc::new(Notify::new());
         let closed = Arc::new(AtomicBool::new(false));
         let failure_family = Arc::new(StdMutex::new(None));
-        let (sender, receiver) = mpsc::channel(256);
+        let (sender, receiver) = mpsc::channel(4096);
         let readers = vec![
             spawn_datagram_reader(
                 AddressFamily::Ipv4,
@@ -569,20 +590,24 @@ impl DatagramSocket for TokioDatagramSocket {
         }
     }
     async fn recv_from(&self, buffer: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        let (packet, source) = self.recv_packet().await?;
+        if packet.len() > buffer.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "UDP datagram is larger than the receive buffer",
+            ));
+        }
+        buffer[..packet.len()].copy_from_slice(&packet);
+        Ok((packet.len(), source))
+    }
+    async fn recv_packet(&self) -> io::Result<(Bytes, SocketAddr)> {
         let packet = self.receiver.lock().await.recv().await.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "UDP socket receive queue closed",
             )
         })??;
-        if packet.0.len() > buffer.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "UDP datagram is larger than the receive buffer",
-            ));
-        }
-        buffer[..packet.0.len()].copy_from_slice(&packet.0);
-        Ok((packet.0.len(), packet.1))
+        Ok((Bytes::from(packet.0), packet.1))
     }
     fn local_addr(&self) -> io::Result<SocketAddr> {
         Ok(self.local_addrs[0])
@@ -716,6 +741,12 @@ pub struct NodeConfig {
     pub virtual_mtu: usize,
 }
 
+const DATA_WORKER_QUEUE_LIMIT: usize = 2048;
+
+fn data_worker_count() -> usize {
+    std::thread::available_parallelism().map_or(4, |parallelism| parallelism.get().max(4))
+}
+
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
@@ -795,6 +826,14 @@ impl VelaNodeBuilder {
         let provider = self.provider.ok_or(CoreError::MissingProvider)?;
         let socket = provider.bind(self.config.bind.clone()).await?;
         let (event_tx, event_rx) = mpsc::channel(256);
+        let data_worker_count = data_worker_count();
+        let mut data_senders = Vec::with_capacity(data_worker_count);
+        let mut data_receivers = Vec::with_capacity(data_worker_count);
+        for _ in 0..data_worker_count {
+            let (sender, receiver) = mpsc::channel(DATA_WORKER_QUEUE_LIMIT);
+            data_senders.push(sender);
+            data_receivers.push(receiver);
+        }
         let local_addresses = self
             .config
             .virtual_ipv4
@@ -827,6 +866,9 @@ impl VelaNodeBuilder {
             local_ipv6: Mutex::new(local_ipv6),
             stun_waiters: Mutex::new(HashMap::new()),
             snapshot_update: Mutex::new(()),
+            data_senders,
+            data_receivers: StdMutex::new(Some(data_receivers)),
+            sessions: StdMutex::new(HashMap::new()),
         });
         Ok(VelaNode { inner })
     }
@@ -901,16 +943,31 @@ impl VelaNode {
         let maintenance = tokio::spawn(async move {
             maintenance.keepalive_loop().await;
         });
+        let data_receivers = self
+            .inner
+            .data_receivers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_default();
+        let mut new_tasks = vec![reader, maintenance];
+        for receiver in data_receivers {
+            let worker = Arc::clone(&self.inner);
+            new_tasks.push(tokio::spawn(async move {
+                worker.data_loop(receiver).await;
+            }));
+        }
         let mut tasks = self
             .inner
             .tasks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.inner.stopping.load(Ordering::Acquire) {
-            reader.abort();
-            maintenance.abort();
+            for task in new_tasks {
+                task.abort();
+            }
         } else {
-            tasks.extend([reader, maintenance]);
+            tasks.extend(new_tasks);
         }
         Ok(())
     }
@@ -974,7 +1031,16 @@ impl VelaNode {
             let previous_info = previous.info();
             previous.online.store(false, Ordering::Release);
             previous.reconnect.lock().await.requested = false;
-            let disconnected = previous.active.lock().await.take().is_some();
+            let disconnected_session_id = previous
+                .active
+                .lock()
+                .await
+                .take()
+                .map(|session| session.session_id);
+            let disconnected = disconnected_session_id.is_some();
+            if let Some(session_id) = disconnected_session_id {
+                self.inner.remove_session(&previous, session_id);
+            }
             *previous.attempt.lock().await = None;
             previous.queue.lock().await.clear();
             previous.notify.notify_waiters();
@@ -1014,7 +1080,15 @@ impl VelaNode {
         };
         peer.online.store(false, Ordering::Release);
         peer.reconnect.lock().await.requested = false;
-        *peer.active.lock().await = None;
+        let session_id = peer
+            .active
+            .lock()
+            .await
+            .take()
+            .map(|session| session.session_id);
+        if let Some(session_id) = session_id {
+            self.inner.remove_session(&peer, session_id);
+        }
         *peer.attempt.lock().await = None;
         peer.queue.lock().await.clear();
         peer.notify.notify_waiters();
@@ -1654,6 +1728,9 @@ struct Inner {
     stun_waiters: Mutex<HashMap<[u8; 12], StunWaiter>>,
     event_tx: mpsc::Sender<VelaEvent>,
     event_rx: Mutex<Option<mpsc::Receiver<VelaEvent>>>,
+    data_senders: Vec<mpsc::Sender<(Bytes, SocketAddr)>>,
+    data_receivers: StdMutex<Option<Vec<mpsc::Receiver<(Bytes, SocketAddr)>>>>,
+    sessions: StdMutex<HashMap<u64, Arc<PeerState>>>,
     shutdown: Notify,
     stopping: AtomicBool,
     started: AtomicBool,
@@ -1661,27 +1738,47 @@ struct Inner {
 }
 
 impl Inner {
+    fn remove_session(&self, peer: &Arc<PeerState>, session_id: u64) {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if sessions
+            .get(&session_id)
+            .is_some_and(|current| Arc::ptr_eq(current, peer))
+        {
+            sessions.remove(&session_id);
+        }
+    }
+
+    fn session_peer(&self, session_id: u64) -> Option<Arc<PeerState>> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&session_id)
+            .cloned()
+    }
+
     async fn read_loop(self: Arc<Self>) {
-        let mut buffer = vec![0u8; 65535];
         loop {
             if self.stopping.load(Ordering::Acquire) {
                 break;
             }
             tokio::select! {
                 _ = self.shutdown.notified() => break,
-                result = self.socket.recv_from(&mut buffer) => match result {
-                    Ok((length, source)) => {
+                result = self.socket.recv_packet() => match result {
+                    Ok((packet, source)) => {
                         debug!(
                             debug_marker = "vela-udp",
                             source = %source,
-                            packet_len = length,
+                            packet_len = packet.len(),
                             "received UDP datagram"
                         );
-                        if let Some(transaction) = stun_transaction_id(&buffer[..length]) {
+                        if let Some(transaction) = stun_transaction_id(&packet) {
                             debug!(
                                 debug_marker = "vela-stun",
                                 source = %source,
-                                packet_len = length,
+                                packet_len = packet.len(),
                                 "received STUN response"
                             );
                             let mut waiters = self.stun_waiters.lock().await;
@@ -1690,7 +1787,7 @@ impl Inner {
                                 .is_some_and(|(_, target, _)| *target == source);
                             if matching {
                                 if let Some((_, _, sender)) = waiters.remove(&transaction) {
-                                    let _ = sender.send((buffer[..length].to_vec(), source));
+                                    let _ = sender.send((packet.to_vec(), source));
                                 }
                             } else if waiters.contains_key(&transaction) {
                                 debug!(
@@ -1701,7 +1798,35 @@ impl Inner {
                             }
                             continue;
                         }
-                        if let Err(error) = self.handle_packet(&buffer[..length], source).await {
+                        if let Ok(header) = Header::decode(&packet) {
+                            if header.packet_type != PacketType::Data {
+                                if let Err(error) = self.handle_packet(packet, source).await {
+                                    debug!(
+                                        debug_marker = "vela-udp",
+                                        error = %error,
+                                        %source,
+                                        "dropping invalid Vela packet"
+                                    );
+                                }
+                                continue;
+                            }
+                            // Keep one session's packets on one worker. The read loop
+                            // preserves wire order, while the replay window and the
+                            // IP/TCP stack both benefit from ordered delivery after
+                            // decryption. Different sessions still run in parallel.
+                            let worker = header.session_id as usize % self.data_senders.len();
+                            let sender = &self.data_senders[worker];
+                            tokio::select! {
+                                _ = self.shutdown.notified() => break,
+                                result = sender.send((packet, source)) => {
+                                    if result.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        if let Err(error) = self.handle_packet(packet, source).await {
                             debug!(
                                 debug_marker = "vela-udp",
                                 error = %error,
@@ -1725,6 +1850,29 @@ impl Inner {
                         break;
                     }
                 }
+            }
+        }
+    }
+
+    async fn data_loop(self: Arc<Self>, mut receiver: mpsc::Receiver<(Bytes, SocketAddr)>) {
+        loop {
+            if self.stopping.load(Ordering::Acquire) {
+                break;
+            }
+            let message = tokio::select! {
+                _ = self.shutdown.notified() => break,
+                message = receiver.recv() => message,
+            };
+            let Some((packet, source)) = message else {
+                break;
+            };
+            if let Err(error) = self.handle_packet(packet, source).await {
+                debug!(
+                    debug_marker = "vela-udp",
+                    error = %error,
+                    %source,
+                    "dropping invalid Vela data packet"
+                );
             }
         }
     }
@@ -1758,17 +1906,18 @@ impl Inner {
                             self.invalidate_session(&peer, true).await;
                             continue;
                         }
-                        let (keepalive, rekey_path, dead) = {
+                        let (keepalive, rekey_path, dead, rekey_session_id) = {
                             let mut active = peer.active.lock().await;
                             let Some(session) = active.as_mut() else {
                                 continue;
                             };
                             if session.last_rx.elapsed() >= dead_after {
-                                (None, None, true)
+                                (None, None, true, None)
                             } else if session.needs_rekey() {
                                 let path = session.path;
+                                let session_id = session.session_id;
                                 active.take();
-                                (None, Some(path), false)
+                                (None, Some(path), false, Some(session_id))
                             } else {
                                 let sequence = session.tx_sequence.fetch_add(1, Ordering::Relaxed);
                                 let mut nonce = [0; KEEPALIVE_NONCE_LEN];
@@ -1784,9 +1933,12 @@ impl Inner {
                                     session.pending_keepalive = Some((nonce, Instant::now()));
                                     (session.path, session.session_id, sequence, payload)
                                 });
-                                (packet, None, false)
+                                (packet, None, false, None)
                             }
                         };
+                        if let Some(session_id) = rekey_session_id {
+                            self.remove_session(&peer, session_id);
+                        }
                         if dead {
                             self.invalidate_session(&peer, true).await;
                             self.schedule_reconnect(peer).await;
@@ -1832,7 +1984,16 @@ impl Inner {
     }
 
     async fn invalidate_session(&self, peer: &Arc<PeerState>, request_reconnect: bool) {
-        let disconnected = peer.active.lock().await.take().is_some();
+        let session_id = peer
+            .active
+            .lock()
+            .await
+            .take()
+            .map(|session| session.session_id);
+        if let Some(session_id) = session_id.as_ref() {
+            self.remove_session(peer, *session_id);
+        }
+        let disconnected = session_id.is_some();
         let had_attempt = peer.attempt.lock().await.take().is_some();
         peer.queue.lock().await.clear();
         if request_reconnect && (disconnected || had_attempt) {
@@ -1932,18 +2093,19 @@ impl Inner {
         }
     }
 
-    async fn handle_packet(&self, input: &[u8], source: SocketAddr) -> Result<(), CoreError> {
+    async fn handle_packet(&self, input: Bytes, source: SocketAddr) -> Result<(), CoreError> {
         if unix_time() >= self.snapshot_expires_at.load(Ordering::Acquire) {
             return Err(CoreError::SnapshotExpired);
         }
-        let packet = WirePacket::decode(input)?;
+        let wire_len = input.len();
+        let packet = WirePacket::decode_bytes(input)?;
         debug!(
             debug_marker = "vela-udp",
             source = %source,
             packet_type = ?packet.header.packet_type,
             session_id = packet.header.session_id,
             sequence = packet.header.sequence,
-            wire_len = input.len(),
+            wire_len,
             "decoded inbound Vela packet"
         );
         match packet.header.packet_type {
@@ -2327,6 +2489,9 @@ impl Inner {
     }
 
     async fn handle_data(&self, packet: WirePacket, source: SocketAddr) -> Result<(), CoreError> {
+        if packet.header.packet_type == PacketType::Data {
+            return self.handle_ip_data(packet, source).await;
+        }
         let peers = self
             .peers
             .lock()
@@ -2357,6 +2522,7 @@ impl Inner {
                 if validate_peer_membership(&peer_info, Some(server_key)).is_err() {
                     active.take();
                     drop(active);
+                    self.remove_session(&peer, packet.header.session_id);
                     *peer.attempt.lock().await = None;
                     peer.queue.lock().await.clear();
                     self.emit(VelaEvent::PeerDisconnected(peer_info.node_id))
@@ -2365,10 +2531,15 @@ impl Inner {
                 }
             }
             let aad = encoded_header(&packet.header);
-            let plaintext =
-                session
-                    .cipher
-                    .decrypt(packet.header.sequence, &aad, &packet.payload)?;
+            let encrypted_len = packet.payload.len();
+            let wire_len = input_wire_len(&packet);
+            let mut plaintext = packet
+                .payload
+                .try_into_mut()
+                .unwrap_or_else(|payload| BytesMut::from(&payload[..]));
+            session
+                .cipher
+                .decrypt_in_place(packet.header.sequence, &aad, &mut plaintext)?;
             if !session.replay.accept(packet.header.sequence) {
                 return Ok(());
             }
@@ -2381,7 +2552,7 @@ impl Inner {
             }
             session
                 .rx_bytes
-                .fetch_add(packet.payload.len() as u64, Ordering::Relaxed);
+                .fetch_add(encrypted_len as u64, Ordering::Relaxed);
             let mut events = Vec::new();
             if path_changed {
                 events.push(VelaEvent::PathChanged(peer_info.node_id, source));
@@ -2389,7 +2560,7 @@ impl Inner {
             let mut response: Option<(PacketType, SocketAddr, u64, u64, Vec<u8>)> = None;
             match packet.header.packet_type {
                 PacketType::Data => {
-                    let ip_packet = IpPacket::parse(plaintext).map_err(CoreError::Ip)?;
+                    let ip_packet = IpPacket::parse(plaintext.freeze()).map_err(CoreError::Ip)?;
                     let destination = ip_packet.destination();
                     debug!(
                         debug_marker = "vela-data",
@@ -2409,8 +2580,8 @@ impl Inner {
                         direction: TrafficDirection::Received,
                         path: source,
                         payload_bytes: ip_packet.as_bytes().len(),
-                        encrypted_bytes: packet.payload.len(),
-                        wire_bytes: input_wire_len(&packet),
+                        encrypted_bytes: encrypted_len,
+                        wire_bytes: wire_len,
                     });
                     events.push(VelaEvent::IpPacket {
                         peer: peer_info.node_id,
@@ -2439,7 +2610,7 @@ impl Inner {
                     if session
                         .pending_keepalive
                         .as_ref()
-                        .is_some_and(|(nonce, _)| nonce.as_slice() == plaintext.as_slice())
+                        .is_some_and(|(nonce, _)| nonce.as_slice() == &plaintext[..])
                     {
                         if let Some((_, sent_at)) = session.pending_keepalive.take() {
                             session.last_rtt_ms = u64::try_from(sent_at.elapsed().as_millis())
@@ -2468,6 +2639,7 @@ impl Inner {
                         return Err(CoreError::InvalidDiagnosticPing);
                     }
                     let nonce: [u8; DIAGNOSTIC_NONCE_LEN] = plaintext
+                        .as_ref()
                         .try_into()
                         .expect("diagnostic nonce length checked");
                     if let Some(waiter) = session.ping_waiters.remove(&nonce) {
@@ -2488,6 +2660,96 @@ impl Inner {
             }
             return Ok(());
         }
+        Ok(())
+    }
+
+    async fn handle_ip_data(
+        &self,
+        packet: WirePacket,
+        source: SocketAddr,
+    ) -> Result<(), CoreError> {
+        let encrypted_len = packet.payload.len();
+        let wire_len = input_wire_len(&packet);
+        let Some(peer) = self.session_peer(packet.header.session_id) else {
+            return Ok(());
+        };
+        let peer_info = peer.info();
+        let cipher = {
+            let mut active = peer.active.lock().await;
+            let Some(session) = active
+                .as_ref()
+                .filter(|session| session.session_id == packet.header.session_id)
+            else {
+                self.remove_session(&peer, packet.header.session_id);
+                return Ok(());
+            };
+            if let Some(server_key) = self.config.server_public_key {
+                if validate_peer_membership(&peer_info, Some(server_key)).is_err() {
+                    active.take();
+                    drop(active);
+                    self.remove_session(&peer, packet.header.session_id);
+                    *peer.attempt.lock().await = None;
+                    peer.queue.lock().await.clear();
+                    self.emit(VelaEvent::PeerDisconnected(peer_info.node_id))
+                        .await;
+                    return Err(CoreError::PeerCredentialExpired);
+                }
+            }
+            session.cipher.clone()
+        };
+        let aad = encoded_header(&packet.header);
+        let mut plaintext = packet
+            .payload
+            .try_into_mut()
+            .unwrap_or_else(|payload| BytesMut::from(&payload[..]));
+        cipher.decrypt_in_place(packet.header.sequence, &aad, &mut plaintext)?;
+        let ip_packet = IpPacket::parse(plaintext.freeze()).map_err(CoreError::Ip)?;
+        let destination = ip_packet.destination();
+        let path_changed = {
+            let mut active = peer.active.lock().await;
+            let Some(session) = active
+                .as_mut()
+                .filter(|session| session.session_id == packet.header.session_id)
+            else {
+                return Ok(());
+            };
+            if !session.replay.accept(packet.header.sequence) {
+                return Ok(());
+            }
+            session.last_rx = Instant::now();
+            let path_changed = session.path != source;
+            session.path = source;
+            if path_changed {
+                session.path_changed_at = Some(unix_time());
+                peer.record_path(source, &peer.info().candidates);
+            }
+            session
+                .rx_bytes
+                .fetch_add(encrypted_len as u64, Ordering::Relaxed);
+            path_changed
+        };
+        if !self.routes.lock().await.is_local(destination) {
+            return Err(CoreError::Ip(vela_ip::IpError::DestinationUnknown(
+                destination,
+            )));
+        }
+        self.observe(TrafficSample {
+            peer: Some(peer_info.node_id),
+            direction: TrafficDirection::Received,
+            path: source,
+            payload_bytes: ip_packet.as_bytes().len(),
+            encrypted_bytes: encrypted_len,
+            wire_bytes: wire_len,
+        });
+        if path_changed {
+            self.emit(VelaEvent::PathChanged(peer_info.node_id, source))
+                .await;
+        }
+        self.emit(VelaEvent::IpPacket {
+            peer: peer_info.node_id,
+            packet: ip_packet,
+        })
+        .await;
         Ok(())
     }
 
@@ -2520,6 +2782,10 @@ impl Inner {
             rx_bytes: AtomicU64::new(0),
         });
         drop(active);
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id, Arc::clone(peer));
         peer.record_path(path, &expected_peer.candidates);
         peer.clear_failure();
         *peer.attempt.lock().await = None;
@@ -3448,10 +3714,16 @@ fn candidate_type(candidates: &[Candidate], address: SocketAddr) -> &'static str
         })
 }
 
-fn encoded_header(header: &Header) -> Vec<u8> {
-    let mut bytes = BytesMut::with_capacity(vela_proto::HEADER_LEN);
-    header.encode(&mut bytes);
-    bytes.to_vec()
+fn encoded_header(header: &Header) -> [u8; vela_proto::HEADER_LEN] {
+    let mut bytes = [0u8; vela_proto::HEADER_LEN];
+    bytes[..4].copy_from_slice(&vela_proto::MAGIC);
+    bytes[4] = vela_proto::PROTOCOL_VERSION;
+    bytes[5] = header.packet_type as u8;
+    bytes[6..8].copy_from_slice(&header.flags.to_be_bytes());
+    bytes[8..16].copy_from_slice(&header.session_id.to_be_bytes());
+    bytes[16..24].copy_from_slice(&header.sequence.to_be_bytes());
+    bytes[24..26].copy_from_slice(&header.payload_len.to_be_bytes());
+    bytes
 }
 fn encrypt_payload(
     session: &ActiveSession,

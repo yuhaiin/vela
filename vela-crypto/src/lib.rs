@@ -1,6 +1,7 @@
 //! Vela identity, membership credentials, Noise handshakes and datagram AEAD.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use bytes::BytesMut;
 use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, KeyInit, Nonce, Tag};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
@@ -412,6 +413,32 @@ impl SessionCipher {
             .map_err(|_| CryptoError::Aead)?;
         Ok(out)
     }
+
+    pub fn decrypt_in_place(
+        &self,
+        sequence: u64,
+        associated_data: &[u8],
+        ciphertext_and_tag: &mut BytesMut,
+    ) -> Result<(), CryptoError> {
+        if ciphertext_and_tag.len() < 16 {
+            return Err(CryptoError::Aead);
+        }
+        let split = ciphertext_and_tag.len() - 16;
+        let tag_bytes: [u8; 16] = ciphertext_and_tag[split..]
+            .try_into()
+            .expect("AEAD tag length checked");
+        let tag = Tag::from_slice(&tag_bytes);
+        self.rx
+            .decrypt_in_place_detached(
+                &nonce(sequence),
+                associated_data,
+                &mut ciphertext_and_tag[..split],
+                tag,
+            )
+            .map_err(|_| CryptoError::Aead)?;
+        ciphertext_and_tag.truncate(split);
+        Ok(())
+    }
 }
 
 fn nonce(sequence: u64) -> Nonce {
@@ -481,6 +508,9 @@ mod tests {
         let cb = b.cipher(false);
         let encrypted = ca.encrypt(1, b"header", b"payload").unwrap();
         assert_eq!(cb.decrypt(1, b"header", &encrypted).unwrap(), b"payload");
+        let mut in_place = BytesMut::from(encrypted.as_slice());
+        cb.decrypt_in_place(1, b"header", &mut in_place).unwrap();
+        assert_eq!(&in_place[..], b"payload");
     }
 
     #[test]
