@@ -678,6 +678,15 @@ impl StackRuntime {
                         Some(VelaEvent::IpPacket { packet, .. }) => {
                             let _ = self.device.push_rx(packet.into_bytes());
                         }
+                        Some(VelaEvent::TransportFailed { family, error }) => {
+                            tracing::error!(
+                                debug_marker = "vela-udp",
+                                ?family,
+                                %error,
+                                "Vela UDP transport failed"
+                            );
+                            break;
+                        }
                         Some(_) => {}
                         None => break,
                     }
@@ -1331,7 +1340,7 @@ mod tests {
             )])))
             .config(NodeConfig {
                 bind: BindOptions {
-                    local_addr: address_a,
+                    port: address_a.port(),
                 },
                 virtual_ipv4: Some(virtual_a),
                 virtual_ipv6: Some(virtual_v6(virtual_a)),
@@ -1348,7 +1357,7 @@ mod tests {
             )])))
             .config(NodeConfig {
                 bind: BindOptions {
-                    local_addr: address_b,
+                    port: address_b.port(),
                 },
                 virtual_ipv4: Some(virtual_b),
                 virtual_ipv6: Some(virtual_v6(virtual_b)),

@@ -19,8 +19,10 @@ pub fn default_doh_servers() -> Vec<String> {
 
 const MAGIC_COOKIE: u32 = 0x2112_A442;
 const BINDING_REQUEST: u16 = 0x0001;
+const BINDING_SUCCESS_RESPONSE: u16 = 0x0101;
 const XOR_MAPPED_ADDRESS: u16 = 0x0020;
 const MAPPED_ADDRESS: u16 = 0x0001;
+const INITIAL_RETRANSMISSION_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug)]
 pub struct StunConfig {
@@ -156,12 +158,19 @@ fn split_server(server: &str) -> Result<(&str, u16), std::io::Error> {
         })?;
         (host, port)
     } else {
-        server.rsplit_once(':').ok_or_else(|| {
+        let (host, port) = server.rsplit_once(':').ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "STUN endpoint must be host:port",
             )
-        })?
+        })?;
+        if host.contains(':') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "IPv6 STUN endpoints must use [IPv6]:port",
+            ));
+        }
+        (host, port)
     };
     if host.is_empty() {
         return Err(std::io::Error::new(
@@ -169,12 +178,18 @@ fn split_server(server: &str) -> Result<(&str, u16), std::io::Error> {
             "STUN endpoint host is empty",
         ));
     }
-    let port = port.parse().map_err(|_| {
+    let port = port.parse::<u16>().map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "STUN endpoint port is invalid",
         )
     })?;
+    if port == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "STUN endpoint port must be non-zero",
+        ));
+    }
     Ok((host, port))
 }
 
@@ -185,16 +200,57 @@ async fn binding_address<S: StunSocket + ?Sized>(
 ) -> Result<SocketAddr, StunError> {
     let transaction = transaction_id();
     let request = binding_request(transaction);
-    socket.send_to(&request, server).await?;
-    let mut response = [0u8; 1500];
-    let (length, source) = timeout(request_timeout, socket.recv_from(&mut response))
-        .await
-        .map_err(|_| StunError::Timeout)??;
-    let address = parse_binding_response(&response[..length], transaction)?;
-    if source.ip().is_unspecified() {
-        return Err(StunError::InvalidResponse);
+    let deadline = tokio::time::Instant::now() + request_timeout;
+    let mut retransmission_timeout = INITIAL_RETRANSMISSION_TIMEOUT;
+    let mut last_error = StunError::Timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(last_error);
+        }
+        socket.send_to(&request, server).await?;
+        let attempt_deadline = tokio::time::Instant::now() + retransmission_timeout.min(remaining);
+        let mut invalid_response = false;
+        loop {
+            let remaining = attempt_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                last_error = if invalid_response {
+                    StunError::InvalidResponse
+                } else {
+                    StunError::Timeout
+                };
+                break;
+            }
+            let mut response = [0u8; 1500];
+            let (length, source) = match timeout(remaining, socket.recv_from(&mut response)).await {
+                Ok(Ok(value)) => value,
+                Ok(Err(error)) => return Err(error.into()),
+                Err(_) => {
+                    last_error = StunError::Timeout;
+                    break;
+                }
+            };
+            if source != server
+                || source.ip().is_unspecified()
+                || source.is_ipv4() != server.is_ipv4()
+            {
+                invalid_response = true;
+                continue;
+            }
+            match parse_binding_response(&response[..length], transaction) {
+                Ok(address)
+                    if !address.ip().is_unspecified() && address.is_ipv4() == server.is_ipv4() =>
+                {
+                    return Ok(address);
+                }
+                Ok(_) | Err(StunError::NoMappedAddress) | Err(StunError::InvalidResponse) => {
+                    invalid_response = true;
+                }
+                Err(_) => invalid_response = true,
+            }
+        }
+        retransmission_timeout = retransmission_timeout.saturating_mul(2);
     }
-    Ok(address)
 }
 
 fn transaction_id() -> [u8; 12] {
@@ -215,21 +271,27 @@ fn binding_request(transaction: [u8; 12]) -> [u8; 20] {
 fn parse_binding_response(input: &[u8], transaction: [u8; 12]) -> Result<SocketAddr, StunError> {
     if input.len() < 20
         || input[0] & 0xc0 != 0
+        || u16::from_be_bytes([input[0], input[1]]) != BINDING_SUCCESS_RESPONSE
         || u32::from_be_bytes(input[4..8].try_into().unwrap()) != MAGIC_COOKIE
         || input[8..20] != transaction
     {
         return Err(StunError::InvalidResponse);
     }
     let message_len = u16::from_be_bytes([input[2], input[3]]) as usize;
-    if input.len() < 20 + message_len {
+    let message_end = 20usize.saturating_add(message_len);
+    if message_end > input.len() {
         return Err(StunError::InvalidResponse);
     }
     let mut offset = 20;
-    while offset + 4 <= 20 + message_len {
+    while offset < message_end {
+        if message_end - offset < 4 {
+            return Err(StunError::InvalidResponse);
+        }
         let attribute = u16::from_be_bytes([input[offset], input[offset + 1]]);
         let length = u16::from_be_bytes([input[offset + 2], input[offset + 3]]) as usize;
         offset += 4;
-        if offset + length > input.len() {
+        let padded_length = (length + 3) & !3;
+        if offset + padded_length > message_end {
             return Err(StunError::InvalidResponse);
         }
         let value = &input[offset..offset + length];
@@ -238,7 +300,7 @@ fn parse_binding_response(input: &[u8], transaction: [u8; 12]) -> Result<SocketA
                 return Ok(address);
             }
         }
-        offset += (length + 3) & !3;
+        offset += padded_length;
     }
     Err(StunError::NoMappedAddress)
 }
@@ -305,7 +367,7 @@ pub enum StunError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::{collections::VecDeque, sync::Mutex};
 
     #[test]
     fn parses_xor_mapped_ipv4() {
@@ -402,5 +464,136 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(candidates, vec!["203.0.113.7:4567".parse().unwrap()]);
+    }
+
+    fn success_response(transaction: [u8; 12], address: SocketAddr) -> Vec<u8> {
+        let mut value = vec![0, if address.is_ipv4() { 1 } else { 2 }];
+        value.extend_from_slice(&(address.port() ^ (MAGIC_COOKIE >> 16) as u16).to_be_bytes());
+        match address.ip() {
+            IpAddr::V4(ip) => {
+                let mut bytes = ip.octets();
+                for (byte, mask) in bytes.iter_mut().zip(MAGIC_COOKIE.to_be_bytes()) {
+                    *byte ^= mask;
+                }
+                value.extend_from_slice(&bytes);
+            }
+            IpAddr::V6(ip) => {
+                let mut bytes = ip.octets();
+                let mut mask = [0u8; 16];
+                mask[..4].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
+                mask[4..].copy_from_slice(&transaction);
+                for (byte, mask) in bytes.iter_mut().zip(mask) {
+                    *byte ^= mask;
+                }
+                value.extend_from_slice(&bytes);
+            }
+        }
+        let message_len = 4 + value.len();
+        let mut response = vec![0u8; 20];
+        response[0..2].copy_from_slice(&BINDING_SUCCESS_RESPONSE.to_be_bytes());
+        response[2..4].copy_from_slice(&(message_len as u16).to_be_bytes());
+        response[4..8].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        response[8..20].copy_from_slice(&transaction);
+        response.extend_from_slice(&XOR_MAPPED_ADDRESS.to_be_bytes());
+        response.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        response.extend_from_slice(&value);
+        response
+    }
+
+    struct RetrySocket {
+        transactions: Mutex<Vec<[u8; 12]>>,
+        response: Mutex<Option<Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl StunSocket for RetrySocket {
+        async fn send_to(&self, bytes: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            let transaction = bytes[8..20].try_into().unwrap();
+            let mut transactions = self.transactions.lock().unwrap();
+            transactions.push(transaction);
+            if transactions.len() == 2 {
+                *self.response.lock().unwrap() = Some(success_response(
+                    transaction,
+                    "203.0.113.7:4567".parse().unwrap(),
+                ));
+            }
+            let _ = target;
+            Ok(bytes.len())
+        }
+
+        async fn recv_from(&self, buffer: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            let response = self.response.lock().unwrap().take();
+            let Some(response) = response else {
+                return std::future::pending().await;
+            };
+            buffer[..response.len()].copy_from_slice(&response);
+            Ok((response.len(), "127.0.0.1:3478".parse().unwrap()))
+        }
+    }
+
+    #[tokio::test]
+    async fn binding_retransmits_with_the_same_transaction_id() {
+        let socket = RetrySocket {
+            transactions: Mutex::new(Vec::new()),
+            response: Mutex::new(None),
+        };
+        let result = binding_address(
+            &socket,
+            Duration::from_millis(750),
+            "127.0.0.1:3478".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, "203.0.113.7:4567".parse().unwrap());
+        let transactions = socket.transactions.lock().unwrap();
+        assert_eq!(transactions.len(), 2);
+        assert_eq!(transactions[0], transactions[1]);
+    }
+
+    struct WrongSourceSocket {
+        responses: Mutex<VecDeque<(Vec<u8>, SocketAddr)>>,
+    }
+
+    #[async_trait]
+    impl StunSocket for WrongSourceSocket {
+        async fn send_to(&self, bytes: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            let transaction = bytes[8..20].try_into().unwrap();
+            let response = success_response(transaction, "203.0.113.7:4567".parse().unwrap());
+            let mut responses = self.responses.lock().unwrap();
+            responses.push_back((response.clone(), "127.0.0.2:3478".parse().unwrap()));
+            responses.push_back((response, target));
+            Ok(bytes.len())
+        }
+
+        async fn recv_from(&self, buffer: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            let (response, source) = self.responses.lock().unwrap().pop_front().unwrap();
+            buffer[..response.len()].copy_from_slice(&response);
+            Ok((response.len(), source))
+        }
+    }
+
+    #[tokio::test]
+    async fn binding_ignores_a_response_from_an_unexpected_source() {
+        let socket = WrongSourceSocket {
+            responses: Mutex::new(VecDeque::new()),
+        };
+        let result = binding_address(
+            &socket,
+            Duration::from_secs(1),
+            "127.0.0.1:3478".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, "203.0.113.7:4567".parse().unwrap());
+    }
+
+    #[test]
+    fn stun_endpoint_requires_bracketed_ipv6_and_a_real_port() {
+        assert!(split_server("2001:db8::1:3478").is_err());
+        assert!(split_server("127.0.0.1:0").is_err());
+        assert_eq!(
+            split_server("[2001:db8::1]:3478").unwrap(),
+            ("2001:db8::1", 3478)
+        );
     }
 }

@@ -16,21 +16,15 @@ use tokio::time::interval;
 use tracing::{debug, warn};
 use vela_coord_client::{CoordClientError, CoordinationClient};
 use vela_core::{
-    BindOptions, ConnectError, CoreError, DiagnosticPingError, DiagnosticPingResult, NodeConfig,
-    TokioDatagramProvider, VelaNode,
+    AddressFamily, BindOptions, ConnectError, CoreError, DiagnosticPingError, DiagnosticPingResult,
+    NodeConfig, TokioDatagramProvider, VelaEvent, VelaNode,
 };
 use vela_crypto::{CryptoError, Identity, MembershipCredential};
 use vela_proto::{Candidate, ControlMessage, NetworkSnapshot, NodeId, PeerInfo, PeerSummary};
 
 const STATE_FILE: &str = "state.json";
 const IDENTITY_FILE: &str = "identity";
-const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-
-fn effective_bind(bind: Option<SocketAddr>) -> SocketAddr {
-    // The default bind is runtime policy, not a persisted peer setting. Keep
-    // old state files from silently forcing a peer back to IPv4-only mode.
-    bind.unwrap_or_else(|| BindOptions::default().local_addr)
-}
+pub const CANDIDATE_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
 
 fn default_doh_servers() -> Vec<String> {
     vela_stun::default_doh_servers()
@@ -41,7 +35,8 @@ pub struct PeerState {
     pub server: String,
     pub server_key: [u8; 32],
     pub credential: Option<MembershipCredential>,
-    pub bind: SocketAddr,
+    #[serde(default)]
+    pub last_local_addrs: Vec<SocketAddr>,
     #[serde(default = "default_doh_servers")]
     pub doh_servers: Vec<String>,
     pub stun_servers: Vec<String>,
@@ -52,17 +47,12 @@ pub struct PeerState {
 }
 
 impl PeerState {
-    pub fn new(
-        server: String,
-        server_key: [u8; 32],
-        bind: SocketAddr,
-        stun_servers: Vec<String>,
-    ) -> Self {
+    pub fn new(server: String, server_key: [u8; 32], stun_servers: Vec<String>) -> Self {
         Self {
             server,
             server_key,
             credential: None,
-            bind,
+            last_local_addrs: Vec::new(),
             doh_servers: default_doh_servers(),
             stun_servers: stun_servers.clone(),
             manual_stun_servers: stun_servers,
@@ -96,16 +86,18 @@ pub async fn register(
     server: String,
     server_key: [u8; 32],
     invite: &str,
-    bind: SocketAddr,
+    port: u16,
     stun_servers: Vec<String>,
 ) -> Result<PeerState, DiagnosticError> {
     let state_dir = state_dir.as_ref();
     let identity = Identity::load_or_generate(PeerState::identity_path(state_dir))?;
     let mut peer = DiagnosticPeer::build(
-        PeerState::new(server, server_key, bind, stun_servers.clone()),
+        PeerState::new(server, server_key, stun_servers.clone()),
         identity,
         state_dir,
         stun_servers,
+        port,
+        None,
     )
     .await?;
     let candidates = peer.candidates.clone();
@@ -117,6 +109,8 @@ pub async fn register(
     peer.state.candidates = candidates;
     peer.apply_snapshot(registration.snapshot).await?;
     peer.refresh_candidates().await?;
+    peer.state.last_local_addrs = peer.node.local_addrs()?;
+    peer.state.save(state_dir)?;
     Ok(peer.state)
 }
 
@@ -178,7 +172,7 @@ impl DiagnosticControl {
         Ok(PeerStatus {
             node_id: self.node_id(),
             server: self.state.server.clone(),
-            bind: self.state.bind,
+            local_addrs: self.state.last_local_addrs.clone(),
             doh_servers: self.state.doh_servers.clone(),
             stun_servers: self.state.stun_servers.clone(),
             candidates: self.state.candidates.clone(),
@@ -195,12 +189,11 @@ impl DiagnosticControl {
 impl DiagnosticPeer {
     pub async fn open(
         state_dir: impl AsRef<Path>,
-        bind: Option<SocketAddr>,
+        port: Option<u16>,
         stun_servers: Option<Vec<String>>,
     ) -> Result<Self, DiagnosticError> {
         let state_dir = state_dir.as_ref();
         let mut state = PeerState::load(state_dir)?;
-        state.bind = effective_bind(bind);
         // Keep an explicitly configured local STUN endpoint across restarts;
         // coordinator endpoints are merged into it when a snapshot arrives.
         let manual_stun_servers = stun_servers.unwrap_or_else(|| state.manual_stun_servers.clone());
@@ -209,7 +202,19 @@ impl DiagnosticPeer {
             state.stun_servers = manual_stun_servers.clone();
         }
         let identity = Identity::load(PeerState::identity_path(state_dir))?;
-        let mut peer = Self::build(state, identity, state_dir, manual_stun_servers).await?;
+        let (port, preferred_ports) = match port {
+            Some(port) => (port, None),
+            None => (0, preferred_local_ports(&state.last_local_addrs)),
+        };
+        let mut peer = Self::build(
+            state,
+            identity,
+            state_dir,
+            manual_stun_servers,
+            port,
+            preferred_ports,
+        )
+        .await?;
         let registration = peer
             .client
             .register(
@@ -223,6 +228,7 @@ impl DiagnosticPeer {
         peer.state.candidates = peer.candidates.clone();
         peer.apply_snapshot(registration.snapshot).await?;
         peer.refresh_candidates().await?;
+        peer.state.last_local_addrs = peer.node.local_addrs()?;
         peer.node.start().await?;
         peer.state.save(state_dir)?;
         Ok(peer)
@@ -233,8 +239,16 @@ impl DiagnosticPeer {
         identity: Identity,
         state_dir: impl AsRef<Path>,
         manual_stun_servers: Vec<String>,
+        port: u16,
+        preferred_ports: Option<[Option<u16>; 2]>,
     ) -> Result<Self, DiagnosticError> {
-        let provider = Arc::new(TokioDatagramProvider::new(Vec::new()));
+        let provider = match preferred_ports {
+            Some(preferred_ports) => Arc::new(TokioDatagramProvider::with_preferred_ports(
+                Vec::new(),
+                preferred_ports,
+            )),
+            None => Arc::new(TokioDatagramProvider::new(Vec::new())),
+        };
         let local = state.snapshot.as_ref().and_then(|snapshot| {
             snapshot
                 .peers
@@ -245,9 +259,7 @@ impl DiagnosticPeer {
             .identity(identity)
             .datagram_provider(provider)
             .config(NodeConfig {
-                bind: BindOptions {
-                    local_addr: state.bind,
-                },
+                bind: BindOptions { port },
                 network_id: state
                     .snapshot
                     .as_ref()
@@ -302,6 +314,10 @@ impl DiagnosticPeer {
         Ok(self.node.local_addr()?)
     }
 
+    pub fn local_addrs(&self) -> Result<Vec<SocketAddr>, DiagnosticError> {
+        Ok(self.node.local_addrs()?)
+    }
+
     pub fn candidates(&self) -> &[Candidate] {
         &self.candidates
     }
@@ -314,7 +330,7 @@ impl DiagnosticPeer {
         Ok(PeerStatus {
             node_id: self.node_id(),
             server: self.state.server.clone(),
-            bind: self.state.bind,
+            local_addrs: self.node.local_addrs()?,
             doh_servers: self.state.doh_servers.clone(),
             stun_servers: self.state.stun_servers.clone(),
             candidates: self.candidates.clone(),
@@ -336,18 +352,18 @@ impl DiagnosticPeer {
             }
             Err(error) => return Err(error),
         };
-        if candidates == self.candidates {
+        let unchanged = candidates == self.candidates;
+        if unchanged {
             debug!(
                 debug_marker = "vela-candidates",
                 candidate_count = candidates.len(),
                 "candidate refresh produced no changes"
             );
-            return Ok(());
         }
         debug!(
             debug_marker = "vela-candidates",
             candidates = ?candidates,
-            "uploading changed local candidates"
+            "uploading refreshed local candidates"
         );
         self.client.update_candidates(candidates.clone()).await?;
         self.candidates = candidates.clone();
@@ -473,15 +489,19 @@ impl DiagnosticPeer {
         let connect_started = Instant::now();
         let handle = self.node.connect(target).await?;
         let connect_ms = connect_started.elapsed().as_millis();
-        let local_addr = self.node.local_addr()?;
+        let local_addrs = self.node.local_addrs()?;
         let result = handle.diagnostic_ping(count, timeout).await?;
         Ok(PingReport::from_result(
-            target, peer, connect_ms, local_addr, result,
+            target,
+            peer,
+            connect_ms,
+            local_addrs,
+            result,
         ))
     }
 
     pub async fn run(mut self) -> Result<(), DiagnosticError> {
-        let mut refresh = interval(DEFAULT_REFRESH_INTERVAL);
+        let mut refresh = interval(CANDIDATE_REFRESH_INTERVAL);
         let mut control_connected = true;
         let mut reconnect_backoff = Duration::from_secs(1);
         let mut reconnect_sleep = Box::pin(tokio::time::sleep(Duration::ZERO));
@@ -577,6 +597,18 @@ impl DiagnosticPeer {
                         Err(error) => return Err(error),
                     }
                 }
+                event = self.node.next_event() => {
+                    match event {
+                        Some(VelaEvent::TransportFailed { family, error }) => {
+                            return Err(DiagnosticError::TransportFailed { family, error });
+                        }
+                        Some(_) => {}
+                        None => return Err(DiagnosticError::TransportFailed {
+                            family: None,
+                            error: "Vela node stopped".to_owned(),
+                        }),
+                    }
+                }
             }
         }
     }
@@ -586,7 +618,7 @@ impl DiagnosticPeer {
 pub struct PeerStatus {
     pub node_id: NodeId,
     pub server: String,
-    pub bind: SocketAddr,
+    pub local_addrs: Vec<SocketAddr>,
     pub doh_servers: Vec<String>,
     pub stun_servers: Vec<String>,
     pub candidates: Vec<Candidate>,
@@ -598,7 +630,7 @@ pub struct PeerStatus {
 pub struct PingReport {
     pub target: NodeId,
     pub direct: bool,
-    pub local_addr: SocketAddr,
+    pub local_addrs: Vec<SocketAddr>,
     pub path: SocketAddr,
     pub candidate_type: String,
     pub connect_ms: u128,
@@ -613,7 +645,7 @@ impl PingReport {
         target: NodeId,
         peer: PeerInfo,
         connect_ms: u128,
-        local_addr: SocketAddr,
+        local_addrs: Vec<SocketAddr>,
         result: DiagnosticPingResult,
     ) -> Self {
         let rtts_ms = result
@@ -638,7 +670,7 @@ impl PingReport {
         Self {
             target,
             direct: true,
-            local_addr,
+            local_addrs,
             path: result.path,
             candidate_type,
             connect_ms,
@@ -662,6 +694,11 @@ pub enum DiagnosticError {
     Coordination(#[from] CoordClientError),
     #[error("core error: {0}")]
     Core(#[from] CoreError),
+    #[error("UDP transport failed ({family:?}): {error}")]
+    TransportFailed {
+        family: Option<AddressFamily>,
+        error: String,
+    },
     #[error("direct connection error: {0}")]
     Connect(#[from] ConnectError),
     #[error("diagnostic ping error: {0}")]
@@ -688,6 +725,20 @@ fn effective_doh_servers(servers: &[String]) -> Vec<String> {
     } else {
         servers.to_vec()
     }
+}
+
+fn preferred_local_ports(local_addrs: &[SocketAddr]) -> Option<[Option<u16>; 2]> {
+    let ports = [
+        local_addrs
+            .iter()
+            .find(|address| address.is_ipv4() && address.port() != 0)
+            .map(SocketAddr::port),
+        local_addrs
+            .iter()
+            .find(|address| address.is_ipv6() && address.port() != 0)
+            .map(SocketAddr::port),
+    ];
+    (ports != [None, None]).then_some(ports)
 }
 
 fn unique_candidates(candidates: Vec<Candidate>) -> Vec<Candidate> {
@@ -722,10 +773,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_bind_ignores_persisted_ipv4_only_setting() {
-        let persisted = "0.0.0.0:0".parse().unwrap();
-        assert_eq!(effective_bind(None), "[::]:0".parse().unwrap());
-        assert_eq!(effective_bind(Some(persisted)), persisted);
+    fn legacy_bind_state_is_ignored_and_ports_start_empty() {
+        let state: PeerState = serde_json::from_value(serde_json::json!({
+            "server": "ws://127.0.0.1/ws",
+            "server_key": vec![0u8; 32],
+            "credential": null,
+            "bind": "0.0.0.0:4567",
+            "stun_servers": [],
+            "candidates": [],
+            "snapshot": null,
+        }))
+        .unwrap();
+        assert!(state.last_local_addrs.is_empty());
+    }
+
+    #[test]
+    fn preferred_ports_are_derived_per_address_family() {
+        let local_addrs = vec![
+            "0.0.0.0:40123".parse().unwrap(),
+            "[::]:40124".parse().unwrap(),
+        ];
+        assert_eq!(
+            preferred_local_ports(&local_addrs),
+            Some([Some(40123), Some(40124)])
+        );
     }
 
     #[test]

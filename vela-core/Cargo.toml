@@ -23,3 +23,7 @@ vela-crypto = { path = "../vela-crypto" }
 vela-ip = { path = "../vela-ip" }
 vela-proto = { path = "../vela-proto" }
 vela-stun = { path = "../vela-stun" }
+
+[[bench]]
+name = "peer_queue"
+harness = false

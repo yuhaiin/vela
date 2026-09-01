@@ -43,7 +43,7 @@ let node = VelaNode::builder()
     .identity(Identity::load_or_generate("./node.key")?)
     .datagram_provider(provider)
     .config(NodeConfig {
-        bind: BindOptions { local_addr: "[::]:0".parse()? },
+        bind: BindOptions { port: 0 },
         ..NodeConfig::default()
     })
     .build()
@@ -99,7 +99,7 @@ cargo run -p vela-cli -- peer register \
   --server ws://127.0.0.1:7000/ws \
   --server-key <base64-server-key> \
   --invite <invite-token> \
-  --bind 192.0.2.10:0
+  --port 0
 
 cargo run -p vela-cli -- peer run --state ./peer-a
 # Linux/Windows default: vela0; macOS default: utun0.
@@ -135,11 +135,17 @@ resolved through DoH on every refresh. The server may be started with repeated
 `--doh <https-url>` and `--stun <host:port>` options, or both settings can be
 edited in `/admin`; changes are persisted, signed into snapshots, and pushed to
 online peers dynamically.
-The default peer bind is the dual-stack `[::]:0`. The peer UDP socket and its
-automatically collected host candidates use the host's main-table default-route
-interface, so addresses from unrelated VPN, container, or virtual interfaces
-are not advertised. Peers on the selected LAN can connect directly without
-going through STUN.
+The peer transport always creates one IPv4-only and one IPv6-only UDP socket.
+`--port <port>` selects the same local port for both sockets; omitting it lets
+the operating system choose an ephemeral port independently for each family.
+On restart, the last successful IPv4 and IPv6 ports are tried first and both
+families fall back to fresh ports together if that pair is unavailable. The
+older peer `--bind` option is ignored for compatibility. The sockets and their
+automatically collected host candidates use each family's main-table
+default-route interface, so addresses from unrelated VPN, container, or
+virtual interfaces are not advertised. If a family has no default route, its
+socket remains usable but no host candidate is published for that family; STUN
+can still discover a server-reflexive candidate.
 
 On Linux, macOS, and Windows, `peer up` creates a layer-3 TUN interface, assigns
 the stable virtual address from the signed network snapshot, installs only the

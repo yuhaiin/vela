@@ -12,7 +12,7 @@ use rand::RngCore;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     collections::{HashMap, VecDeque},
-    io,
+    fmt, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         Arc, Mutex as StdMutex,
@@ -24,6 +24,7 @@ use thiserror::Error;
 use tokio::{
     net::UdpSocket,
     sync::{Mutex, Notify, mpsc, oneshot},
+    task::JoinHandle,
     time::{Instant, timeout},
 };
 use tracing::{debug, warn};
@@ -38,16 +39,35 @@ use vela_proto::{
     WirePacket,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct BindOptions {
-    pub local_addr: SocketAddr,
+    /// Port used by both address families. Zero asks the provider for fresh
+    /// ephemeral ports, one for each socket.
+    pub port: u16,
 }
 
-impl Default for BindOptions {
-    fn default() -> Self {
-        Self {
-            local_addr: "[::]:0".parse().expect("valid default socket address"),
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AddressFamily {
+    Ipv4,
+    Ipv6,
+}
+
+impl AddressFamily {
+    fn of(address: SocketAddr) -> Self {
+        if address.is_ipv4() {
+            Self::Ipv4
+        } else {
+            Self::Ipv6
         }
+    }
+}
+
+impl fmt::Display for AddressFamily {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Ipv4 => "IPv4",
+            Self::Ipv6 => "IPv6",
+        })
     }
 }
 
@@ -56,6 +76,16 @@ pub trait DatagramSocket: Send + Sync {
     async fn send_to(&self, bytes: &[u8], target: SocketAddr) -> io::Result<usize>;
     async fn recv_from(&self, buffer: &mut [u8]) -> io::Result<(usize, SocketAddr)>;
     fn local_addr(&self) -> io::Result<SocketAddr>;
+
+    fn local_addrs(&self) -> io::Result<Vec<SocketAddr>> {
+        Ok(vec![self.local_addr()?])
+    }
+
+    async fn shutdown(&self) {}
+
+    fn failure_family(&self) -> Option<AddressFamily> {
+        None
+    }
 }
 
 #[async_trait]
@@ -63,26 +93,39 @@ pub trait DatagramProvider: Send + Sync {
     async fn bind(&self, options: BindOptions) -> Result<Arc<dyn DatagramSocket>, CoreError>;
     fn local_candidates(&self) -> Vec<Candidate>;
 
-    /// Returns the interface selected for the default local socket, if any.
+    /// Returns the interfaces selected for the default local sockets.
     ///
     /// Providers that manage their own socket and candidates can leave this
     /// unset. The built-in provider uses it to keep fallback host candidates
     /// consistent with the interface-bound socket.
-    fn local_interface(&self) -> Option<String> {
-        None
+    fn local_interfaces(&self) -> Vec<(AddressFamily, String)> {
+        Vec::new()
     }
 }
 
 pub struct TokioDatagramProvider {
     pub host_candidates: Vec<Candidate>,
-    selected_interface: StdMutex<Option<DefaultRouteInterface>>,
+    selected_interfaces: StdMutex<Vec<(AddressFamily, DefaultRouteInterface)>>,
+    preferred_ports: Option<[Option<u16>; 2]>,
 }
 
 impl TokioDatagramProvider {
     pub fn new(host_candidates: Vec<Candidate>) -> Self {
         Self {
             host_candidates,
-            selected_interface: StdMutex::new(None),
+            selected_interfaces: StdMutex::new(Vec::new()),
+            preferred_ports: None,
+        }
+    }
+
+    pub fn with_preferred_ports(
+        host_candidates: Vec<Candidate>,
+        preferred_ports: [Option<u16>; 2],
+    ) -> Self {
+        Self {
+            host_candidates,
+            selected_interfaces: StdMutex::new(Vec::new()),
+            preferred_ports: Some(preferred_ports),
         }
     }
 }
@@ -93,19 +136,9 @@ struct DefaultRouteInterface {
     index: Option<std::num::NonZeroU32>,
 }
 
-fn default_route_interface(bind_addr: SocketAddr) -> io::Result<Option<DefaultRouteInterface>> {
+fn default_route_interface(ipv4: bool) -> io::Result<Option<DefaultRouteInterface>> {
     let mut routes = route_manager::RouteManager::new()?;
-    let route = if bind_addr.is_ipv4() {
-        default_route(&mut routes, true)?
-    } else {
-        // The dual-stack socket uses the IPv4 default route when available;
-        // this is also the route used for IPv4-mapped destinations. Fall back
-        // to IPv6-only systems where no IPv4 default route exists.
-        match default_route(&mut routes, true)? {
-            Some(route) => Some(route),
-            None => default_route(&mut routes, false)?,
-        }
-    };
+    let route = default_route(&mut routes, ipv4)?;
     let Some(route) = route else {
         return Ok(None);
     };
@@ -220,182 +253,378 @@ fn bind_socket_to_interface(
     Ok(())
 }
 
-#[cfg(any(
-    target_os = "ios",
-    target_os = "visionos",
-    target_os = "macos",
-    target_os = "tvos",
-    target_os = "watchos",
-))]
-fn bind_dual_stack_socket_to_interface(
-    socket: &Socket,
-    interface: &DefaultRouteInterface,
-) -> io::Result<()> {
-    // This is an AF_INET6 socket. Darwin rejects the IPv4 IP_BOUND_IF option
-    // on it with EINVAL, even when IPV6_V6ONLY is disabled. IPv4-mapped
-    // datagrams therefore use the system IPv4 route, while native IPv6
-    // datagrams are pinned to the selected interface.
-    bind_socket_to_interface(socket, interface, false)
+fn bind_udp_socket(
+    family: AddressFamily,
+    port: u16,
+    interface: Option<&DefaultRouteInterface>,
+) -> Result<UdpSocket, CoreError> {
+    let socket = Socket::new(
+        match family {
+            AddressFamily::Ipv4 => Domain::IPV4,
+            AddressFamily::Ipv6 => Domain::IPV6,
+        },
+        Type::DGRAM,
+        Some(Protocol::UDP),
+    )
+    .map_err(|source| CoreError::DatagramBind {
+        family,
+        port,
+        source,
+    })?;
+    if family == AddressFamily::Ipv6 {
+        socket
+            .set_only_v6(true)
+            .map_err(|source| CoreError::DatagramBind {
+                family,
+                port,
+                source,
+            })?;
+    }
+    if let Some(interface) = interface {
+        bind_socket_to_interface(&socket, interface, family == AddressFamily::Ipv4).map_err(
+            |source| CoreError::DatagramBind {
+                family,
+                port,
+                source,
+            },
+        )?;
+    }
+    socket
+        .set_nonblocking(true)
+        .map_err(|source| CoreError::DatagramBind {
+            family,
+            port,
+            source,
+        })?;
+    let local_addr = match family {
+        AddressFamily::Ipv4 => SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
+        AddressFamily::Ipv6 => SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+    };
+    socket
+        .bind(&local_addr.into())
+        .map_err(|source| CoreError::DatagramBind {
+            family,
+            port,
+            source,
+        })?;
+    UdpSocket::from_std(socket.into()).map_err(CoreError::Io)
 }
 
-#[cfg(not(any(
-    target_os = "ios",
-    target_os = "visionos",
-    target_os = "macos",
-    target_os = "tvos",
-    target_os = "watchos",
-)))]
-fn bind_dual_stack_socket_to_interface(
-    socket: &Socket,
-    interface: &DefaultRouteInterface,
-) -> io::Result<()> {
-    bind_socket_to_interface(socket, interface, false)
+fn bind_socket_pair(
+    ports: [u16; 2],
+    interfaces: [Option<&DefaultRouteInterface>; 2],
+) -> Result<(UdpSocket, UdpSocket), CoreError> {
+    let ipv4 = bind_udp_socket(AddressFamily::Ipv4, ports[0], interfaces[0])?;
+    let ipv6 = bind_udp_socket(AddressFamily::Ipv6, ports[1], interfaces[1])?;
+    Ok((ipv4, ipv6))
 }
 
 #[async_trait]
 impl DatagramProvider for TokioDatagramProvider {
     async fn bind(&self, options: BindOptions) -> Result<Arc<dyn DatagramSocket>, CoreError> {
-        let domain = if options.local_addr.is_ipv4() {
-            Domain::IPV4
-        } else {
-            Domain::IPV6
-        };
-        let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-        let dual_stack = options.local_addr.is_ipv6() && options.local_addr.ip().is_unspecified();
-        if dual_stack {
-            if let Err(error) = socket.set_only_v6(false) {
-                tracing::debug!(
-                    debug_marker = "vela-udp",
-                    error = %error,
-                    "failed to enable IPv4-mapped traffic on dual-stack socket"
-                );
-                return Err(error.into());
+        let mut interfaces = [None, None];
+        if self.host_candidates.is_empty() {
+            for (slot, family) in [AddressFamily::Ipv4, AddressFamily::Ipv6]
+                .into_iter()
+                .enumerate()
+            {
+                interfaces[slot] = match default_route_interface(family == AddressFamily::Ipv4) {
+                    Ok(interface) => interface,
+                    Err(error) => {
+                        tracing::debug!(
+                            debug_marker = "vela-udp",
+                            %family,
+                            error = %error,
+                            "failed to find default route; leaving socket unpinned"
+                        );
+                        None
+                    }
+                };
             }
         }
-        let selected_interface = if options.local_addr.ip().is_unspecified() {
-            Some(default_route_interface(options.local_addr)?.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "no main-table default-route interface is available",
-                )
-            })?)
+        let preferred = self.preferred_ports;
+        let attempts = if options.port != 0 {
+            vec![[options.port, options.port]]
         } else {
-            None
-        };
-        if let Some(interface) = &selected_interface {
-            tracing::info!(
-                interface = %interface.name,
-                index = ?interface.index,
-                dual_stack,
-                "binding peer UDP socket to the default-route interface"
-            );
-            if dual_stack {
-                if let Err(error) = bind_dual_stack_socket_to_interface(&socket, interface) {
-                    tracing::debug!(
-                        debug_marker = "vela-udp",
-                        interface = %interface.name,
-                        index = ?interface.index,
-                        error = %error,
-                        "failed to bind dual-stack socket to interface"
-                    );
-                    return Err(error.into());
+            let mut attempts = Vec::new();
+            if let Some(preferred) = preferred {
+                let ports = [preferred[0].unwrap_or(0), preferred[1].unwrap_or(0)];
+                if ports != [0, 0] {
+                    attempts.push(ports);
                 }
-            } else {
-                if let Err(error) =
-                    bind_socket_to_interface(&socket, interface, options.local_addr.is_ipv4())
-                {
+            }
+            if attempts.last() != Some(&[0, 0]) {
+                attempts.push([0, 0]);
+            }
+            attempts
+        };
+        let mut last_error = None;
+        for (attempt, ports) in attempts.into_iter().enumerate() {
+            match bind_socket_pair(ports, [interfaces[0].as_ref(), interfaces[1].as_ref()]) {
+                Ok((ipv4, ipv6)) => {
+                    let local_addrs = [ipv4.local_addr()?, ipv6.local_addr()?];
+                    *self
+                        .selected_interfaces
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = interfaces
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(index, interface)| {
+                            interface.map(|interface| {
+                                ([AddressFamily::Ipv4, AddressFamily::Ipv6][index], interface)
+                            })
+                        })
+                        .collect();
+                    if attempt > 0 {
+                        tracing::debug!(
+                            debug_marker = "vela-udp",
+                            ?local_addrs,
+                            "preferred UDP ports were unavailable; using fresh ports"
+                        );
+                    }
+                    return Ok(Arc::new(TokioDatagramSocket::new(ipv4, ipv6, local_addrs)));
+                }
+                Err(error) => {
                     tracing::debug!(
                         debug_marker = "vela-udp",
-                        interface = %interface.name,
-                        index = ?interface.index,
+                        ?ports,
+                        attempt,
                         error = %error,
-                        "failed to bind socket to interface"
+                        "failed to bind both peer UDP sockets"
                     );
-                    return Err(error.into());
+                    last_error = Some(error);
+                    if options.port != 0 {
+                        break;
+                    }
                 }
             }
         }
-        socket.set_nonblocking(true)?;
-        if let Err(error) = socket.bind(&options.local_addr.into()) {
-            tracing::debug!(
-                debug_marker = "vela-udp",
-                local_addr = %options.local_addr,
-                error = %error,
-                "failed to bind peer UDP socket"
-            );
-            return Err(error.into());
-        }
-        *self
-            .selected_interface
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = selected_interface;
-        Ok(Arc::new(TokioDatagramSocket {
-            socket: UdpSocket::from_std(socket.into())?,
-        }))
+        Err(last_error.expect("at least one UDP bind attempt"))
     }
 
     fn local_candidates(&self) -> Vec<Candidate> {
         self.host_candidates.clone()
     }
 
-    fn local_interface(&self) -> Option<String> {
-        self.selected_interface
+    fn local_interfaces(&self) -> Vec<(AddressFamily, String)> {
+        self.selected_interfaces
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map(|interface| interface.name.clone())
+            .iter()
+            .map(|(family, interface)| (*family, interface.name.clone()))
+            .collect()
     }
 }
 
 fn host_candidates(
-    bind_addr: SocketAddr,
-    port: u16,
-    interface_name: Option<&str>,
+    local_addrs: &[SocketAddr],
+    selected_interfaces: &[(AddressFamily, String)],
 ) -> Vec<Candidate> {
-    if !bind_addr.ip().is_unspecified() {
-        return vec![Candidate::Host(SocketAddr::new(bind_addr.ip(), port))];
-    }
-
-    // An unspecified IPv6 socket is created as dual-stack below, so it can
-    // reach IPv4 peers as well. Advertise both address families in that case.
-    let include_ipv4 = bind_addr.is_ipv4() || bind_addr.is_ipv6();
-    let include_ipv6 = bind_addr.is_ipv6();
     let Ok(interfaces) = get_if_addrs() else {
         return Vec::new();
     };
     let mut candidates = Vec::new();
     for interface in interfaces {
-        if interface_name.is_some_and(|name| interface.name != name) {
+        let family = AddressFamily::of(SocketAddr::new(interface.ip(), 0));
+        let Some(port) = local_addrs
+            .iter()
+            .find(|address| AddressFamily::of(**address) == family)
+            .map(SocketAddr::port)
+        else {
+            continue;
+        };
+        if !selected_interfaces
+            .iter()
+            .any(|(selected_family, name)| *selected_family == family && name == &interface.name)
+        {
             continue;
         }
         if interface.is_loopback() || interface.is_link_local() {
             continue;
         }
         let address = interface.ip();
-        if (address.is_ipv4() && include_ipv4) || (address.is_ipv6() && include_ipv6) {
-            let candidate = Candidate::Host(SocketAddr::new(address, port));
-            if !candidates.contains(&candidate) {
-                candidates.push(candidate);
-            }
+        let candidate = Candidate::Host(SocketAddr::new(address, port));
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
         }
     }
     candidates
 }
 
+type DatagramMessage = io::Result<(Vec<u8>, SocketAddr)>;
+
 struct TokioDatagramSocket {
-    socket: UdpSocket,
+    ipv4: Arc<UdpSocket>,
+    ipv6: Arc<UdpSocket>,
+    receiver: Mutex<mpsc::Receiver<DatagramMessage>>,
+    shutdown: Arc<Notify>,
+    closed: Arc<AtomicBool>,
+    readers: StdMutex<Vec<JoinHandle<()>>>,
+    failure_family: Arc<StdMutex<Option<AddressFamily>>>,
+    local_addrs: [SocketAddr; 2],
+}
+
+impl TokioDatagramSocket {
+    fn new(ipv4: UdpSocket, ipv6: UdpSocket, local_addrs: [SocketAddr; 2]) -> Self {
+        let ipv4 = Arc::new(ipv4);
+        let ipv6 = Arc::new(ipv6);
+        let shutdown = Arc::new(Notify::new());
+        let closed = Arc::new(AtomicBool::new(false));
+        let failure_family = Arc::new(StdMutex::new(None));
+        let (sender, receiver) = mpsc::channel(256);
+        let readers = vec![
+            spawn_datagram_reader(
+                AddressFamily::Ipv4,
+                Arc::clone(&ipv4),
+                sender.clone(),
+                Arc::clone(&shutdown),
+                Arc::clone(&closed),
+                Arc::clone(&failure_family),
+            ),
+            spawn_datagram_reader(
+                AddressFamily::Ipv6,
+                Arc::clone(&ipv6),
+                sender,
+                Arc::clone(&shutdown),
+                Arc::clone(&closed),
+                Arc::clone(&failure_family),
+            ),
+        ];
+        Self {
+            ipv4,
+            ipv6,
+            receiver: Mutex::new(receiver),
+            shutdown,
+            closed,
+            readers: StdMutex::new(readers),
+            failure_family,
+            local_addrs,
+        }
+    }
+}
+
+fn spawn_datagram_reader(
+    family: AddressFamily,
+    socket: Arc<UdpSocket>,
+    sender: mpsc::Sender<DatagramMessage>,
+    shutdown: Arc<Notify>,
+    closed: Arc<AtomicBool>,
+    failure_family: Arc<StdMutex<Option<AddressFamily>>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut buffer = vec![0u8; 65535];
+        loop {
+            if closed.load(Ordering::Acquire) {
+                return;
+            }
+            let result = tokio::select! {
+                _ = shutdown.notified() => return,
+                result = socket.recv_from(&mut buffer) => result,
+            };
+            let (length, source) = match result {
+                Ok(value) => value,
+                Err(error) => {
+                    if !closed.load(Ordering::Acquire) {
+                        *failure_family
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(family);
+                        let error = io::Error::new(
+                            error.kind(),
+                            format!("{family} UDP receive failed: {error}"),
+                        );
+                        tokio::select! {
+                            _ = shutdown.notified() => {}
+                            _ = sender.send(Err(error)) => {}
+                        }
+                    }
+                    return;
+                }
+            };
+            let packet = Ok((buffer[..length].to_vec(), source));
+            tokio::select! {
+                _ = shutdown.notified() => return,
+                result = sender.send(packet) => {
+                    if result.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    })
 }
 
 #[async_trait]
 impl DatagramSocket for TokioDatagramSocket {
     async fn send_to(&self, bytes: &[u8], target: SocketAddr) -> io::Result<usize> {
-        self.socket.send_to(bytes, target).await
+        if self.closed.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "UDP socket is shut down",
+            ));
+        }
+        match target {
+            SocketAddr::V4(_) => self.ipv4.send_to(bytes, target).await,
+            SocketAddr::V6(_) => self.ipv6.send_to(bytes, target).await,
+        }
     }
     async fn recv_from(&self, buffer: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        self.socket.recv_from(buffer).await
+        let packet = self.receiver.lock().await.recv().await.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "UDP socket receive queue closed",
+            )
+        })??;
+        if packet.0.len() > buffer.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "UDP datagram is larger than the receive buffer",
+            ));
+        }
+        buffer[..packet.0.len()].copy_from_slice(&packet.0);
+        Ok((packet.0.len(), packet.1))
     }
     fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.socket.local_addr()
+        Ok(self.local_addrs[0])
+    }
+    fn local_addrs(&self) -> io::Result<Vec<SocketAddr>> {
+        Ok(self.local_addrs.to_vec())
+    }
+    async fn shutdown(&self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            self.shutdown.notify_waiters();
+            self.shutdown.notify_one();
+        }
+        let readers = std::mem::take(
+            &mut *self
+                .readers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for reader in readers {
+            let _ = reader.await;
+        }
+    }
+    fn failure_family(&self) -> Option<AddressFamily> {
+        *self
+            .failure_family
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Drop for TokioDatagramSocket {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Release);
+        self.shutdown.notify_waiters();
+        self.shutdown.notify_one();
+        for reader in self
+            .readers
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+        {
+            reader.abort();
+        }
     }
 }
 
@@ -405,7 +634,7 @@ struct StunSocketAdapter {
 }
 
 type StunResponse = (Vec<u8>, SocketAddr);
-type StunWaiter = (Instant, oneshot::Sender<StunResponse>);
+type StunWaiter = (Instant, SocketAddr, oneshot::Sender<StunResponse>);
 
 const STUN_MAGIC_COOKIE: [u8; 4] = 0x2112_A442u32.to_be_bytes();
 
@@ -429,8 +658,8 @@ impl vela_stun::StunSocket for StunSocketAdapter {
         {
             let mut waiters = self.inner.stun_waiters.lock().await;
             let now = Instant::now();
-            waiters.retain(|_, (deadline, _)| *deadline > now);
-            waiters.insert(transaction, (now + Duration::from_secs(10), sender));
+            waiters.retain(|_, (deadline, _, _)| *deadline > now);
+            waiters.insert(transaction, (now + Duration::from_secs(10), target, sender));
         }
         *self.pending.lock().await = Some(receiver);
         match self.inner.socket.send_to(bytes, target).await {
@@ -491,7 +720,7 @@ impl Default for NodeConfig {
         Self {
             bind: BindOptions::default(),
             max_payload_size: 1200,
-            per_peer_queue_limit: 32,
+            per_peer_queue_limit: 256,
             keepalive_interval: Duration::from_secs(20),
             connect_timeout: Duration::from_secs(8),
             reconnect_backoff: Duration::from_secs(1),
@@ -580,6 +809,7 @@ impl VelaNodeBuilder {
             event_tx,
             event_rx: Mutex::new(Some(event_rx)),
             shutdown: Notify::new(),
+            stopping: AtomicBool::new(false),
             started: AtomicBool::new(false),
             network_id: Mutex::new(network_id),
             snapshot_generation: AtomicU64::new(0),
@@ -608,23 +838,26 @@ impl VelaNode {
     pub fn node_id(&self) -> NodeId {
         self.inner.identity.public().node_id
     }
+    /// Returns the first local socket address for compatibility with callers
+    /// that only understand one address family.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.socket.local_addr()
+        self.local_addrs()?
+            .into_iter()
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "no local UDP sockets"))
+    }
+    pub fn local_addrs(&self) -> io::Result<Vec<SocketAddr>> {
+        self.inner.socket.local_addrs()
     }
     pub fn local_candidates(&self) -> Vec<Candidate> {
         let candidates = self.inner.provider.local_candidates();
         if !candidates.is_empty() {
             candidates
         } else {
-            let Ok(local_addr) = self.local_addr() else {
+            let Ok(local_addrs) = self.local_addrs() else {
                 return Vec::new();
             };
-            let interface_name = self.inner.provider.local_interface();
-            host_candidates(
-                self.inner.config.bind.local_addr,
-                local_addr.port(),
-                interface_name.as_deref(),
-            )
+            host_candidates(&local_addrs, &self.inner.provider.local_interfaces())
         }
     }
 
@@ -659,7 +892,10 @@ impl VelaNode {
     }
 
     pub async fn shutdown(&self) {
+        self.inner.stopping.store(true, Ordering::Release);
         self.inner.shutdown.notify_waiters();
+        self.inner.stun_waiters.lock().await.clear();
+        self.inner.socket.shutdown().await;
     }
 
     pub async fn register_peer(&self, info: PeerInfo) -> Result<(), CoreError> {
@@ -1106,6 +1342,7 @@ struct Inner {
     event_tx: mpsc::Sender<VelaEvent>,
     event_rx: Mutex<Option<mpsc::Receiver<VelaEvent>>>,
     shutdown: Notify,
+    stopping: AtomicBool,
     started: AtomicBool,
 }
 
@@ -1130,9 +1367,20 @@ impl Inner {
                                 packet_len = length,
                                 "received STUN response"
                             );
-                            let waiter = self.stun_waiters.lock().await.remove(&transaction);
-                            if let Some((_, sender)) = waiter {
-                                let _ = sender.send((buffer[..length].to_vec(), source));
+                            let mut waiters = self.stun_waiters.lock().await;
+                            let matching = waiters
+                                .get(&transaction)
+                                .is_some_and(|(_, target, _)| *target == source);
+                            if matching {
+                                if let Some((_, _, sender)) = waiters.remove(&transaction) {
+                                    let _ = sender.send((buffer[..length].to_vec(), source));
+                                }
+                            } else if waiters.contains_key(&transaction) {
+                                debug!(
+                                    debug_marker = "vela-stun",
+                                    source = %source,
+                                    "ignored STUN response from an unexpected source"
+                                );
                             }
                             continue;
                         }
@@ -1145,7 +1393,20 @@ impl Inner {
                             );
                         }
                     }
-                    Err(error) => { warn!(%error, "Vela UDP receive loop stopped"); break; }
+                    Err(error) => {
+                        if self.stopping.load(Ordering::Acquire) {
+                            break;
+                        }
+                        warn!(%error, "Vela UDP receive loop stopped");
+                        self.stun_waiters.lock().await.clear();
+                        self.emit(VelaEvent::TransportFailed {
+                            family: self.socket.failure_family(),
+                            error: error.to_string(),
+                        }).await;
+                        self.shutdown.notify_waiters();
+                        self.socket.shutdown().await;
+                        break;
+                    }
                 }
             }
         }
@@ -2048,7 +2309,14 @@ pub enum VelaEvent {
     PeerDisconnected(NodeId),
     PeerUnreachable(NodeId),
     PathChanged(NodeId, SocketAddr),
-    IpPacket { peer: NodeId, packet: IpPacket },
+    TransportFailed {
+        family: Option<AddressFamily>,
+        error: String,
+    },
+    IpPacket {
+        peer: NodeId,
+        packet: IpPacket,
+    },
 }
 
 struct PeerState {
@@ -2403,6 +2671,13 @@ fn input_wire_len(packet: &WirePacket) -> usize {
 pub enum CoreError {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+    #[error("failed to bind {family} UDP socket on port {port}: {source}")]
+    DatagramBind {
+        family: AddressFamily,
+        port: u16,
+        #[source]
+        source: io::Error,
+    },
     #[error("protocol error: {0}")]
     Protocol(#[from] ProtoError),
     #[error("cryptographic error: {0}")]
@@ -2514,12 +2789,104 @@ mod tests {
     }
 
     #[test]
-    fn explicit_ipv6_bind_is_advertised_as_a_host_candidate() {
-        let bind: SocketAddr = "[2001:db8::10]:0".parse().unwrap();
-        let candidates = host_candidates(bind, 45101, None);
-        assert_eq!(
-            candidates,
-            vec![Candidate::Host("[2001:db8::10]:45101".parse().unwrap())]
+    fn selected_interface_host_candidates_use_the_matching_socket_port() {
+        let Some(interface) = get_if_addrs()
+            .unwrap()
+            .into_iter()
+            .find(|interface| !interface.is_loopback() && !interface.is_link_local())
+        else {
+            return;
+        };
+        let family = AddressFamily::of(SocketAddr::new(interface.ip(), 0));
+        let local_addrs = match family {
+            AddressFamily::Ipv4 => vec!["0.0.0.0:45101".parse().unwrap()],
+            AddressFamily::Ipv6 => vec!["[::]:45102".parse().unwrap()],
+        };
+        let candidates = host_candidates(&local_addrs, &[(family, interface.name.clone())]);
+        assert!(candidates.contains(&Candidate::Host(SocketAddr::new(
+            interface.ip(),
+            local_addrs[0].port(),
+        ))));
+    }
+
+    #[tokio::test]
+    async fn provider_binds_ipv4_and_ipv6_sockets_with_the_same_explicit_port() {
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let provider =
+            TokioDatagramProvider::new(vec![Candidate::Host("127.0.0.1:1".parse().unwrap())]);
+        let socket = provider.bind(BindOptions { port }).await.unwrap();
+        let addrs = socket.local_addrs().unwrap();
+        assert_eq!(addrs.len(), 2);
+        assert_eq!(addrs[0], SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)));
+        assert_eq!(addrs[1], SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)));
+        socket.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn provider_uses_fresh_ports_after_a_partial_explicit_bind_failure() {
+        let ipv6_blocker = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        ipv6_blocker.set_only_v6(true).unwrap();
+        ipv6_blocker
+            .bind(&"[::]:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+        let port = ipv6_blocker
+            .local_addr()
+            .unwrap()
+            .as_socket()
+            .unwrap()
+            .port();
+        let provider =
+            TokioDatagramProvider::new(vec![Candidate::Host("127.0.0.1:1".parse().unwrap())]);
+        let error = match provider.bind(BindOptions { port }).await {
+            Ok(_) => panic!("the occupied IPv6 port unexpectedly bound"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            CoreError::DatagramBind {
+                family: AddressFamily::Ipv6,
+                ..
+            }
+        ));
+        drop(ipv6_blocker);
+        std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_retries_both_families_with_fresh_ports_after_preferred_failure() {
+        let occupied = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let occupied_port = occupied.local_addr().unwrap().port();
+        let provider = TokioDatagramProvider::with_preferred_ports(
+            vec![Candidate::Host("127.0.0.1:1".parse().unwrap())],
+            [Some(occupied_port), Some(occupied_port)],
+        );
+        let socket = provider.bind(BindOptions { port: 0 }).await.unwrap();
+        let addrs = socket.local_addrs().unwrap();
+        assert_ne!(addrs[0].port(), occupied_port);
+        assert_ne!(addrs[1].port(), 0);
+        socket.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn immediate_shutdown_does_not_emit_a_transport_failure() {
+        let node = VelaNode::builder()
+            .datagram_provider(Arc::new(TokioDatagramProvider::new(vec![Candidate::Host(
+                "127.0.0.1:1".parse().unwrap(),
+            )])))
+            .config(NodeConfig::default())
+            .build()
+            .await
+            .unwrap();
+        node.start().await.unwrap();
+        node.shutdown().await;
+        assert!(
+            timeout(Duration::from_millis(50), node.next_event())
+                .await
+                .is_err()
         );
     }
 
@@ -2558,7 +2925,7 @@ mod tests {
         let provider_b = Arc::new(TokioDatagramProvider::new(vec![Candidate::Host(address_b)]));
         let config_a = NodeConfig {
             bind: BindOptions {
-                local_addr: address_a,
+                port: address_a.port(),
             },
             connect_timeout: Duration::from_secs(2),
             virtual_ipv4: Some(Ipv4Addr::new(10, 254, 0, 1)),
@@ -2566,7 +2933,7 @@ mod tests {
         };
         let config_b = NodeConfig {
             bind: BindOptions {
-                local_addr: address_b,
+                port: address_b.port(),
             },
             connect_timeout: Duration::from_secs(2),
             virtual_ipv4: Some(Ipv4Addr::new(10, 254, 0, 2)),
@@ -2692,9 +3059,7 @@ mod tests {
             .identity(identity_a.clone())
             .datagram_provider(Arc::new(TokioDatagramProvider::new(Vec::new())))
             .config(NodeConfig {
-                bind: BindOptions {
-                    local_addr: "[::1]:0".parse().unwrap(),
-                },
+                bind: BindOptions { port: 0 },
                 virtual_ipv4: Some(Ipv4Addr::new(10, 254, 0, 3)),
                 ..NodeConfig::default()
             })
@@ -2705,23 +3070,37 @@ mod tests {
             .identity(identity_b.clone())
             .datagram_provider(Arc::new(TokioDatagramProvider::new(Vec::new())))
             .config(NodeConfig {
-                bind: BindOptions {
-                    local_addr: "[::1]:0".parse().unwrap(),
-                },
+                bind: BindOptions { port: 0 },
                 virtual_ipv4: Some(Ipv4Addr::new(10, 254, 0, 4)),
                 ..NodeConfig::default()
             })
             .build()
             .await
             .unwrap();
-        let address_a = SocketAddr::new(
-            IpAddr::V6(Ipv6Addr::LOCALHOST),
-            node_a.local_addr().unwrap().port(),
-        );
-        let address_b = SocketAddr::new(
-            IpAddr::V6(Ipv6Addr::LOCALHOST),
-            node_b.local_addr().unwrap().port(),
-        );
+        assert_eq!(node_a.local_addrs().unwrap().len(), 2);
+        assert_eq!(node_b.local_addrs().unwrap().len(), 2);
+        let Some(address_a) =
+            node_a
+                .local_candidates()
+                .into_iter()
+                .find_map(|candidate| match candidate {
+                    Candidate::Host(address) if address.is_ipv6() => Some(address),
+                    _ => None,
+                })
+        else {
+            return;
+        };
+        let Some(address_b) =
+            node_b
+                .local_candidates()
+                .into_iter()
+                .find_map(|candidate| match candidate {
+                    Candidate::Host(address) if address.is_ipv6() => Some(address),
+                    _ => None,
+                })
+        else {
+            return;
+        };
         node_a
             .register_peer(peer_info(
                 &identity_b,
@@ -2792,7 +3171,7 @@ mod tests {
             )])))
             .config(NodeConfig {
                 bind: BindOptions {
-                    local_addr: address,
+                    port: address.port(),
                 },
                 network_id,
                 server_public_key: Some(signer.public()),

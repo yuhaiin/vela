@@ -8,7 +8,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn usage() -> ! {
     eprintln!(
-        "Usage:\n  vela-cli identity <path>\n  vela-cli server --path <dir> --bind <addr> --tenant <name> [--doh <https-url>] [--stun <host:port>] [--admin-password-stdin]\n  vela-cli invite --path <dir> --tenant <name> [--ttl <seconds>]\n  vela-cli peers --path <dir> --tenant <name>\n  vela-cli revoke <node-id> --path <dir> --tenant <name>\n  vela-cli admin password reset --path <dir> [--password-stdin]\n  vela-cli peer register --state <dir> --server <url> --server-key <base64> --invite <token> [--bind <addr>] [--stun <host:port>]\n  vela-cli peer run --state <dir> [--bind <addr>] [--stun <host:port>]\n  vela-cli peer up --state <dir> [--tun <name>] [--mtu <bytes>] [--bind <addr>] [--stun <host:port>]\n  vela-cli peer list --state <dir> [--json]\n  vela-cli peer ping <node-id> --state <dir> [--count <n>] [--timeout <duration>] [--json]\n\nServer path defaults: <path>/vela.db, <path>/server.key, <path>/admin.credentials.\nThe server DoH/STUN settings can also be changed from the admin web page.\nLegacy --db/--signer and --admin-credentials overrides are still accepted."
+        "Usage:\n  vela-cli identity <path>\n  vela-cli server --path <dir> --bind <addr> --tenant <name> [--doh <https-url>] [--stun <host:port>] [--admin-password-stdin]\n  vela-cli invite --path <dir> --tenant <name> [--ttl <seconds>]\n  vela-cli peers --path <dir> --tenant <name>\n  vela-cli revoke <node-id> --path <dir> --tenant <name>\n  vela-cli admin password reset --path <dir> [--password-stdin]\n  vela-cli peer register --state <dir> --server <url> --server-key <base64> --invite <token> [--port <port>] [--stun <host:port>]\n  vela-cli peer run --state <dir> [--port <port>] [--stun <host:port>]\n  vela-cli peer up --state <dir> [--tun <name>] [--mtu <bytes>] [--port <port>] [--stun <host:port>]\n  vela-cli peer list --state <dir> [--json]\n  vela-cli peer ping <node-id> --state <dir> [--count <n>] [--timeout <duration>] [--json]\n\nServer path defaults: <path>/vela.db, <path>/server.key, <path>/admin.credentials.\nThe server DoH/STUN settings can also be changed from the admin web page.\nLegacy --db/--signer and --admin-credentials overrides are still accepted."
     );
     eprintln!("  vela-cli peer status --state <dir> [--json]");
     std::process::exit(2);
@@ -57,8 +57,8 @@ fn decode_server_key(value: &str) -> Result<[u8; 32], String> {
         .map_err(|_| "server key must decode to 32 bytes".to_owned())
 }
 
-fn bind_option(args: &[String]) -> Result<Option<SocketAddr>, Box<dyn std::error::Error>> {
-    option(args, "--bind")
+fn port_option(args: &[String]) -> Result<Option<u16>, Box<dyn std::error::Error>> {
+    option(args, "--port")
         .map(|value| value.parse().map_err(Into::into))
         .transpose()
 }
@@ -143,10 +143,10 @@ async fn run_peer_command(args: &[String]) -> Result<(), Box<dyn std::error::Err
             let server = required(args, "--server");
             let server_key = decode_server_key(&required(args, "--server-key"))?;
             let invite = required(args, "--invite");
-            let bind = bind_option(args)?.unwrap_or_else(|| "[::]:0".parse().unwrap());
+            let port = port_option(args)?.unwrap_or(0);
             let stun = options(args, "--stun");
             let state =
-                vela_diagnostic::register(&state_dir, server, server_key, &invite, bind, stun)
+                vela_diagnostic::register(&state_dir, server, server_key, &invite, port, stun)
                     .await?;
             let identity = Identity::load(PeerState::identity_path(&state_dir))?;
             println!("registered {}", identity.public().node_id);
@@ -161,11 +161,11 @@ async fn run_peer_command(args: &[String]) -> Result<(), Box<dyn std::error::Err
             } else {
                 Some(stun_values)
             };
-            let peer = DiagnosticPeer::open(&state_dir, bind_option(args)?, stun).await?;
+            let peer = DiagnosticPeer::open(&state_dir, port_option(args)?, stun).await?;
             println!(
-                "peer {} ready on {}",
+                "peer {} ready on {:?}",
                 peer.node_id(),
-                peer.node.local_addr()?
+                peer.node.local_addrs()?
             );
             peer.run().await?;
         }
@@ -184,7 +184,7 @@ async fn run_peer_command(args: &[String]) -> Result<(), Box<dyn std::error::Err
                 } else {
                     Some(stun_values)
                 };
-                let peer = DiagnosticPeer::open(&state_dir, bind_option(args)?, stun).await?;
+                let peer = DiagnosticPeer::open(&state_dir, port_option(args)?, stun).await?;
                 let snapshot = peer
                     .state
                     .snapshot
@@ -254,7 +254,7 @@ async fn run_peer_command(args: &[String]) -> Result<(), Box<dyn std::error::Err
             } else {
                 println!("node\t{}", status.node_id);
                 println!("server\t{}", status.server);
-                println!("bind\t{}", status.bind);
+                println!("local_addrs\t{:?}", status.local_addrs);
                 println!("doh_servers\t{:?}", status.doh_servers);
                 println!("stun_servers\t{:?}", status.stun_servers);
                 println!("candidates\t{:?}", status.candidates);
@@ -365,7 +365,7 @@ async fn run_tun_peer(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let node = peer.node.clone();
     let mut peer = Some(peer);
-    let mut refresh = tokio::time::interval(Duration::from_secs(60));
+    let mut refresh = tokio::time::interval(vela_diagnostic::CANDIDATE_REFRESH_INTERVAL);
     let mut control_connected = true;
     let mut reconnect_backoff = Duration::from_secs(1);
     let mut reconnect_sleep = Box::pin(tokio::time::sleep(Duration::ZERO));
@@ -471,6 +471,9 @@ async fn run_tun_peer(
                         path = %path,
                         "peer path changed"
                     ),
+                    Some(vela_core::VelaEvent::TransportFailed { family, error }) => {
+                        return Err(format!("UDP transport failed ({family:?}): {error}").into());
+                    }
                     None => return Err("Vela node stopped".into()),
                 }
             }
@@ -738,5 +741,13 @@ mod tests {
             tun_send_disposition(&vela_core::SendError::SnapshotExpired),
             TunSendDisposition::Reconnect
         );
+    }
+
+    #[test]
+    fn legacy_peer_bind_argument_is_ignored() {
+        let args = vec!["--bind".to_owned(), "192.0.2.10:40000".to_owned()];
+        assert_eq!(port_option(&args).unwrap(), None);
+        let args = vec!["--port".to_owned(), "40000".to_owned()];
+        assert_eq!(port_option(&args).unwrap(), Some(40000));
     }
 }
