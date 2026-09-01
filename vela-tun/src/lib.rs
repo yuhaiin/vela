@@ -519,10 +519,9 @@ mod platform {
 
     fn host_route(address: IpAddr, interface_index: u32) -> route_manager::Route {
         let prefix_len = if address.is_ipv4() { 32 } else { 128 };
-        let route = route_manager::Route::new(address, prefix_len).with_if_index(interface_index);
-        #[cfg(target_os = "macos")]
-        let route = route.with_if_scope(true);
-        route
+        // Keep the route attached to the TUN interface, but leave
+        // RTF_IFSCOPE unset so normal route lookups can select it.
+        route_manager::Route::new(address, prefix_len).with_if_index(interface_index)
     }
 
     impl RouteManager {
@@ -627,7 +626,7 @@ mod platform {
             assert_eq!(route.gateway(), None);
             assert_eq!(route.if_index(), Some(7));
             #[cfg(target_os = "macos")]
-            assert!(route.if_scope());
+            assert!(!route.if_scope());
         }
     }
 
