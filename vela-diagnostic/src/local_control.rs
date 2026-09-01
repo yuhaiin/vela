@@ -117,7 +117,10 @@ impl LocalControlServer {
 
         #[cfg(unix)]
         let (socket_path, socket_listener, transport) = {
-            let socket_path = state_dir.join(CONTROL_SOCKET);
+            let socket_path = control_socket_path(state_dir);
+            if let Some(parent) = socket_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
             if socket_path.exists() {
                 fs::remove_file(&socket_path)?;
             }
@@ -204,6 +207,17 @@ fn random_token() -> String {
     let mut token = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut token);
     base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, token)
+}
+
+#[cfg(target_os = "linux")]
+fn control_socket_path(_state_dir: &Path) -> PathBuf {
+    let uid = unsafe { libc::getuid() };
+    PathBuf::from(format!("/run/user/{uid}/vela")).join(CONTROL_SOCKET)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn control_socket_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(CONTROL_SOCKET)
 }
 
 fn write_endpoint(path: &Path, endpoint: &ControlEndpoint) -> Result<(), DiagnosticError> {
@@ -514,7 +528,7 @@ impl LocalControlClient {
         #[cfg(unix)]
         {
             Ok(Self {
-                socket_path: state_dir.join(CONTROL_SOCKET),
+                socket_path: control_socket_path(state_dir),
                 token: None,
             })
         }
