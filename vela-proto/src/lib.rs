@@ -75,6 +75,85 @@ mod node_id_serde {
     }
 }
 
+fn decode_base64_or_legacy<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Representation {
+        Base64(String),
+        Legacy(Vec<u8>),
+    }
+
+    match Representation::deserialize(deserializer)? {
+        Representation::Base64(value) => BASE64.decode(value).map_err(serde::de::Error::custom),
+        Representation::Legacy(value) => Ok(value),
+    }
+}
+
+pub mod base64_16_serde {
+    use super::*;
+
+    pub fn serialize<S>(value: &[u8; 16], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&BASE64.encode(value))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 16], D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        decode_base64_or_legacy(deserializer)?
+            .try_into()
+            .map_err(|value: Vec<u8>| {
+                serde::de::Error::custom(format!("expected 16 bytes, got {}", value.len()))
+            })
+    }
+}
+
+pub mod base64_32_serde {
+    use super::*;
+
+    pub fn serialize<S>(value: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&BASE64.encode(value))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        decode_base64_or_legacy(deserializer)?
+            .try_into()
+            .map_err(|value: Vec<u8>| {
+                serde::de::Error::custom(format!("expected 32 bytes, got {}", value.len()))
+            })
+    }
+}
+
+pub mod base64_bytes_serde {
+    use super::*;
+
+    pub fn serialize<S>(value: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&BASE64.encode(value))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        decode_base64_or_legacy(deserializer)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Candidate {
     Host(SocketAddr),
@@ -100,6 +179,7 @@ pub enum PacketType {
     KeepAlive = 5,
     DiagnosticPing = 6,
     DiagnosticPong = 7,
+    KeepAliveAck = 8,
 }
 
 impl TryFrom<u8> for PacketType {
@@ -114,6 +194,7 @@ impl TryFrom<u8> for PacketType {
             5 => Ok(Self::KeepAlive),
             6 => Ok(Self::DiagnosticPing),
             7 => Ok(Self::DiagnosticPong),
+            8 => Ok(Self::KeepAliveAck),
             _ => Err(ProtoError::UnknownPacketType(value)),
         }
     }
@@ -220,6 +301,7 @@ impl WirePacket {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PublicPeerInfo {
     pub node_id: NodeId,
+    pub incarnation: u64,
     pub signing_public: String,
     pub noise_public: String,
     pub candidates: Vec<Candidate>,
@@ -251,11 +333,15 @@ pub struct PeerSummary {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PeerInfo {
     pub node_id: NodeId,
+    pub incarnation: u64,
+    #[serde(with = "base64_32_serde")]
     pub signing_public: [u8; 32],
+    #[serde(with = "base64_32_serde")]
     pub noise_public: [u8; 32],
     pub candidates: Vec<Candidate>,
     pub virtual_ipv4: Option<Ipv4Addr>,
     pub virtual_ipv6: Option<Ipv6Addr>,
+    #[serde(with = "base64_bytes_serde")]
     pub credential: Vec<u8>,
     pub capabilities: Vec<PeerCapability>,
 }
@@ -275,6 +361,7 @@ impl TryFrom<PublicPeerInfo> for PeerInfo {
             .map_err(|_| ProtoError::InvalidEncoding)?;
         Ok(Self {
             node_id: value.node_id,
+            incarnation: value.incarnation,
             signing_public: signing_public
                 .try_into()
                 .map_err(|_| ProtoError::InvalidEncoding)?,
@@ -304,6 +391,7 @@ pub struct Ipv6Cidr {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NetworkSnapshot {
+    #[serde(with = "base64_16_serde")]
     pub network_id: [u8; 16],
     pub generation: u64,
     pub virtual_ipv4: Option<Ipv4Cidr>,
@@ -317,7 +405,10 @@ pub struct NetworkSnapshot {
     #[serde(default)]
     pub stun_servers: Vec<String>,
     pub peers: Vec<PeerInfo>,
+    #[serde(default)]
+    pub online_peers: Vec<NodeId>,
     pub expires_at: u64,
+    #[serde(with = "base64_bytes_serde")]
     pub signature: Vec<u8>,
 }
 
@@ -384,20 +475,25 @@ impl NetworkSnapshot {
                 }
             }
         }
+        let peer_ids = self
+            .peers
+            .iter()
+            .map(|peer| peer.node_id)
+            .collect::<std::collections::HashSet<_>>();
+        let mut online_ids = std::collections::HashSet::new();
+        for node_id in &self.online_peers {
+            if !peer_ids.contains(node_id) || !online_ids.insert(*node_id) {
+                return Err(ProtoError::InvalidSnapshot(
+                    "invalid or duplicate online peer".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
     pub fn unsigned_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(128);
-        // Keep old snapshots verifiable while using a new payload version for
-        // coordinator-managed DoH configuration.
-        if self.doh_servers.is_empty() && self.stun_servers.is_empty() {
-            out.extend_from_slice(b"VELA-NETWORK-SNAPSHOT-v1");
-        } else if self.doh_servers.is_empty() {
-            out.extend_from_slice(b"VELA-NETWORK-SNAPSHOT-v2");
-        } else {
-            out.extend_from_slice(b"VELA-NETWORK-SNAPSHOT-v3");
-        }
+        out.extend_from_slice(b"VELA-NETWORK-SNAPSHOT-v4");
         out.extend_from_slice(&self.network_id);
         out.extend_from_slice(&self.generation.to_be_bytes());
         encode_ipv4_cidr(&mut out, self.virtual_ipv4);
@@ -419,6 +515,7 @@ impl NetworkSnapshot {
         peers.sort_by_key(|peer| peer.node_id);
         for peer in peers {
             out.extend_from_slice(peer.node_id.as_bytes());
+            out.extend_from_slice(&peer.incarnation.to_be_bytes());
             out.extend_from_slice(&peer.signing_public);
             out.extend_from_slice(&peer.noise_public);
             match peer.virtual_ipv4 {
@@ -445,6 +542,12 @@ impl NetworkSnapshot {
             for capability in peer.capabilities {
                 out.push(capability as u8);
             }
+        }
+        let mut online_peers = self.online_peers.clone();
+        online_peers.sort_unstable();
+        out.extend_from_slice(&(online_peers.len() as u32).to_be_bytes());
+        for node_id in online_peers {
+            out.extend_from_slice(node_id.as_bytes());
         }
         out.extend_from_slice(&self.expires_at.to_be_bytes());
         out
@@ -535,6 +638,7 @@ fn encode_socket_address(out: &mut Vec<u8>, address: SocketAddr) {
 pub enum ControlMessage {
     Register {
         node_id: NodeId,
+        incarnation: u64,
         signing_public: String,
         noise_public: String,
         credential: String,
@@ -649,5 +753,38 @@ mod tests {
             WirePacket::decode(&bytes),
             Err(ProtoError::InvalidMagic)
         ));
+    }
+
+    #[test]
+    fn binary_json_fields_use_base64_and_read_legacy_arrays() {
+        #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+        struct BinaryFields {
+            #[serde(with = "base64_16_serde")]
+            sixteen: [u8; 16],
+            #[serde(with = "base64_32_serde")]
+            thirty_two: [u8; 32],
+            #[serde(with = "base64_bytes_serde")]
+            bytes: Vec<u8>,
+        }
+
+        let expected = BinaryFields {
+            sixteen: [1; 16],
+            thirty_two: [2; 32],
+            bytes: vec![3, 4, 5],
+        };
+        let encoded = serde_json::to_value(&expected).unwrap();
+        assert_eq!(encoded["sixteen"], BASE64.encode([1; 16]));
+        assert_eq!(encoded["thirty_two"], BASE64.encode([2; 32]));
+        assert_eq!(encoded["bytes"], BASE64.encode([3, 4, 5]));
+
+        let legacy = serde_json::json!({
+            "sixteen": vec![1; 16],
+            "thirty_two": vec![2; 32],
+            "bytes": [3, 4, 5],
+        });
+        assert_eq!(
+            serde_json::from_value::<BinaryFields>(legacy).unwrap(),
+            expected
+        );
     }
 }

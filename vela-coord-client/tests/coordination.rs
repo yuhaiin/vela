@@ -60,7 +60,13 @@ async fn client_reconnects_and_reregisters_with_existing_credential() {
         .unwrap();
 
     let reconnected = client
-        .reconnect(&identity, Some(&registration.credential), Vec::new(), &[])
+        .reconnect(
+            &identity,
+            1,
+            Some(&registration.credential),
+            Vec::new(),
+            &[],
+        )
         .await
         .unwrap();
     assert_eq!(reconnected.credential.node_id, identity.public().node_id);
@@ -119,6 +125,18 @@ async fn clients_discover_online_peers_and_receive_connect_signal() {
             .iter()
             .any(|peer| peer.node_id == identity_a.public().node_id)
     );
+    assert!(
+        registration_b
+            .snapshot
+            .online_peers
+            .contains(&identity_a.public().node_id)
+    );
+    assert!(
+        registration_b
+            .snapshot
+            .online_peers
+            .contains(&identity_b.public().node_id)
+    );
 
     client_b.update_candidates(Vec::new()).await.unwrap();
     let snapshot_a = tokio::time::timeout(Duration::from_secs(1), client_a.recv())
@@ -175,14 +193,32 @@ async fn clients_discover_online_peers_and_receive_connect_signal() {
         )
         .await
         .unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), client_b.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        ControlMessage::Snapshot { .. }
+    ));
     drop(client_a_control);
     tokio::time::sleep(Duration::from_millis(20)).await;
+
+    drop(client_a);
+    let offline_snapshot = tokio::time::timeout(Duration::from_secs(1), client_b.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        offline_snapshot,
+        ControlMessage::Snapshot { ref snapshot }
+            if !snapshot.online_peers.contains(&identity_a.public().node_id)
+    ));
 
     let peers = client_b.list_peers().await.unwrap();
     assert!(
         peers
             .iter()
-            .any(|peer| { peer.node_id == identity_a.public().node_id && peer.online })
+            .any(|peer| { peer.node_id == identity_a.public().node_id && !peer.online })
     );
 
     server_task.abort();

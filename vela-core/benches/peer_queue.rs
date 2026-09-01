@@ -170,6 +170,7 @@ fn peer_info(identity: &Identity) -> PeerInfo {
     let public = identity.public();
     PeerInfo {
         node_id: public.node_id,
+        incarnation: 1,
         signing_public: public.signing_public,
         noise_public: public.noise_public,
         candidates: vec![Candidate::Host(SocketAddr::from(([127, 0, 0, 1], 9)))],

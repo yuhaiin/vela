@@ -1312,10 +1312,16 @@ mod tests {
     use vela_crypto::Identity;
     use vela_proto::{Candidate, PeerInfo};
 
-    fn peer(identity: &Identity, address: SocketAddr, virtual_address: Ipv4Addr) -> PeerInfo {
+    fn peer(
+        identity: &Identity,
+        incarnation: u64,
+        address: SocketAddr,
+        virtual_address: Ipv4Addr,
+    ) -> PeerInfo {
         let public = identity.public();
         PeerInfo {
             node_id: public.node_id,
+            incarnation,
             signing_public: public.signing_public,
             noise_public: public.noise_public,
             candidates: vec![Candidate::Host(address)],
@@ -1335,6 +1341,7 @@ mod tests {
         let virtual_b = Ipv4Addr::new(10, 254, 0, 12);
         let node_a = VelaNode::builder()
             .identity(identity_a.clone())
+            .incarnation(1)
             .datagram_provider(Arc::new(TokioDatagramProvider::new(vec![Candidate::Host(
                 address_a,
             )])))
@@ -1352,6 +1359,7 @@ mod tests {
             .unwrap();
         let node_b = VelaNode::builder()
             .identity(identity_b.clone())
+            .incarnation(2)
             .datagram_provider(Arc::new(TokioDatagramProvider::new(vec![Candidate::Host(
                 address_b,
             )])))
@@ -1368,11 +1376,11 @@ mod tests {
             .await
             .unwrap();
         node_a
-            .register_peer(peer(&identity_b, address_b, virtual_b))
+            .register_peer(peer(&identity_b, 2, address_b, virtual_b))
             .await
             .unwrap();
         node_b
-            .register_peer(peer(&identity_a, address_a, virtual_a))
+            .register_peer(peer(&identity_a, 1, address_a, virtual_a))
             .await
             .unwrap();
         node_a.start().await.unwrap();

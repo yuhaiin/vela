@@ -123,6 +123,7 @@ impl CoordServer {
                 node_id BLOB PRIMARY KEY,
                 signing_public BLOB NOT NULL,
                 noise_public BLOB NOT NULL,
+                incarnation INTEGER NOT NULL DEFAULT 0,
                 candidates TEXT NOT NULL,
                 virtual_ipv4 BLOB,
                 virtual_ipv6 BLOB,
@@ -166,6 +167,10 @@ impl CoordServer {
         );
         let _ = connection.execute(
             "ALTER TABLE peers ADD COLUMN last_seen INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = connection.execute(
+            "ALTER TABLE peers ADD COLUMN incarnation INTEGER NOT NULL DEFAULT 0",
             [],
         );
         let _ = connection.execute("ALTER TABLE invites ADD COLUMN id TEXT", []);
@@ -374,12 +379,22 @@ async fn handle_socket(state: Arc<ServerInner>, socket: WebSocket) {
         }
     }
     if let Some(node_id) = registered {
-        let mut online = state.online.lock().await;
-        if let Some(sessions) = online.get_mut(&node_id) {
-            sessions.remove(&connection_id);
-            if sessions.is_empty() {
-                online.remove(&node_id);
+        let became_offline = {
+            let mut online = state.online.lock().await;
+            if let Some(sessions) = online.get_mut(&node_id) {
+                sessions.remove(&connection_id);
+                if sessions.is_empty() {
+                    online.remove(&node_id);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
             }
+        };
+        if became_offline && bump_snapshot(&state).is_ok() {
+            let _ = broadcast_snapshot(&state).await;
         }
     }
     heartbeat_task.abort();
@@ -396,6 +411,7 @@ async fn handle_message(
     match request {
         ControlMessage::Register {
             node_id,
+            incarnation,
             signing_public,
             noise_public,
             credential,
@@ -446,45 +462,53 @@ async fn handle_message(
                     .ok_or(CoordError::PeerNotRegistered)?;
                 (credential, None)
             };
+            let previous_peer = load_peer(state, node_id)?;
             let peer = StoredPeer {
                 node_id,
+                incarnation,
                 name: String::new(),
                 signing_public,
                 noise_public,
                 candidates,
-                virtual_ipv4: load_peer(state, node_id)?
+                virtual_ipv4: previous_peer
+                    .as_ref()
                     .and_then(|peer| peer.virtual_ipv4)
                     .or(Some(allocate_virtual_ipv4(state, node_id)?)),
                 virtual_ipv6: None,
                 credential: stored_credential.clone(),
                 capabilities,
             };
+            let peer_changed = previous_peer.as_ref().is_none_or(|previous| {
+                previous.incarnation != peer.incarnation
+                    || previous.candidates != peer.candidates
+                    || previous.signing_public != peer.signing_public
+                    || previous.noise_public != peer.noise_public
+            });
             update_peer(state, &peer)?;
             if let Some(registration) = invite_registration {
                 update_peer_metadata(state, node_id, &registration.name, &registration.notes)?;
             }
             touch_peer(state, node_id)?;
             bump_snapshot(state)?;
-            let existing_senders = state
-                .online
-                .lock()
-                .await
-                .values()
-                .flat_map(|sessions| sessions.values().cloned())
-                .collect::<Vec<_>>();
-            state
-                .online
-                .lock()
-                .await
-                .entry(node_id)
-                .or_default()
-                .insert(connection_id, outbound.clone());
+            let (existing_senders, was_online) = {
+                let mut online = state.online.lock().await;
+                let was_online = online.contains_key(&node_id);
+                let existing_senders = online
+                    .values()
+                    .flat_map(|sessions| sessions.values().cloned())
+                    .collect::<Vec<_>>();
+                online
+                    .entry(node_id)
+                    .or_default()
+                    .insert(connection_id, outbound.clone());
+                (existing_senders, was_online)
+            };
             let peers = load_peers(state)?
                 .into_iter()
                 .filter(|peer| peer.node_id != node_id)
                 .map(|peer| public_peer(&peer))
                 .collect::<Result<Vec<_>, _>>()?;
-            let snapshot = network_snapshot(state)?;
+            let snapshot = network_snapshot(state, online_peer_ids(state).await)?;
             outbound
                 .send(ControlMessage::RegisterOk {
                     credential: BASE64.encode(stored_credential),
@@ -493,12 +517,14 @@ async fn handle_message(
                 })
                 .await
                 .map_err(|_| CoordError::ConnectionClosed)?;
-            for sender in existing_senders {
-                let _ = sender
-                    .send(ControlMessage::Snapshot {
-                        snapshot: snapshot.clone(),
-                    })
-                    .await;
+            if !was_online || peer_changed {
+                for sender in existing_senders {
+                    let _ = sender
+                        .send(ControlMessage::Snapshot {
+                            snapshot: snapshot.clone(),
+                        })
+                        .await;
+                }
             }
             debug!(node = %node_id, "peer registered");
             Ok(Some(node_id))
@@ -510,6 +536,7 @@ async fn handle_message(
                 state,
                 &StoredPeer {
                     node_id,
+                    incarnation: peer.incarnation,
                     name: peer.name,
                     signing_public: peer.signing_public,
                     noise_public: peer.noise_public,
@@ -728,6 +755,7 @@ fn random_token(bytes: usize) -> String {
 #[derive(Clone)]
 struct StoredPeer {
     node_id: NodeId,
+    incarnation: u64,
     name: String,
     signing_public: [u8; 32],
     noise_public: [u8; 32],
@@ -743,7 +771,7 @@ fn update_peer(state: &Arc<ServerInner>, peer: &StoredPeer) -> Result<(), CoordE
     let capabilities = serde_json::to_string(&peer.capabilities)?;
     let virtual_ipv4 = peer.virtual_ipv4.map(|address| address.octets().to_vec());
     let virtual_ipv6 = peer.virtual_ipv6.map(|address| address.octets().to_vec());
-    state.database.lock().map_err(|_| CoordError::DatabasePoisoned)?.execute("INSERT INTO peers(node_id, signing_public, noise_public, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities, revoked) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0) ON CONFLICT(node_id) DO UPDATE SET signing_public = excluded.signing_public, noise_public = excluded.noise_public, candidates = excluded.candidates, virtual_ipv4 = COALESCE(excluded.virtual_ipv4, peers.virtual_ipv4), virtual_ipv6 = COALESCE(excluded.virtual_ipv6, peers.virtual_ipv6), credential = excluded.credential, capabilities = excluded.capabilities, revoked = 0", params![peer.node_id.as_bytes().as_slice(), peer.signing_public.as_slice(), peer.noise_public.as_slice(), candidates, virtual_ipv4, virtual_ipv6, peer.credential, capabilities])?;
+    state.database.lock().map_err(|_| CoordError::DatabasePoisoned)?.execute("INSERT INTO peers(node_id, signing_public, noise_public, incarnation, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities, revoked) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0) ON CONFLICT(node_id) DO UPDATE SET signing_public = excluded.signing_public, noise_public = excluded.noise_public, incarnation = excluded.incarnation, candidates = excluded.candidates, virtual_ipv4 = COALESCE(excluded.virtual_ipv4, peers.virtual_ipv4), virtual_ipv6 = COALESCE(excluded.virtual_ipv6, peers.virtual_ipv6), credential = excluded.credential, capabilities = excluded.capabilities, revoked = 0", params![peer.node_id.as_bytes().as_slice(), peer.signing_public.as_slice(), peer.noise_public.as_slice(), peer.incarnation as i64, candidates, virtual_ipv4, virtual_ipv6, peer.credential, capabilities])?;
     Ok(())
 }
 
@@ -859,11 +887,11 @@ fn load_peer(state: &Arc<ServerInner>, node_id: NodeId) -> Result<Option<StoredP
         .database
         .lock()
         .map_err(|_| CoordError::DatabasePoisoned)?;
-    database.query_row("SELECT name, signing_public, noise_public, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities FROM peers WHERE node_id = ?1 AND revoked = 0", params![node_id.as_bytes().as_slice()], |row| {
-        let name: String = row.get(0)?; let signing: Vec<u8> = row.get(1)?; let noise: Vec<u8> = row.get(2)?; let candidates: String = row.get(3)?; let virtual_ipv4: Option<Vec<u8>> = row.get(4)?; let virtual_ipv6: Option<Vec<u8>> = row.get(5)?; let credential: Vec<u8> = row.get(6)?; let capabilities: String = row.get(7)?;
-        Ok((name, signing, noise, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities))
-    }).optional()?.map(|(name, signing, noise, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities)| {
-        Ok(StoredPeer { node_id, name, signing_public: signing.try_into().map_err(|_| CoordError::InvalidPeer)?, noise_public: noise.try_into().map_err(|_| CoordError::InvalidPeer)?, candidates: serde_json::from_str(&candidates)?, virtual_ipv4: decode_ipv4(virtual_ipv4)?, virtual_ipv6: decode_ipv6(virtual_ipv6)?, credential, capabilities: serde_json::from_str(&capabilities)? })
+    database.query_row("SELECT name, signing_public, noise_public, incarnation, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities FROM peers WHERE node_id = ?1 AND revoked = 0", params![node_id.as_bytes().as_slice()], |row| {
+        let name: String = row.get(0)?; let signing: Vec<u8> = row.get(1)?; let noise: Vec<u8> = row.get(2)?; let incarnation: i64 = row.get(3)?; let candidates: String = row.get(4)?; let virtual_ipv4: Option<Vec<u8>> = row.get(5)?; let virtual_ipv6: Option<Vec<u8>> = row.get(6)?; let credential: Vec<u8> = row.get(7)?; let capabilities: String = row.get(8)?;
+        Ok((name, signing, noise, incarnation, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities))
+    }).optional()?.map(|(name, signing, noise, incarnation, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities)| {
+        Ok(StoredPeer { node_id, incarnation: incarnation as u64, name, signing_public: signing.try_into().map_err(|_| CoordError::InvalidPeer)?, noise_public: noise.try_into().map_err(|_| CoordError::InvalidPeer)?, candidates: serde_json::from_str(&candidates)?, virtual_ipv4: decode_ipv4(virtual_ipv4)?, virtual_ipv6: decode_ipv6(virtual_ipv6)?, credential, capabilities: serde_json::from_str(&capabilities)? })
     }).transpose()
 }
 
@@ -873,7 +901,7 @@ fn load_peers(state: &Arc<ServerInner>) -> Result<Vec<StoredPeer>, CoordError> {
         .lock()
         .map_err(|_| CoordError::DatabasePoisoned)?;
     let mut statement = database.prepare(
-        "SELECT node_id, name, signing_public, noise_public, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities
+        "SELECT node_id, name, signing_public, noise_public, incarnation, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities
          FROM peers WHERE revoked = 0 ORDER BY node_id",
     )?;
     let rows = statement.query_map([], |row| {
@@ -881,16 +909,18 @@ fn load_peers(state: &Arc<ServerInner>) -> Result<Vec<StoredPeer>, CoordError> {
         let name: String = row.get(1)?;
         let signing: Vec<u8> = row.get(2)?;
         let noise: Vec<u8> = row.get(3)?;
-        let candidates: String = row.get(4)?;
-        let virtual_ipv4: Option<Vec<u8>> = row.get(5)?;
-        let virtual_ipv6: Option<Vec<u8>> = row.get(6)?;
-        let credential: Vec<u8> = row.get(7)?;
-        let capabilities: String = row.get(8)?;
+        let incarnation: i64 = row.get(4)?;
+        let candidates: String = row.get(5)?;
+        let virtual_ipv4: Option<Vec<u8>> = row.get(6)?;
+        let virtual_ipv6: Option<Vec<u8>> = row.get(7)?;
+        let credential: Vec<u8> = row.get(8)?;
+        let capabilities: String = row.get(9)?;
         Ok((
             node_id,
             name,
             signing,
             noise,
+            incarnation,
             candidates,
             virtual_ipv4,
             virtual_ipv6,
@@ -904,6 +934,7 @@ fn load_peers(state: &Arc<ServerInner>) -> Result<Vec<StoredPeer>, CoordError> {
             name,
             signing,
             noise,
+            incarnation,
             candidates,
             virtual_ipv4,
             virtual_ipv6,
@@ -919,6 +950,7 @@ fn load_peers(state: &Arc<ServerInner>) -> Result<Vec<StoredPeer>, CoordError> {
             signing_public: signing
                 .try_into()
                 .map_err(|_| rusqlite::Error::InvalidQuery)?,
+            incarnation: incarnation as u64,
             noise_public: noise
                 .try_into()
                 .map_err(|_| rusqlite::Error::InvalidQuery)?,
@@ -938,6 +970,7 @@ fn load_peers(state: &Arc<ServerInner>) -> Result<Vec<StoredPeer>, CoordError> {
 fn public_peer(peer: &StoredPeer) -> Result<PublicPeerInfo, CoordError> {
     Ok(PublicPeerInfo {
         node_id: peer.node_id,
+        incarnation: peer.incarnation,
         signing_public: BASE64.encode(peer.signing_public),
         noise_public: BASE64.encode(peer.noise_public),
         candidates: peer.candidates.clone(),
@@ -951,6 +984,7 @@ fn public_peer(peer: &StoredPeer) -> Result<PublicPeerInfo, CoordError> {
 fn private_peer(peer: &StoredPeer) -> PeerInfo {
     PeerInfo {
         node_id: peer.node_id,
+        incarnation: peer.incarnation,
         signing_public: peer.signing_public,
         noise_public: peer.noise_public,
         candidates: peer.candidates.clone(),
@@ -1051,7 +1085,10 @@ pub(crate) async fn update_network_config(
     Ok(())
 }
 
-fn network_snapshot(state: &Arc<ServerInner>) -> Result<NetworkSnapshot, CoordError> {
+fn network_snapshot(
+    state: &Arc<ServerInner>,
+    online_peers: Vec<NodeId>,
+) -> Result<NetworkSnapshot, CoordError> {
     let digest = blake3::hash(state.tenant.as_bytes());
     let mut network_id = [0u8; 16];
     network_id.copy_from_slice(&digest.as_bytes()[..16]);
@@ -1070,6 +1107,7 @@ fn network_snapshot(state: &Arc<ServerInner>) -> Result<NetworkSnapshot, CoordEr
         doh_servers: config.doh_servers,
         stun_servers: config.stun_servers,
         peers,
+        online_peers,
         expires_at: unix_time().saturating_add(3600),
         signature: Vec::new(),
     }))
@@ -1097,14 +1135,17 @@ fn bump_snapshot(state: &Arc<ServerInner>) -> Result<(), CoordError> {
 }
 
 async fn broadcast_snapshot(state: &Arc<ServerInner>) -> Result<(), CoordError> {
-    let snapshot = network_snapshot(state)?;
-    let senders = state
-        .online
-        .lock()
-        .await
-        .values()
-        .flat_map(|sessions| sessions.values().cloned())
-        .collect::<Vec<_>>();
+    let (senders, online_peers) = {
+        let online = state.online.lock().await;
+        (
+            online
+                .values()
+                .flat_map(|sessions| sessions.values().cloned())
+                .collect::<Vec<_>>(),
+            online.keys().copied().collect::<Vec<_>>(),
+        )
+    };
+    let snapshot = network_snapshot(state, online_peers)?;
     for sender in senders {
         sender
             .send(ControlMessage::Snapshot {
@@ -1114,6 +1155,13 @@ async fn broadcast_snapshot(state: &Arc<ServerInner>) -> Result<(), CoordError> 
             .map_err(|_| CoordError::ConnectionClosed)?;
     }
     Ok(())
+}
+
+async fn online_peer_ids(state: &Arc<ServerInner>) -> Vec<NodeId> {
+    let online = state.online.lock().await;
+    let mut peers = online.keys().copied().collect::<Vec<_>>();
+    peers.sort_unstable();
+    peers
 }
 
 fn allocate_virtual_ipv4(
@@ -1324,6 +1372,7 @@ mod tests {
             .unwrap();
         let peer = StoredPeer {
             node_id: public.node_id,
+            incarnation: 1,
             name: String::new(),
             signing_public: public.signing_public,
             noise_public: public.noise_public,
@@ -1406,7 +1455,7 @@ mod tests {
             vec!["stun.example.test:3478".to_owned()],
         )
         .unwrap();
-        let snapshot = network_snapshot(&server.inner).unwrap();
+        let snapshot = network_snapshot(&server.inner, Vec::new()).unwrap();
         assert_eq!(snapshot.doh_servers, vela_dns::default_servers());
         assert_eq!(snapshot.stun_servers, vec!["stun.example.test:3478"]);
         vela_crypto::verify_snapshot(&snapshot, &server.server_public_key(), unix_time()).unwrap();
@@ -1434,7 +1483,7 @@ mod tests {
             vec!["[2001:db8::1]:3478".to_owned()],
         )
         .unwrap();
-        let snapshot = network_snapshot(&server.inner).unwrap();
+        let snapshot = network_snapshot(&server.inner, Vec::new()).unwrap();
         assert_eq!(
             snapshot.doh_servers,
             vec!["https://resolver.example.test/dns-query"]
@@ -1450,7 +1499,7 @@ mod tests {
             &credentials_path,
         )
         .unwrap();
-        let reopened_snapshot = network_snapshot(&reopened.inner).unwrap();
+        let reopened_snapshot = network_snapshot(&reopened.inner, Vec::new()).unwrap();
         assert_eq!(reopened_snapshot.doh_servers, snapshot.doh_servers);
         assert_eq!(reopened_snapshot.stun_servers, snapshot.stun_servers);
         let _ = std::fs::remove_file(db);
@@ -1474,6 +1523,7 @@ mod tests {
             &server.inner,
             &StoredPeer {
                 node_id: public.node_id,
+                incarnation: 1,
                 name: String::new(),
                 signing_public: public.signing_public,
                 noise_public: public.noise_public,
@@ -1493,7 +1543,7 @@ mod tests {
         assert!(virtual_ipv4_host(address).is_some());
         assert_ne!(address, Ipv4Addr::new(100, 74, 105, 149));
 
-        let snapshot = network_snapshot(&reopened.inner).unwrap();
+        let snapshot = network_snapshot(&reopened.inner, Vec::new()).unwrap();
         assert_eq!(
             snapshot.virtual_ipv4,
             Some(Ipv4Cidr {
@@ -1578,7 +1628,9 @@ mod tests {
             serde_json::json!(["https://dns.example.test/dns-query"])
         );
         assert_eq!(
-            network_snapshot(&server.inner).unwrap().stun_servers,
+            network_snapshot(&server.inner, Vec::new())
+                .unwrap()
+                .stun_servers,
             vec!["stun.example.test:3478"]
         );
 
@@ -1628,6 +1680,7 @@ mod tests {
             &server.inner,
             &StoredPeer {
                 node_id: public.node_id,
+                incarnation: 1,
                 name: String::new(),
                 signing_public: public.signing_public,
                 noise_public: public.noise_public,

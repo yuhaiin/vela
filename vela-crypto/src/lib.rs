@@ -32,7 +32,9 @@ pub struct Identity {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PublicIdentity {
     pub node_id: NodeId,
+    #[serde(with = "vela_proto::base64_32_serde")]
     pub signing_public: [u8; 32],
+    #[serde(with = "vela_proto::base64_32_serde")]
     pub noise_public: [u8; 32],
 }
 
@@ -125,12 +127,16 @@ impl Identity {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MembershipCredential {
     pub node_id: NodeId,
+    #[serde(with = "vela_proto::base64_32_serde")]
     pub signing_public: [u8; 32],
+    #[serde(with = "vela_proto::base64_32_serde")]
     pub noise_public: [u8; 32],
     pub tenant: String,
     pub issued_at: u64,
     pub expires_at: u64,
+    #[serde(with = "vela_proto::base64_32_serde")]
     pub server_key_id: [u8; 32],
+    #[serde(with = "vela_proto::base64_bytes_serde")]
     pub signature: Vec<u8>,
 }
 
@@ -510,6 +516,7 @@ mod tests {
             stun_servers: Vec::new(),
             peers: vec![PeerInfo {
                 node_id: public.node_id,
+                incarnation: 1,
                 signing_public: public.signing_public,
                 noise_public: public.noise_public,
                 candidates: Vec::new(),
@@ -518,6 +525,7 @@ mod tests {
                 credential: Vec::new(),
                 capabilities: Vec::new(),
             }],
+            online_peers: vec![public.node_id],
             expires_at: unix_time() + 60,
             signature: Vec::new(),
         };

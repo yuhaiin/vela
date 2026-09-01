@@ -165,6 +165,7 @@ impl CoordinationClient {
     pub async fn reconnect(
         &mut self,
         identity: &Identity,
+        incarnation: u64,
         credential: Option<&MembershipCredential>,
         candidates: Vec<Candidate>,
         doh_servers: &[String],
@@ -180,7 +181,7 @@ impl CoordinationClient {
             replacement.trust_server_key(server_public_key);
         }
         let registration = replacement
-            .register(identity, None, credential, candidates)
+            .register_with_incarnation(identity, incarnation, None, credential, candidates)
             .await?;
         *self = replacement;
         Ok(registration)
@@ -197,6 +198,22 @@ impl CoordinationClient {
         credential: Option<&MembershipCredential>,
         candidates: Vec<Candidate>,
     ) -> Result<Registration, CoordClientError> {
+        let mut incarnation = rand::random();
+        while incarnation == 0 {
+            incarnation = rand::random();
+        }
+        self.register_with_incarnation(identity, incarnation, token, credential, candidates)
+            .await
+    }
+
+    pub async fn register_with_incarnation(
+        &mut self,
+        identity: &Identity,
+        incarnation: u64,
+        token: Option<&str>,
+        credential: Option<&MembershipCredential>,
+        candidates: Vec<Candidate>,
+    ) -> Result<Registration, CoordClientError> {
         let public = identity.public();
         let credential = match credential {
             Some(value) => {
@@ -206,6 +223,7 @@ impl CoordinationClient {
         };
         self.send(ControlMessage::Register {
             node_id: public.node_id,
+            incarnation,
             signing_public: BASE64.encode(public.signing_public),
             noise_public: BASE64.encode(public.noise_public),
             credential,

@@ -33,6 +33,7 @@ fn default_doh_servers() -> Vec<String> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerState {
     pub server: String,
+    #[serde(with = "vela_proto::base64_32_serde")]
     pub server_key: [u8; 32],
     pub credential: Option<MembershipCredential>,
     #[serde(default)]
@@ -63,7 +64,16 @@ impl PeerState {
 
     pub fn load(dir: impl AsRef<Path>) -> Result<Self, DiagnosticError> {
         let data = fs::read(dir.as_ref().join(STATE_FILE))?;
-        Ok(serde_json::from_slice(&data)?)
+        let mut value: serde_json::Value = serde_json::from_slice(&data)?;
+        if is_legacy_snapshot(&value) {
+            if let Some(state) = value.as_object_mut() {
+                // The persisted snapshot is only a cache. Its old signature
+                // and peer schema must not be treated as an authoritative
+                // network view after a protocol upgrade.
+                state.insert("snapshot".to_owned(), serde_json::Value::Null);
+            }
+        }
+        Ok(serde_json::from_value(value)?)
     }
 
     pub fn save(&self, dir: impl AsRef<Path>) -> Result<(), DiagnosticError> {
@@ -79,6 +89,17 @@ impl PeerState {
     pub fn identity_path(dir: impl AsRef<Path>) -> PathBuf {
         dir.as_ref().join(IDENTITY_FILE)
     }
+}
+
+fn is_legacy_snapshot(state: &serde_json::Value) -> bool {
+    let Some(snapshot) = state.get("snapshot").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    snapshot.get("online_peers").is_none()
+        || snapshot
+            .get("peers")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|peers| peers.iter().any(|peer| peer.get("incarnation").is_none()))
 }
 
 pub async fn register(
@@ -103,7 +124,13 @@ pub async fn register(
     let candidates = peer.candidates.clone();
     let registration = peer
         .client
-        .register(peer.node.identity(), Some(invite), None, candidates.clone())
+        .register_with_incarnation(
+            peer.node.identity(),
+            peer.node.incarnation(),
+            Some(invite),
+            None,
+            candidates.clone(),
+        )
         .await?;
     peer.state.credential = Some(registration.credential);
     peer.state.candidates = candidates;
@@ -217,8 +244,9 @@ impl DiagnosticPeer {
         .await?;
         let registration = peer
             .client
-            .register(
+            .register_with_incarnation(
                 peer.node.identity(),
+                peer.node.incarnation(),
                 None,
                 peer.state.credential.as_ref(),
                 peer.candidates.clone(),
@@ -385,6 +413,7 @@ impl DiagnosticPeer {
             .client
             .reconnect(
                 self.node.identity(),
+                self.node.incarnation(),
                 self.state.credential.as_ref(),
                 candidates.clone(),
                 &self.state.doh_servers,
@@ -785,6 +814,60 @@ mod tests {
         }))
         .unwrap();
         assert!(state.last_local_addrs.is_empty());
+    }
+
+    #[test]
+    fn legacy_snapshot_is_discarded_during_state_load() {
+        let directory = std::env::temp_dir().join(format!(
+            "vela-diagnostic-legacy-state-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join(STATE_FILE),
+            serde_json::to_vec(&serde_json::json!({
+                "server": "ws://127.0.0.1/ws",
+                "server_key": vec![0u8; 32],
+                "credential": null,
+                "last_local_addrs": [],
+                "doh_servers": [],
+                "stun_servers": [],
+                "manual_stun_servers": [],
+                "candidates": [],
+                "snapshot": {
+                    "network_id": vec![0u8; 16],
+                    "generation": 1,
+                    "virtual_ipv4": null,
+                    "virtual_ipv6": null,
+                    "doh_servers": [],
+                    "stun_servers": [],
+                    "peers": [{
+                        "node_id": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                        "signing_public": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                        "noise_public": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                        "candidates": [],
+                        "virtual_ipv4": null,
+                        "virtual_ipv6": null,
+                        "credential": "",
+                        "capabilities": []
+                    }],
+                    "expires_at": 1,
+                    "signature": []
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let state = PeerState::load(&directory).unwrap();
+        assert!(state.snapshot.is_none());
+
+        let _ = fs::remove_file(directory.join(STATE_FILE));
+        let _ = fs::remove_dir(directory);
     }
 
     #[test]
