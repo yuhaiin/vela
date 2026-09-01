@@ -324,6 +324,8 @@ pub struct PeerSummary {
     pub name: String,
     pub online: bool,
     #[serde(default)]
+    pub last_seen: Option<u64>,
+    #[serde(default)]
     pub virtual_ipv4: Option<Ipv4Addr>,
     #[serde(default)]
     pub virtual_ipv6: Option<Ipv6Addr>,

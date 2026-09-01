@@ -3,21 +3,24 @@
 //! This crate owns the diagnostic peer lifecycle and result contract. It does
 //! not implement a relay or a business data plane.
 
+use axum::{Json, Router, extract::State, response::Html, routing::get};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::{HashMap, HashSet},
     fs,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tokio::time::interval;
+use tokio::{net::TcpListener, sync::RwLock, time::interval};
 use tracing::{debug, warn};
 use vela_coord_client::{CoordClientError, CoordinationClient};
 use vela_core::{
-    AddressFamily, BindOptions, ConnectError, CoreError, DiagnosticPingError, DiagnosticPingResult,
-    NodeConfig, TokioDatagramProvider, VelaEvent, VelaNode,
+    AddressFamily, BindOptions, ConnectError, CoreError, DatagramProvider, DiagnosticPingError,
+    DiagnosticPingResult, NodeConfig, PeerRuntimeStatus, TokioDatagramProvider, VelaEvent,
+    VelaNode,
 };
 use vela_crypto::{CryptoError, Identity, MembershipCredential};
 use vela_proto::{Candidate, ControlMessage, NetworkSnapshot, NodeId, PeerInfo, PeerSummary};
@@ -25,6 +28,68 @@ use vela_proto::{Candidate, ControlMessage, NetworkSnapshot, NodeId, PeerInfo, P
 const STATE_FILE: &str = "state.json";
 const IDENTITY_FILE: &str = "identity";
 pub const CANDIDATE_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
+const DASHBOARD_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const DASHBOARD_PEER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+fn unix_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DashboardCoordinatorStatus {
+    pub connected: bool,
+    pub checked_at: u64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DashboardPeer {
+    pub node_id: NodeId,
+    pub name: String,
+    pub coordinator_online: bool,
+    pub coordinator_last_seen_at: Option<u64>,
+    pub virtual_ipv4: Option<std::net::Ipv4Addr>,
+    pub virtual_ipv6: Option<std::net::Ipv6Addr>,
+    pub capabilities: Vec<vela_proto::PeerCapability>,
+    pub last_status_at: Option<u64>,
+    pub direct: PeerRuntimeStatus,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DashboardSnapshot {
+    pub generated_at: u64,
+    pub node_id: NodeId,
+    pub server: String,
+    pub coordinator: DashboardCoordinatorStatus,
+    pub local_udp_addresses: Vec<SocketAddr>,
+    pub published_candidates: Vec<Candidate>,
+    pub snapshot_generation: Option<u64>,
+    pub snapshot_expires_at: Option<u64>,
+    pub credential_expires_at: Option<u64>,
+    pub peers: Vec<DashboardPeer>,
+}
+
+struct DashboardStore {
+    snapshot: RwLock<DashboardSnapshot>,
+}
+
+impl DashboardStore {
+    fn new(snapshot: DashboardSnapshot) -> Self {
+        Self {
+            snapshot: RwLock::new(snapshot),
+        }
+    }
+}
+
+async fn dashboard_page() -> Html<&'static str> {
+    Html(include_str!("dashboard.html"))
+}
+
+async fn dashboard_data(State(state): State<Arc<DashboardStore>>) -> Json<DashboardSnapshot> {
+    Json(state.snapshot.read().await.clone())
+}
 
 fn default_doh_servers() -> Vec<String> {
     vela_stun::default_doh_servers()
@@ -277,6 +342,25 @@ impl DiagnosticPeer {
             )),
             None => Arc::new(TokioDatagramProvider::new(Vec::new())),
         };
+        Self::build_with_provider(
+            state,
+            identity,
+            state_dir,
+            manual_stun_servers,
+            port,
+            provider,
+        )
+        .await
+    }
+
+    async fn build_with_provider(
+        state: PeerState,
+        identity: Identity,
+        state_dir: impl AsRef<Path>,
+        manual_stun_servers: Vec<String>,
+        port: u16,
+        provider: Arc<dyn DatagramProvider>,
+    ) -> Result<Self, DiagnosticError> {
         let local = state.snapshot.as_ref().and_then(|snapshot| {
             snapshot
                 .peers
@@ -437,6 +521,18 @@ impl DiagnosticPeer {
         Ok(snapshot)
     }
 
+    /// Ask the coordinator to notify the remote peer to start its own direct
+    /// connection attempt. The lookup response is intentionally ignored by
+    /// callers that already have the peer state; the coordinator's lookup
+    /// side effect is the bilateral probe signal.
+    pub async fn request_peer_connection(
+        &mut self,
+        peer_id: NodeId,
+    ) -> Result<(), DiagnosticError> {
+        self.client.lookup_peer(peer_id).await.map(|_| ())?;
+        Ok(())
+    }
+
     pub fn is_retryable_control_error(error: &DiagnosticError) -> bool {
         matches!(
             error,
@@ -529,9 +625,131 @@ impl DiagnosticPeer {
         ))
     }
 
-    pub async fn run(mut self) -> Result<(), DiagnosticError> {
+    pub async fn run(self) -> Result<(), DiagnosticError> {
+        self.run_loop(None).await
+    }
+
+    /// Runs the peer together with a loopback-only read-only dashboard.
+    pub async fn run_with_dashboard(self, bind: SocketAddr) -> Result<(), DiagnosticError> {
+        let mut peer = self;
+        let summaries = peer.list_peers().await?;
+        let store = Arc::new(DashboardStore::new(
+            peer.dashboard_snapshot(true, &summaries, None).await,
+        ));
+        let listener = TcpListener::bind(bind).await?;
+        let app = Router::new()
+            .route("/", get(dashboard_page))
+            .route("/api/v1/dashboard", get(dashboard_data))
+            .with_state(Arc::clone(&store));
+        let server = axum::serve(listener, app);
+        tokio::select! {
+            result = peer.run_loop(Some(store)) => result,
+            result = server => result.map_err(DiagnosticError::Io),
+        }
+    }
+
+    async fn dashboard_snapshot(
+        &self,
+        coordinator_connected: bool,
+        summaries: &[PeerSummary],
+        last_error: Option<String>,
+    ) -> DashboardSnapshot {
+        let runtime = self.node.peer_statuses().await;
+        let summary_by_id = summaries
+            .iter()
+            .map(|summary| (summary.node_id, summary))
+            .collect::<HashMap<_, _>>();
+        let peers = runtime
+            .into_iter()
+            .map(|direct| {
+                let summary = summary_by_id.get(&direct.node_id).copied();
+                let last_status_at = [
+                    summary.and_then(|summary| summary.last_seen),
+                    direct.connected_at,
+                    direct.path_changed_at,
+                    direct.attempt.as_ref().map(|attempt| attempt.started_at),
+                    direct
+                        .last_failure
+                        .as_ref()
+                        .map(|failure| failure.occurred_at),
+                ]
+                .into_iter()
+                .flatten()
+                .max();
+                DashboardPeer {
+                    node_id: direct.node_id,
+                    name: summary.map_or_else(String::new, |summary| summary.name.clone()),
+                    coordinator_online: summary.is_some_and(|summary| summary.online),
+                    coordinator_last_seen_at: summary.and_then(|summary| summary.last_seen),
+                    virtual_ipv4: direct.virtual_ipv4,
+                    virtual_ipv6: direct.virtual_ipv6,
+                    capabilities: direct.capabilities.clone(),
+                    last_status_at,
+                    direct,
+                }
+            })
+            .collect();
+        DashboardSnapshot {
+            generated_at: unix_time(),
+            node_id: self.node_id(),
+            server: self.state.server.clone(),
+            coordinator: DashboardCoordinatorStatus {
+                connected: coordinator_connected,
+                checked_at: unix_time(),
+                last_error,
+            },
+            local_udp_addresses: self.node.local_addrs().unwrap_or_default(),
+            published_candidates: self.candidates.clone(),
+            snapshot_generation: self
+                .state
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.generation),
+            snapshot_expires_at: self
+                .state
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.expires_at),
+            credential_expires_at: self
+                .state
+                .credential
+                .as_ref()
+                .map(|credential| credential.expires_at),
+            peers,
+        }
+    }
+
+    async fn publish_dashboard(
+        &self,
+        store: &DashboardStore,
+        coordinator_connected: bool,
+        summaries: &[PeerSummary],
+        last_error: Option<String>,
+    ) {
+        *store.snapshot.write().await = self
+            .dashboard_snapshot(coordinator_connected, summaries, last_error)
+            .await;
+    }
+
+    async fn run_loop(
+        mut self,
+        dashboard: Option<Arc<DashboardStore>>,
+    ) -> Result<(), DiagnosticError> {
         let mut refresh = interval(CANDIDATE_REFRESH_INTERVAL);
+        let mut dashboard_refresh = interval(DASHBOARD_REFRESH_INTERVAL);
+        let mut dashboard_peer_refresh = interval(DASHBOARD_PEER_REFRESH_INTERVAL);
         let mut control_connected = true;
+        let mut dashboard_error = None;
+        let mut pending_reconnects = HashSet::new();
+        let mut dashboard_peers = if dashboard.is_some() {
+            self.list_peers().await?
+        } else {
+            Vec::new()
+        };
+        if let Some(store) = dashboard.as_ref() {
+            self.publish_dashboard(store, true, &dashboard_peers, None)
+                .await;
+        }
         let mut reconnect_backoff = Duration::from_secs(1);
         let mut reconnect_sleep = Box::pin(tokio::time::sleep(Duration::ZERO));
         loop {
@@ -545,7 +763,19 @@ impl DiagnosticPeer {
                                 "received peer connect signal"
                             );
                             let peer = self.client.verify_public_peer(from)?;
+                            let peer_id = peer.node_id;
                             self.node.register_peer(peer).await?;
+                            let node = self.node.clone();
+                            tokio::spawn(async move {
+                                if let Err(error) = node.connect(peer_id).await {
+                                    warn!(
+                                        debug_marker = "vela-session",
+                                        peer_id = %peer_id,
+                                        error = %error,
+                                        "peer connection triggered by coordination signal failed"
+                                    );
+                                }
+                            });
                         }
                         Ok(ControlMessage::Snapshot { snapshot }) => {
                             debug!(
@@ -560,6 +790,7 @@ impl DiagnosticPeer {
                                     if !Self::is_retryable_control_error(&error) {
                                         return Err(error);
                                     }
+                                    dashboard_error = Some(error.to_string());
                                     warn!(error = %error, "coordination refresh failed; retrying");
                                     control_connected = false;
                                     reconnect_sleep.as_mut().reset(
@@ -577,6 +808,7 @@ impl DiagnosticPeer {
                             if !Self::is_retryable_control_error(&error) {
                                 return Err(error);
                             }
+                            dashboard_error = Some(error.to_string());
                             warn!(
                                 debug_marker = "vela-control",
                                 error = %error,
@@ -594,6 +826,7 @@ impl DiagnosticPeer {
                         if !Self::is_retryable_control_error(&error) {
                             return Err(error);
                         }
+                        dashboard_error = Some(error.to_string());
                         warn!(error = %error, "coordination refresh failed; retrying");
                         control_connected = false;
                         reconnect_sleep.as_mut().reset(
@@ -607,9 +840,32 @@ impl DiagnosticPeer {
                         Ok(_) => {
                             debug!(debug_marker = "vela-control", "coordination reconnect succeeded");
                             control_connected = true;
+                            dashboard_error = None;
                             reconnect_backoff = Duration::from_secs(1);
+                            let pending = std::mem::take(&mut pending_reconnects);
+                            for peer_id in pending {
+                                if let Err(error) = self.request_peer_connection(peer_id).await {
+                                    if !Self::is_retryable_control_error(&error) {
+                                        return Err(error);
+                                    }
+                                    pending_reconnects.insert(peer_id);
+                                    dashboard_error = Some(error.to_string());
+                                    warn!(
+                                        debug_marker = "vela-control",
+                                        peer_id = %peer_id,
+                                        error = %error,
+                                        "failed to flush bilateral reconnect signal"
+                                    );
+                                    control_connected = false;
+                                    reconnect_sleep.as_mut().reset(
+                                        tokio::time::Instant::now() + reconnect_backoff,
+                                    );
+                                    break;
+                                }
+                            }
                         }
                         Err(error) if Self::is_retryable_control_error(&error) => {
+                            dashboard_error = Some(error.to_string());
                             warn!(
                                 debug_marker = "vela-control",
                                 error = %error,
@@ -626,16 +882,73 @@ impl DiagnosticPeer {
                         Err(error) => return Err(error),
                     }
                 }
+                _ = dashboard_refresh.tick(), if dashboard.is_some() => {
+                    if let Some(store) = dashboard.as_ref() {
+                        self.publish_dashboard(
+                            store,
+                            control_connected,
+                            &dashboard_peers,
+                            dashboard_error.clone(),
+                        ).await;
+                    }
+                }
+                _ = dashboard_peer_refresh.tick(), if dashboard.is_some() && control_connected => {
+                    match self.list_peers().await {
+                        Ok(peers) => {
+                            dashboard_peers = peers;
+                            dashboard_error = None;
+                        }
+                        Err(error) if Self::is_retryable_control_error(&error) => {
+                            dashboard_error = Some(error.to_string());
+                            control_connected = false;
+                            reconnect_sleep.as_mut().reset(
+                                tokio::time::Instant::now() + reconnect_backoff,
+                            );
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
                 event = self.node.next_event() => {
                     match event {
                         Some(VelaEvent::TransportFailed { family, error }) => {
                             return Err(DiagnosticError::TransportFailed { family, error });
+                        }
+                        Some(VelaEvent::PeerReconnectRequested(peer_id)) => {
+                            if !control_connected {
+                                pending_reconnects.insert(peer_id);
+                                continue;
+                            }
+                            if let Err(error) = self.request_peer_connection(peer_id).await {
+                                if !Self::is_retryable_control_error(&error) {
+                                    return Err(error);
+                                }
+                                pending_reconnects.insert(peer_id);
+                                dashboard_error = Some(error.to_string());
+                                warn!(
+                                    debug_marker = "vela-control",
+                                    peer_id = %peer_id,
+                                    error = %error,
+                                    "failed to signal peer for bilateral reconnect; retrying coordination"
+                                );
+                                control_connected = false;
+                                reconnect_sleep.as_mut().reset(
+                                    tokio::time::Instant::now() + reconnect_backoff,
+                                );
+                            }
                         }
                         Some(_) => {}
                         None => return Err(DiagnosticError::TransportFailed {
                             family: None,
                             error: "Vela node stopped".to_owned(),
                         }),
+                    }
+                    if let Some(store) = dashboard.as_ref() {
+                        self.publish_dashboard(
+                            store,
+                            control_connected,
+                            &dashboard_peers,
+                            dashboard_error.clone(),
+                        ).await;
                     }
                 }
             }
@@ -800,6 +1113,236 @@ fn set_private(_path: &Path) -> Result<(), std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::sync::Mutex as StdMutex;
+    use tokio::net::TcpListener;
+    use vela_coord::CoordServer;
+    use vela_core::DatagramSocket;
+    use vela_proto::{PacketType, WirePacket};
+
+    struct RecordingProvider {
+        inner: TokioDatagramProvider,
+        sent_probes: Arc<StdMutex<Vec<SocketAddr>>>,
+    }
+
+    struct RecordingSocket {
+        inner: Arc<dyn DatagramSocket>,
+        sent_probes: Arc<StdMutex<Vec<SocketAddr>>>,
+    }
+
+    impl RecordingProvider {
+        fn new(address: SocketAddr, sent_probes: Arc<StdMutex<Vec<SocketAddr>>>) -> Self {
+            Self {
+                inner: TokioDatagramProvider::new(vec![Candidate::Host(address)]),
+                sent_probes,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DatagramProvider for RecordingProvider {
+        async fn bind(&self, options: BindOptions) -> Result<Arc<dyn DatagramSocket>, CoreError> {
+            let inner = self.inner.bind(options).await?;
+            Ok(Arc::new(RecordingSocket {
+                inner,
+                sent_probes: Arc::clone(&self.sent_probes),
+            }))
+        }
+
+        fn local_candidates(&self) -> Vec<Candidate> {
+            self.inner.local_candidates()
+        }
+    }
+
+    #[async_trait]
+    impl DatagramSocket for RecordingSocket {
+        async fn send_to(&self, bytes: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            if WirePacket::decode(bytes)
+                .ok()
+                .is_some_and(|packet| packet.header.packet_type == PacketType::Probe)
+            {
+                self.sent_probes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(target);
+            }
+            self.inner.send_to(bytes, target).await
+        }
+
+        async fn recv_from(&self, buffer: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            self.inner.recv_from(buffer).await
+        }
+
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            self.inner.local_addr()
+        }
+
+        fn local_addrs(&self) -> std::io::Result<Vec<SocketAddr>> {
+            self.inner.local_addrs()
+        }
+
+        async fn shutdown(&self) {
+            self.inner.shutdown().await;
+        }
+
+        fn failure_family(&self) -> Option<AddressFamily> {
+            self.inner.failure_family()
+        }
+    }
+
+    async fn build_registered_peer(
+        state_dir: &Path,
+        server: &str,
+        server_key: [u8; 32],
+        invite: &str,
+        identity: Identity,
+        address: SocketAddr,
+        sent_probes: Arc<StdMutex<Vec<SocketAddr>>>,
+    ) -> DiagnosticPeer {
+        let mut peer = DiagnosticPeer::build_with_provider(
+            PeerState::new(server.to_owned(), server_key, Vec::new()),
+            identity.clone(),
+            state_dir,
+            Vec::new(),
+            address.port(),
+            Arc::new(RecordingProvider::new(address, sent_probes)),
+        )
+        .await
+        .unwrap();
+        let registration = peer
+            .client
+            .register_with_incarnation(
+                peer.node.identity(),
+                peer.node.incarnation(),
+                Some(invite),
+                None,
+                peer.candidates.clone(),
+            )
+            .await
+            .unwrap();
+        peer.state.credential = Some(registration.credential);
+        peer.state.candidates = peer.candidates.clone();
+        peer.apply_snapshot(registration.snapshot).await.unwrap();
+        peer.node.start().await.unwrap();
+        peer
+    }
+
+    #[tokio::test]
+    async fn coordination_signal_starts_bilateral_probe_attempts() {
+        let base = std::env::temp_dir().join(format!(
+            "vela-diagnostic-bilateral-probe-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = base.with_extension("db");
+        let signer = base.with_extension("key");
+        let state_a = base.with_extension("a");
+        let state_b = base.with_extension("b");
+        let server = CoordServer::open(&db, &signer, "integration").unwrap();
+        let invite_a = server.create_invite(60).unwrap();
+        let invite_b = server.create_invite(60).unwrap();
+        let server_key = server.server_public_key();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_address = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move { server.serve(listener).await.unwrap() });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let address_a = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let address_b = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let sent_a = Arc::new(StdMutex::new(Vec::new()));
+        let sent_b = Arc::new(StdMutex::new(Vec::new()));
+        let server_url = format!("ws://{server_address}/ws");
+        let identity_a = Identity::generate();
+        let identity_b = Identity::generate();
+        let mut peer_a = build_registered_peer(
+            &state_a,
+            &server_url,
+            server_key,
+            &invite_a,
+            identity_a,
+            address_a,
+            Arc::clone(&sent_a),
+        )
+        .await;
+        let peer_b = build_registered_peer(
+            &state_b,
+            &server_url,
+            server_key,
+            &invite_b,
+            identity_b,
+            address_b,
+            Arc::clone(&sent_b),
+        )
+        .await;
+        let peer = peer_b
+            .state
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .peers
+            .iter()
+            .find(|peer| peer.node_id == peer_b.node_id())
+            .cloned()
+            .unwrap();
+        let node_b = peer_b.node.clone();
+        let peer_b_id = peer_b.node_id();
+        let peer_b_task = tokio::spawn(async move { peer_b.run().await });
+        peer_a.node.register_peer(peer).await.unwrap();
+        peer_a.request_peer_connection(peer_b_id).await.unwrap();
+        let node_a = peer_a.node.clone();
+        let connect_task = tokio::spawn(async move {
+            let _ = node_a.connect(peer_b_id).await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let a_sent = sent_a
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(&address_b);
+                let b_sent = sent_b
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(&address_a);
+                if a_sent && b_sent {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            sent_a
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&address_b)
+        );
+        assert!(
+            sent_b
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&address_a)
+        );
+
+        connect_task.abort();
+        node_b.shutdown().await;
+        peer_a.node.shutdown().await;
+        peer_b_task.abort();
+        server_task.abort();
+        let _ = std::fs::remove_dir_all(&state_a);
+        let _ = std::fs::remove_dir_all(&state_b);
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_file(signer);
+    }
 
     #[test]
     fn legacy_bind_state_is_ignored_and_ports_start_empty() {

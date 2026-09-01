@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use if_addrs::get_if_addrs;
 use rand::RngCore;
+use serde::Serialize;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     collections::{HashMap, VecDeque},
@@ -35,8 +36,8 @@ use vela_crypto::{
 };
 use vela_ip::{IpPacket, RouteTable};
 use vela_proto::{
-    Candidate, Header, NetworkSnapshot, NodeId, PacketType, PeerInfo, ProtoError, PublicPeerInfo,
-    WirePacket,
+    Candidate, Header, NetworkSnapshot, NodeId, PacketType, PeerCapability, PeerInfo, ProtoError,
+    PublicPeerInfo, WirePacket,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -912,6 +913,15 @@ impl VelaNode {
         validate_peer_info(&info)?;
         validate_peer_membership(&info, self.inner.config.server_public_key)?;
         let peer_id = info.node_id;
+        if let Some(peer) = self.inner.peers.lock().await.get(&peer_id).cloned() {
+            if peer.info() == info {
+                // Repeated coordinator lookups are common during bilateral
+                // punching. Keep an unchanged active session instead of
+                // replacing it and manufacturing a disconnect/reconnect.
+                peer.online.store(true, Ordering::Release);
+                return Ok(());
+            }
+        }
         let peer_addresses = info
             .virtual_ipv4
             .into_iter()
@@ -1288,8 +1298,22 @@ impl VelaNode {
                 handshake_payload: None,
                 handshake_path: None,
                 last_handshake_at: None,
+                started_at: unix_time(),
+                timeout_at: unix_time().saturating_add(self.inner.config.connect_timeout.as_secs()),
+                candidates: candidates
+                    .iter()
+                    .cloned()
+                    .map(|candidate| PeerCandidateAttempt {
+                        candidate,
+                        state: PeerCandidateState::Pending,
+                        last_sent_at: None,
+                        responded_at: None,
+                        error: None,
+                    })
+                    .collect(),
             });
         }
+        peer.clear_failure();
         let node_id = self.node_id();
         let timestamp = unix_time();
         let send_probes = || async {
@@ -1302,31 +1326,45 @@ impl VelaNode {
                 &self.inner.identity,
             );
             for candidate in &candidates {
-                if let Err(error) = self
+                let address = candidate.address();
+                match self
                     .inner
-                    .send_packet(
-                        candidate.address(),
-                        PacketType::Probe,
-                        session_id,
-                        0,
-                        &payload,
-                    )
+                    .send_packet(address, PacketType::Probe, session_id, 0, &payload)
                     .await
                 {
-                    debug!(
-                        debug_marker = "vela-session",
-                        peer_id = %peer_id,
-                        target = %candidate.address(),
-                        session_id,
-                        error = %error,
-                        "peer probe send failed"
-                    );
+                    Ok(()) => {
+                        self.inner
+                            .record_candidate_probe(&peer, session_id, address, None)
+                            .await
+                    }
+                    Err(error) => {
+                        self.inner
+                            .record_candidate_probe(
+                                &peer,
+                                session_id,
+                                address,
+                                Some(error.to_string()),
+                            )
+                            .await;
+                        debug!(
+                            debug_marker = "vela-session",
+                            peer_id = %peer_id,
+                            target = %address,
+                            session_id,
+                            error = %error,
+                            "peer probe send failed"
+                        );
+                    }
                 }
             }
         };
         send_probes().await;
         let deadline = Instant::now() + self.inner.config.connect_timeout;
         let mut next_probe = Instant::now() + Duration::from_millis(250);
+        // The remote side may win the simultaneous probe race and replace our
+        // attempt. Keep waiting for that attempt to establish the session so
+        // the caller observes the shared connection rather than Superseded.
+        let mut superseded = false;
         loop {
             if peer.active.lock().await.is_some() {
                 return Ok(PeerHandle {
@@ -1351,6 +1389,7 @@ impl VelaNode {
                 if !current {
                     return Err(ConnectError::Superseded);
                 }
+                peer.record_failure("connection attempt timed out");
                 self.inner.emit(VelaEvent::PeerUnreachable(peer_id)).await;
                 debug!(
                     debug_marker = "vela-session",
@@ -1359,21 +1398,29 @@ impl VelaNode {
                 );
                 return Err(ConnectError::Timeout);
             }
-            if !peer
-                .attempt
-                .lock()
-                .await
+            let current_attempt = peer.attempt.lock().await;
+            if !current_attempt
                 .as_ref()
                 .is_some_and(|value| value.session_id == session_id)
             {
-                return Err(ConnectError::Superseded);
+                if current_attempt.is_some() {
+                    superseded = true;
+                    next_probe = deadline;
+                } else if !superseded {
+                    return Err(ConnectError::Superseded);
+                }
             }
-            if Instant::now() >= next_probe {
+            drop(current_attempt);
+            if !superseded && Instant::now() >= next_probe {
                 send_probes().await;
                 next_probe = Instant::now() + Duration::from_millis(250);
                 continue;
             }
-            let wait_for_probe = next_probe.saturating_duration_since(Instant::now());
+            let wait_for_probe = if superseded {
+                remaining
+            } else {
+                next_probe.saturating_duration_since(Instant::now())
+            };
             let wait_for = remaining.min(wait_for_probe);
             if timeout(wait_for, peer.notify.notified()).await.is_err() {
                 continue;
@@ -1394,6 +1441,7 @@ impl VelaNode {
                 if !current {
                     return Err(ConnectError::Superseded);
                 }
+                peer.record_failure("connection attempt timed out");
                 self.inner.emit(VelaEvent::PeerUnreachable(peer_id)).await;
                 return Err(ConnectError::Timeout);
             }
@@ -1403,6 +1451,161 @@ impl VelaNode {
     pub async fn next_event(&self) -> Option<VelaEvent> {
         let mut receiver = self.inner.event_rx.lock().await;
         receiver.as_mut()?.recv().await
+    }
+
+    /// Returns a redacted, read-only view of every peer's direct transport
+    /// state. Credentials and public keys are intentionally omitted because
+    /// this view is suitable for a local dashboard.
+    pub async fn peer_statuses(&self) -> Vec<PeerRuntimeStatus> {
+        let peers = self
+            .inner
+            .peers
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut statuses = Vec::with_capacity(peers.len());
+        for peer in peers {
+            let info = peer.info();
+            let active = peer.active.lock().await;
+            let attempt = peer.attempt.lock().await;
+            let reconnect = peer.reconnect.lock().await;
+            let failure = peer
+                .last_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let (
+                state,
+                active_path,
+                active_path_type,
+                connected_at,
+                path_changed_at,
+                path_history,
+                last_rx_at,
+                last_rtt_ms,
+                tx_bytes,
+                rx_bytes,
+            ) = if let Some(session) = active.as_ref() {
+                (
+                    PeerRuntimeState::Connected,
+                    Some(session.path),
+                    Some(candidate_type(&info.candidates, session.path).to_owned()),
+                    Some(session.created_at_unix),
+                    session.path_changed_at,
+                    peer.path_history
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone(),
+                    Some(unix_time().saturating_sub(session.last_rx.elapsed().as_secs())),
+                    session.last_rtt_ms,
+                    session.tx_bytes.load(Ordering::Relaxed),
+                    session.rx_bytes.load(Ordering::Relaxed),
+                )
+            } else if attempt.is_some() || reconnect.requested || reconnect.running {
+                (
+                    PeerRuntimeState::Connecting,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    None,
+                    None,
+                    0,
+                    0,
+                )
+            } else if failure.is_some() {
+                (
+                    PeerRuntimeState::Unreachable,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    None,
+                    None,
+                    0,
+                    0,
+                )
+            } else {
+                (
+                    PeerRuntimeState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    None,
+                    None,
+                    0,
+                    0,
+                )
+            };
+            let attempt_status = attempt.as_ref().map(|attempt| PeerAttemptStatus {
+                phase: if attempt.handshake.is_some() {
+                    PeerAttemptPhase::Handshaking
+                } else {
+                    PeerAttemptPhase::Probing
+                },
+                started_at: attempt.started_at,
+                timeout_at: attempt.timeout_at,
+                retry_count: reconnect.attempts,
+                candidates: attempt.candidates.clone(),
+            });
+            let attempt_status = attempt_status.or_else(|| {
+                reconnect.requested.then_some(PeerAttemptStatus {
+                    phase: PeerAttemptPhase::Retrying,
+                    started_at: failure
+                        .as_ref()
+                        .map_or_else(unix_time, |failure| failure.occurred_at),
+                    timeout_at: 0,
+                    retry_count: reconnect.attempts,
+                    candidates: info
+                        .candidates
+                        .iter()
+                        .cloned()
+                        .map(|candidate| PeerCandidateAttempt {
+                            candidate,
+                            state: PeerCandidateState::Pending,
+                            last_sent_at: None,
+                            responded_at: None,
+                            error: None,
+                        })
+                        .collect(),
+                })
+            });
+            statuses.push(PeerRuntimeStatus {
+                node_id: info.node_id,
+                online: peer.online.load(Ordering::Acquire),
+                state,
+                candidates: info.candidates,
+                virtual_ipv4: info.virtual_ipv4,
+                virtual_ipv6: info.virtual_ipv6,
+                capabilities: info.capabilities,
+                active_path,
+                active_path_type,
+                connected_at,
+                path_changed_at,
+                path_history: if active.is_some() {
+                    path_history
+                } else {
+                    peer.path_history
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone()
+                },
+                last_rx_at,
+                last_rtt_ms,
+                tx_bytes,
+                rx_bytes,
+                attempt: attempt_status,
+                last_failure: failure,
+            });
+        }
+        statuses.sort_by_key(|status| status.node_id);
+        statuses
     }
 }
 
@@ -1543,7 +1746,7 @@ impl Inner {
                                 )
                                 .ok()
                                 .map(|payload| {
-                                    session.pending_keepalive = Some(nonce);
+                                    session.pending_keepalive = Some((nonce, Instant::now()));
                                     (session.path, session.session_id, sequence, payload)
                                 });
                                 (packet, None, false)
@@ -1567,6 +1770,22 @@ impl Inner {
                                     handshake_payload: None,
                                     handshake_path: None,
                                     last_handshake_at: None,
+                                    started_at: unix_time(),
+                                    timeout_at: unix_time().saturating_add(
+                                        self.config.connect_timeout.as_secs(),
+                                    ),
+                                    candidates: peer_info
+                                        .candidates
+                                        .iter()
+                                        .cloned()
+                                        .map(|candidate| PeerCandidateAttempt {
+                                            candidate,
+                                            state: PeerCandidateState::Pending,
+                                            last_sent_at: None,
+                                            responded_at: None,
+                                            error: None,
+                                        })
+                                        .collect(),
                                 });
                                 let _ = self.start_initiator(&peer, path, session_id).await;
                             }
@@ -1607,6 +1826,8 @@ impl Inner {
         }
         reconnect.running = true;
         drop(reconnect);
+        self.emit(VelaEvent::PeerReconnectRequested(peer.info().node_id))
+            .await;
         let inner = Arc::clone(self);
         tokio::spawn(async move {
             inner.reconnect_loop(peer).await;
@@ -1664,6 +1885,7 @@ impl Inner {
                     return;
                 }
                 Err(error) => {
+                    peer.record_failure(error.to_string());
                     debug!(
                         debug_marker = "vela-session",
                         peer_id = %peer.info().node_id,
@@ -1741,6 +1963,20 @@ impl Inner {
                     handshake_payload: None,
                     handshake_path: None,
                     last_handshake_at: None,
+                    started_at: unix_time(),
+                    timeout_at: unix_time().saturating_add(self.config.connect_timeout.as_secs()),
+                    candidates: peer_info
+                        .candidates
+                        .iter()
+                        .cloned()
+                        .map(|candidate| PeerCandidateAttempt {
+                            candidate,
+                            state: PeerCandidateState::Pending,
+                            last_sent_at: None,
+                            responded_at: None,
+                            error: None,
+                        })
+                        .collect(),
                 });
             }
             drop(attempt);
@@ -1777,6 +2013,8 @@ impl Inner {
             return Ok(());
         }
         drop(attempt);
+        self.record_candidate_response(&peer, probe.session_id, source)
+            .await;
         debug!(
             debug_marker = "vela-session",
             peer_id = %probe.sender,
@@ -1884,6 +2122,7 @@ impl Inner {
             .send_packet(path, PacketType::Handshake, session_id, 0, &payload)
             .await
         {
+            peer.record_failure(format!("handshake send failed: {error}"));
             debug!(
                 debug_marker = "vela-session",
                 peer_id = %peer_id,
@@ -2094,6 +2333,13 @@ impl Inner {
             session.last_rx = Instant::now();
             let path_changed = session.path != source;
             session.path = source;
+            if path_changed {
+                session.path_changed_at = Some(unix_time());
+                peer.record_path(source, &peer_info.candidates);
+            }
+            session
+                .rx_bytes
+                .fetch_add(packet.payload.len() as u64, Ordering::Relaxed);
             let mut events = Vec::new();
             if path_changed {
                 events.push(VelaEvent::PathChanged(peer_info.node_id, source));
@@ -2151,9 +2397,13 @@ impl Inner {
                     if session
                         .pending_keepalive
                         .as_ref()
-                        .is_some_and(|nonce| nonce.as_slice() == plaintext.as_slice())
+                        .is_some_and(|(nonce, _)| nonce.as_slice() == plaintext.as_slice())
                     {
-                        session.pending_keepalive = None;
+                        if let Some((_, sent_at)) = session.pending_keepalive.take() {
+                            session.last_rtt_ms = u64::try_from(sent_at.elapsed().as_millis())
+                                .ok()
+                                .or(Some(u64::MAX));
+                        }
                     }
                 }
                 PacketType::DiagnosticPing => {
@@ -2220,10 +2470,16 @@ impl Inner {
             ping_waiters: HashMap::new(),
             pending_keepalive: None,
             last_rx: Instant::now(),
+            created_at_unix: unix_time(),
             created_at: Instant::now(),
+            path_changed_at: None,
+            last_rtt_ms: None,
             tx_bytes: AtomicU64::new(0),
+            rx_bytes: AtomicU64::new(0),
         });
         drop(active);
+        peer.record_path(path, &expected_peer.candidates);
+        peer.clear_failure();
         *peer.attempt.lock().await = None;
         let mut reconnect = peer.reconnect.lock().await;
         reconnect.requested = false;
@@ -2373,6 +2629,61 @@ impl Inner {
             .ok_or(CoreError::UnknownPeer(node_id))
     }
 
+    async fn record_candidate_probe(
+        &self,
+        peer: &Arc<PeerState>,
+        session_id: u64,
+        address: SocketAddr,
+        error: Option<String>,
+    ) {
+        let mut attempt = peer.attempt.lock().await;
+        let Some(attempt) = attempt
+            .as_mut()
+            .filter(|attempt| attempt.session_id == session_id)
+        else {
+            return;
+        };
+        let Some(candidate) = attempt
+            .candidates
+            .iter_mut()
+            .find(|candidate| candidate.candidate.address() == address)
+        else {
+            return;
+        };
+        candidate.last_sent_at = Some(unix_time());
+        candidate.error = error.clone();
+        candidate.state = if error.is_some() {
+            PeerCandidateState::Failed
+        } else {
+            PeerCandidateState::Sent
+        };
+    }
+
+    async fn record_candidate_response(
+        &self,
+        peer: &Arc<PeerState>,
+        session_id: u64,
+        address: SocketAddr,
+    ) {
+        let mut attempt = peer.attempt.lock().await;
+        let Some(attempt) = attempt
+            .as_mut()
+            .filter(|attempt| attempt.session_id == session_id)
+        else {
+            return;
+        };
+        let Some(candidate) = attempt
+            .candidates
+            .iter_mut()
+            .find(|candidate| candidate.candidate.address() == address)
+        else {
+            return;
+        };
+        candidate.state = PeerCandidateState::Responded;
+        candidate.responded_at = Some(unix_time());
+        candidate.error = None;
+    }
+
     async fn handshake_context(&self) -> Result<Vec<u8>, CoreError> {
         let network_id = *self.network_id.lock().await;
         let ipv4 = *self.local_ipv4.lock().await;
@@ -2440,6 +2751,85 @@ impl Inner {
 pub struct PeerHandle {
     node: VelaNode,
     peer_id: NodeId,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PeerRuntimeStatus {
+    pub node_id: NodeId,
+    pub online: bool,
+    pub state: PeerRuntimeState,
+    pub candidates: Vec<Candidate>,
+    pub virtual_ipv4: Option<Ipv4Addr>,
+    pub virtual_ipv6: Option<Ipv6Addr>,
+    pub capabilities: Vec<PeerCapability>,
+    pub active_path: Option<SocketAddr>,
+    pub active_path_type: Option<String>,
+    pub connected_at: Option<u64>,
+    pub path_changed_at: Option<u64>,
+    pub path_history: Vec<PeerPathChange>,
+    pub last_rx_at: Option<u64>,
+    pub last_rtt_ms: Option<u64>,
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
+    pub attempt: Option<PeerAttemptStatus>,
+    pub last_failure: Option<PeerFailureStatus>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PeerPathChange {
+    pub path: SocketAddr,
+    pub candidate_type: String,
+    pub changed_at: u64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerRuntimeState {
+    Idle,
+    Connecting,
+    Connected,
+    Unreachable,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PeerAttemptStatus {
+    pub phase: PeerAttemptPhase,
+    pub started_at: u64,
+    pub timeout_at: u64,
+    pub retry_count: u8,
+    pub candidates: Vec<PeerCandidateAttempt>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerAttemptPhase {
+    Probing,
+    Handshaking,
+    Retrying,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PeerCandidateAttempt {
+    pub candidate: Candidate,
+    pub state: PeerCandidateState,
+    pub last_sent_at: Option<u64>,
+    pub responded_at: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerCandidateState {
+    Pending,
+    Sent,
+    Responded,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PeerFailureStatus {
+    pub reason: String,
+    pub occurred_at: u64,
 }
 
 impl PeerHandle {
@@ -2563,6 +2953,7 @@ pub enum VelaEvent {
     PeerConnecting(NodeId),
     PeerConnected(NodeId),
     PeerDisconnected(NodeId),
+    PeerReconnectRequested(NodeId),
     PeerUnreachable(NodeId),
     PathChanged(NodeId, SocketAddr),
     TransportFailed {
@@ -2578,6 +2969,8 @@ pub enum VelaEvent {
 struct PeerState {
     info: StdMutex<PeerInfo>,
     online: AtomicBool,
+    last_failure: StdMutex<Option<PeerFailureStatus>>,
+    path_history: StdMutex<Vec<PeerPathChange>>,
     connect: Mutex<()>,
     attempt: Mutex<Option<Attempt>>,
     active: Mutex<Option<ActiveSession>>,
@@ -2595,6 +2988,8 @@ impl PeerState {
         Self {
             info: StdMutex::new(info),
             online: AtomicBool::new(online),
+            last_failure: StdMutex::new(None),
+            path_history: StdMutex::new(Vec::new()),
             connect: Mutex::new(()),
             attempt: Mutex::new(None),
             active: Mutex::new(None),
@@ -2616,6 +3011,41 @@ impl PeerState {
             .info
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = info;
+    }
+
+    fn clear_failure(&self) {
+        *self
+            .last_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    fn record_failure(&self, reason: impl Into<String>) {
+        *self
+            .last_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PeerFailureStatus {
+            reason: reason.into(),
+            occurred_at: unix_time(),
+        });
+    }
+
+    fn record_path(&self, path: SocketAddr, candidates: &[Candidate]) {
+        let mut history = self
+            .path_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if history.last().is_some_and(|previous| previous.path == path) {
+            return;
+        }
+        history.push(PeerPathChange {
+            path,
+            candidate_type: candidate_type(candidates, path).to_owned(),
+            changed_at: unix_time(),
+        });
+        if history.len() > 32 {
+            history.remove(0);
+        }
     }
 }
 
@@ -2656,6 +3086,9 @@ struct Attempt {
     handshake_payload: Option<Vec<u8>>,
     handshake_path: Option<SocketAddr>,
     last_handshake_at: Option<Instant>,
+    started_at: u64,
+    timeout_at: u64,
+    candidates: Vec<PeerCandidateAttempt>,
 }
 
 const HANDSHAKE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
@@ -2667,10 +3100,14 @@ struct ActiveSession {
     tx_sequence: AtomicU64,
     replay: ReplayWindow,
     ping_waiters: HashMap<[u8; DIAGNOSTIC_NONCE_LEN], oneshot::Sender<SocketAddr>>,
-    pending_keepalive: Option<[u8; KEEPALIVE_NONCE_LEN]>,
+    pending_keepalive: Option<([u8; KEEPALIVE_NONCE_LEN], Instant)>,
     last_rx: Instant,
+    created_at_unix: u64,
     created_at: Instant,
+    path_changed_at: Option<u64>,
+    last_rtt_ms: Option<u64>,
     tx_bytes: AtomicU64,
+    rx_bytes: AtomicU64,
 }
 
 const KEEPALIVE_NONCE_LEN: usize = 16;
@@ -2940,6 +3377,18 @@ fn unix_time() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
 }
+
+fn candidate_type(candidates: &[Candidate], address: SocketAddr) -> &'static str {
+    candidates
+        .iter()
+        .find(|candidate| candidate.address() == address)
+        .map_or("peer_reflexive", |candidate| match candidate {
+            Candidate::Host(_) => "host",
+            Candidate::ServerReflexive(_) => "server_reflexive",
+            Candidate::PeerReflexive(_) => "peer_reflexive",
+        })
+}
+
 fn encoded_header(header: &Header) -> Vec<u8> {
     let mut bytes = BytesMut::with_capacity(vela_proto::HEADER_LEN);
     header.encode(&mut bytes);
@@ -3343,7 +3792,9 @@ mod tests {
         node_b.start().await.unwrap();
         let a_id = node_a.node_id();
         let b_id = node_b.node_id();
-        let handle_a = node_a.connect(b_id).await.unwrap();
+        let (result_a, result_b) = tokio::join!(node_a.connect(b_id), node_b.connect(a_id));
+        let handle_a = result_a.unwrap();
+        result_b.unwrap();
         let diagnostic = handle_a
             .diagnostic_ping(3, Duration::from_secs(1))
             .await
@@ -3351,6 +3802,25 @@ mod tests {
         assert_eq!(diagnostic.peer, b_id);
         assert_eq!(diagnostic.path, address_b);
         assert_eq!(diagnostic.rtts.len(), 3);
+
+        while timeout(Duration::from_millis(5), node_a.next_event())
+            .await
+            .is_ok()
+        {}
+        node_a
+            .register_peer(peer_info(
+                &identity_b,
+                2,
+                address_b,
+                Ipv4Addr::new(10, 254, 0, 2),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(20), node_a.next_event())
+                .await
+                .is_err()
+        );
 
         node_a
             .apply_snapshot(NetworkSnapshot {
@@ -3588,12 +4058,20 @@ mod tests {
 
         timeout(Duration::from_secs(2), async {
             let mut disconnected = false;
+            let mut reconnect_requested = false;
             loop {
                 match node_a.next_event().await {
                     Some(VelaEvent::PeerDisconnected(id)) if id == peer_id => {
                         disconnected = true;
                     }
-                    Some(VelaEvent::PeerConnected(id)) if id == peer_id && disconnected => break,
+                    Some(VelaEvent::PeerReconnectRequested(id)) if id == peer_id => {
+                        reconnect_requested = true;
+                    }
+                    Some(VelaEvent::PeerConnected(id))
+                        if id == peer_id && disconnected && reconnect_requested =>
+                    {
+                        break;
+                    }
                     _ => {}
                 }
             }

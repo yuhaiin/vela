@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+axum = "0.8"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -16,3 +17,7 @@ vela-core = { path = "../vela-core" }
 vela-crypto = { path = "../vela-crypto" }
 vela-proto = { path = "../vela-proto" }
 vela-stun = { path = "../vela-stun" }
+
+[dev-dependencies]
+async-trait.workspace = true
+vela-coord = { path = "../vela-coord" }

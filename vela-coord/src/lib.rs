@@ -477,6 +477,7 @@ async fn handle_message(
                 virtual_ipv6: None,
                 credential: stored_credential.clone(),
                 capabilities,
+                last_seen: previous_peer.as_ref().map_or(0, |peer| peer.last_seen),
             };
             let peer_changed = previous_peer.as_ref().is_none_or(|previous| {
                 previous.incarnation != peer.incarnation
@@ -545,6 +546,7 @@ async fn handle_message(
                     virtual_ipv6: peer.virtual_ipv6,
                     credential: peer.credential,
                     capabilities: peer.capabilities,
+                    last_seen: peer.last_seen,
                 },
             )?;
             touch_peer(state, node_id)?;
@@ -593,6 +595,7 @@ async fn handle_message(
                     node_id: peer.node_id,
                     name: peer.name,
                     online: online.contains_key(&peer.node_id),
+                    last_seen: (peer.last_seen > 0).then_some(peer.last_seen),
                     virtual_ipv4: peer.virtual_ipv4,
                     virtual_ipv6: peer.virtual_ipv6,
                     capabilities: peer.capabilities,
@@ -764,6 +767,7 @@ struct StoredPeer {
     virtual_ipv6: Option<Ipv6Addr>,
     credential: Vec<u8>,
     capabilities: Vec<PeerCapability>,
+    last_seen: u64,
 }
 
 fn update_peer(state: &Arc<ServerInner>, peer: &StoredPeer) -> Result<(), CoordError> {
@@ -887,11 +891,11 @@ fn load_peer(state: &Arc<ServerInner>, node_id: NodeId) -> Result<Option<StoredP
         .database
         .lock()
         .map_err(|_| CoordError::DatabasePoisoned)?;
-    database.query_row("SELECT name, signing_public, noise_public, incarnation, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities FROM peers WHERE node_id = ?1 AND revoked = 0", params![node_id.as_bytes().as_slice()], |row| {
-        let name: String = row.get(0)?; let signing: Vec<u8> = row.get(1)?; let noise: Vec<u8> = row.get(2)?; let incarnation: i64 = row.get(3)?; let candidates: String = row.get(4)?; let virtual_ipv4: Option<Vec<u8>> = row.get(5)?; let virtual_ipv6: Option<Vec<u8>> = row.get(6)?; let credential: Vec<u8> = row.get(7)?; let capabilities: String = row.get(8)?;
-        Ok((name, signing, noise, incarnation, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities))
-    }).optional()?.map(|(name, signing, noise, incarnation, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities)| {
-        Ok(StoredPeer { node_id, incarnation: incarnation as u64, name, signing_public: signing.try_into().map_err(|_| CoordError::InvalidPeer)?, noise_public: noise.try_into().map_err(|_| CoordError::InvalidPeer)?, candidates: serde_json::from_str(&candidates)?, virtual_ipv4: decode_ipv4(virtual_ipv4)?, virtual_ipv6: decode_ipv6(virtual_ipv6)?, credential, capabilities: serde_json::from_str(&capabilities)? })
+    database.query_row("SELECT name, signing_public, noise_public, incarnation, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities, last_seen FROM peers WHERE node_id = ?1 AND revoked = 0", params![node_id.as_bytes().as_slice()], |row| {
+        let name: String = row.get(0)?; let signing: Vec<u8> = row.get(1)?; let noise: Vec<u8> = row.get(2)?; let incarnation: i64 = row.get(3)?; let candidates: String = row.get(4)?; let virtual_ipv4: Option<Vec<u8>> = row.get(5)?; let virtual_ipv6: Option<Vec<u8>> = row.get(6)?; let credential: Vec<u8> = row.get(7)?; let capabilities: String = row.get(8)?; let last_seen: i64 = row.get(9)?;
+        Ok((name, signing, noise, incarnation, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities, last_seen))
+    }).optional()?.map(|(name, signing, noise, incarnation, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities, last_seen)| {
+        Ok(StoredPeer { node_id, incarnation: incarnation as u64, name, signing_public: signing.try_into().map_err(|_| CoordError::InvalidPeer)?, noise_public: noise.try_into().map_err(|_| CoordError::InvalidPeer)?, candidates: serde_json::from_str(&candidates)?, virtual_ipv4: decode_ipv4(virtual_ipv4)?, virtual_ipv6: decode_ipv6(virtual_ipv6)?, credential, capabilities: serde_json::from_str(&capabilities)?, last_seen: last_seen.max(0) as u64 })
     }).transpose()
 }
 
@@ -901,7 +905,7 @@ fn load_peers(state: &Arc<ServerInner>) -> Result<Vec<StoredPeer>, CoordError> {
         .lock()
         .map_err(|_| CoordError::DatabasePoisoned)?;
     let mut statement = database.prepare(
-        "SELECT node_id, name, signing_public, noise_public, incarnation, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities
+        "SELECT node_id, name, signing_public, noise_public, incarnation, candidates, virtual_ipv4, virtual_ipv6, credential, capabilities, last_seen
          FROM peers WHERE revoked = 0 ORDER BY node_id",
     )?;
     let rows = statement.query_map([], |row| {
@@ -915,6 +919,7 @@ fn load_peers(state: &Arc<ServerInner>) -> Result<Vec<StoredPeer>, CoordError> {
         let virtual_ipv6: Option<Vec<u8>> = row.get(7)?;
         let credential: Vec<u8> = row.get(8)?;
         let capabilities: String = row.get(9)?;
+        let last_seen: i64 = row.get(10)?;
         Ok((
             node_id,
             name,
@@ -926,6 +931,7 @@ fn load_peers(state: &Arc<ServerInner>) -> Result<Vec<StoredPeer>, CoordError> {
             virtual_ipv6,
             credential,
             capabilities,
+            last_seen,
         ))
     })?;
     rows.map(|row| {
@@ -940,6 +946,7 @@ fn load_peers(state: &Arc<ServerInner>) -> Result<Vec<StoredPeer>, CoordError> {
             virtual_ipv6,
             credential,
             capabilities,
+            last_seen,
         ) = row?;
         Ok(StoredPeer {
             node_id: node_id
@@ -961,6 +968,7 @@ fn load_peers(state: &Arc<ServerInner>) -> Result<Vec<StoredPeer>, CoordError> {
             credential,
             capabilities: serde_json::from_str(&capabilities)
                 .map_err(|_| rusqlite::Error::InvalidQuery)?,
+            last_seen: last_seen.max(0) as u64,
         })
     })
     .collect::<Result<Vec<_>, _>>()
@@ -1383,6 +1391,7 @@ mod tests {
             virtual_ipv6: None,
             credential: serde_json::to_vec(&registration.credential).unwrap(),
             capabilities: vec![PeerCapability::DiagnosticPing],
+            last_seen: 0,
         };
         update_peer(&server.inner, &peer).unwrap();
         assert_eq!(server.list_peers().unwrap(), vec![public.node_id]);
@@ -1532,6 +1541,7 @@ mod tests {
                 virtual_ipv6: None,
                 credential: Vec::new(),
                 capabilities: Vec::new(),
+                last_seen: 0,
             },
         )
         .unwrap();
@@ -1689,6 +1699,7 @@ mod tests {
                 virtual_ipv6: None,
                 credential: Vec::new(),
                 capabilities: Vec::new(),
+                last_seen: 0,
             },
         )
         .unwrap();

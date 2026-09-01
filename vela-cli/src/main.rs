@@ -1,4 +1,7 @@
-use std::{env, io::Read, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
+use std::{
+    collections::HashSet, env, io::Read, net::SocketAddr, path::PathBuf, str::FromStr,
+    time::Duration,
+};
 use vela_coord::CoordServer;
 use vela_crypto::Identity;
 use vela_diagnostic::{DiagnosticControl, DiagnosticError, DiagnosticPeer, PeerState};
@@ -9,6 +12,9 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 fn usage() -> ! {
     eprintln!(
         "Usage:\n  vela-cli identity <path>\n  vela-cli server --path <dir> --bind <addr> --tenant <name> [--doh <https-url>] [--stun <host:port>] [--admin-password-stdin]\n  vela-cli invite --path <dir> --tenant <name> [--ttl <seconds>]\n  vela-cli peers --path <dir> --tenant <name>\n  vela-cli revoke <node-id> --path <dir> --tenant <name>\n  vela-cli admin password reset --path <dir> [--password-stdin]\n  vela-cli peer register --state <dir> --server <url> --server-key <base64> --invite <token> [--port <port>] [--stun <host:port>]\n  vela-cli peer run --state <dir> [--port <port>] [--stun <host:port>]\n  vela-cli peer up --state <dir> [--tun <name>] [--mtu <bytes>] [--port <port>] [--stun <host:port>]\n  vela-cli peer list --state <dir> [--json]\n  vela-cli peer ping <node-id> --state <dir> [--count <n>] [--timeout <duration>] [--json]\n\nServer path defaults: <path>/vela.db, <path>/server.key, <path>/admin.credentials.\nThe server DoH/STUN settings can also be changed from the admin web page.\nLegacy --db/--signer and --admin-credentials overrides are still accepted."
+    );
+    eprintln!(
+        "  vela-cli peer dashboard --state <dir> [--bind <addr>] [--port <port>] [--stun <host:port>]"
     );
     eprintln!("  vela-cli peer status --state <dir> [--json]");
     std::process::exit(2);
@@ -168,6 +174,25 @@ async fn run_peer_command(args: &[String]) -> Result<(), Box<dyn std::error::Err
                 peer.node.local_addrs()?
             );
             peer.run().await?;
+        }
+        "dashboard" => {
+            let state_dir = required(args, "--state");
+            let stun_values = options(args, "--stun");
+            let stun = if stun_values.is_empty() {
+                None
+            } else {
+                Some(stun_values)
+            };
+            let bind = option(args, "--bind")
+                .unwrap_or_else(|| "127.0.0.1:7001".to_owned())
+                .parse::<SocketAddr>()?;
+            let peer = DiagnosticPeer::open(&state_dir, port_option(args)?, stun).await?;
+            println!(
+                "peer {} dashboard available at http://{}",
+                peer.node_id(),
+                bind
+            );
+            peer.run_with_dashboard(bind).await?;
         }
         "up" => {
             #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -367,6 +392,7 @@ async fn run_tun_peer(
     let mut peer = Some(peer);
     let mut refresh = tokio::time::interval(vela_diagnostic::CANDIDATE_REFRESH_INTERVAL);
     let mut control_connected = true;
+    let mut pending_reconnects = HashSet::new();
     let mut reconnect_backoff = Duration::from_secs(1);
     let mut reconnect_sleep = Box::pin(tokio::time::sleep(Duration::ZERO));
     let mut reconnect_task: Option<
@@ -460,6 +486,29 @@ async fn run_tun_peer(
                         peer_id = %peer,
                         "peer session disconnected"
                     ),
+                    Some(vela_core::VelaEvent::PeerReconnectRequested(peer_id)) => {
+                        if !control_connected {
+                            pending_reconnects.insert(peer_id);
+                            continue;
+                        }
+                        let control_peer = peer.as_mut().expect("control peer is available");
+                        if let Err(error) = control_peer.request_peer_connection(peer_id).await {
+                            if !DiagnosticPeer::is_retryable_control_error(&error) {
+                                return Err(error.into());
+                            }
+                            pending_reconnects.insert(peer_id);
+                            tracing::warn!(
+                                debug_marker = "vela-control",
+                                peer_id = %peer_id,
+                                error = %error,
+                                "failed to signal peer for bilateral reconnect; retrying coordination"
+                            );
+                            control_connected = false;
+                            reconnect_sleep.as_mut().reset(
+                                tokio::time::Instant::now() + reconnect_backoff,
+                            );
+                        }
+                    }
                     Some(vela_core::VelaEvent::PeerUnreachable(peer)) => tracing::warn!(
                         debug_marker = "vela-session",
                         peer_id = %peer,
@@ -493,7 +542,19 @@ async fn run_tun_peer(
                         );
                         let control_peer = peer.as_mut().expect("control peer is available");
                         let info = control_peer.client.verify_public_peer(from)?;
+                        let peer_id = info.node_id;
                         node.register_peer(info).await?;
+                        let connect_node = node.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = connect_node.connect(peer_id).await {
+                                tracing::warn!(
+                                    debug_marker = "vela-session",
+                                    peer_id = %peer_id,
+                                    error = %error,
+                                    "peer connection triggered by coordination signal failed"
+                                );
+                            }
+                        });
                     }
                     Ok(vela_proto::ControlMessage::Snapshot { snapshot }) => {
                         tracing::debug!(
@@ -597,6 +658,27 @@ async fn run_tun_peer(
                         reconnect_task = None;
                         control_connected = true;
                         reconnect_backoff = Duration::from_secs(1);
+                        let pending = std::mem::take(&mut pending_reconnects);
+                        for peer_id in pending {
+                            let control_peer = peer.as_mut().expect("control peer is available");
+                            if let Err(error) = control_peer.request_peer_connection(peer_id).await {
+                                if !DiagnosticPeer::is_retryable_control_error(&error) {
+                                    return Err(error.into());
+                                }
+                                pending_reconnects.insert(peer_id);
+                                tracing::warn!(
+                                    debug_marker = "vela-control",
+                                    peer_id = %peer_id,
+                                    error = %error,
+                                    "failed to flush bilateral reconnect signal"
+                                );
+                                control_connected = false;
+                                reconnect_sleep.as_mut().reset(
+                                    tokio::time::Instant::now() + reconnect_backoff,
+                                );
+                                break;
+                            }
+                        }
                     }
                     Err(error) if DiagnosticPeer::is_retryable_control_error(&error) => {
                         tracing::warn!(

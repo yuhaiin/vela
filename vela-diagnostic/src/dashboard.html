@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vela Peer Dashboard</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #07111f;
+      --panel: #0d1b2d;
+      --panel-strong: #12243a;
+      --line: #20344d;
+      --text: #edf5ff;
+      --muted: #8da3bc;
+      --cyan: #56d9ee;
+      --green: #56d39b;
+      --amber: #f6c76f;
+      --red: #f47f8b;
+      --shadow: 0 18px 60px rgb(0 0 0 / 20%);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: radial-gradient(circle at 10% 0%, #143457 0, transparent 34rem), var(--bg);
+      color: var(--text);
+      font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { width: min(1440px, calc(100% - 36px)); margin: 0 auto; padding: 34px 0 60px; }
+    header { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; margin-bottom: 26px; }
+    h1, h2, h3, p { margin: 0; }
+    h1 { font-size: clamp(24px, 4vw, 38px); letter-spacing: -.04em; }
+    h2 { font-size: 17px; letter-spacing: -.01em; }
+    h3 { font-size: 15px; }
+    .eyebrow { color: var(--cyan); font-size: 11px; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; }
+    .subtle, .muted { color: var(--muted); }
+    .subtle { margin-top: 5px; }
+    .refresh { color: var(--muted); font-size: 12px; text-align: right; }
+    .refresh strong { color: var(--green); font-weight: 600; }
+    .grid { display: grid; gap: 16px; }
+    .metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 16px; }
+    .metric, .panel { background: color-mix(in srgb, var(--panel) 94%, transparent); border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow); }
+    .metric { padding: 18px; min-height: 108px; }
+    .metric-label { color: var(--muted); font-size: 12px; }
+    .metric-value { display: block; margin-top: 10px; font-size: 29px; font-weight: 700; letter-spacing: -.05em; }
+    .metric-value.green { color: var(--green); }
+    .metric-value.amber { color: var(--amber); }
+    .metric-value.cyan { color: var(--cyan); }
+    .panel { padding: 20px; }
+    .overview { grid-template-columns: minmax(0, 1.2fr) minmax(0, .8fr); margin-bottom: 16px; }
+    .panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; margin-bottom: 17px; }
+    .panel-head p { margin-top: 4px; color: var(--muted); font-size: 12px; }
+    .facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 24px; }
+    .fact dt { color: var(--muted); font-size: 11px; margin-bottom: 3px; }
+    .fact dd { margin: 0; overflow-wrap: anywhere; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    .stack { display: flex; flex-wrap: wrap; gap: 7px; }
+    .chip, .badge { display: inline-flex; align-items: center; border-radius: 999px; white-space: nowrap; }
+    .chip { padding: 4px 8px; background: #13273e; color: #c5d8ed; font-size: 12px; }
+    .badge { gap: 5px; padding: 4px 8px; font-size: 11px; font-weight: 650; }
+    .badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+    .badge.green { background: #103328; color: var(--green); }
+    .badge.amber { background: #3b2e16; color: var(--amber); }
+    .badge.red { background: #3b1d28; color: var(--red); }
+    .badge.gray { background: #1c2b3d; color: var(--muted); }
+    .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-bottom: 16px; }
+    .peer-card { border: 1px solid var(--line); border-radius: 13px; padding: 15px; background: rgb(18 36 58 / 55%); }
+    .peer-card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+    .peer-name { font-weight: 700; }
+    .peer-id { margin-top: 2px; color: var(--muted); overflow-wrap: anywhere; }
+    .peer-meta { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px 17px; margin-top: 14px; }
+    .meta-label { color: var(--muted); font-size: 11px; }
+    .meta-value { margin-top: 2px; overflow-wrap: anywhere; }
+    .candidate-list { display: grid; gap: 7px; margin-top: 12px; }
+    .candidate-row { display: flex; align-items: center; justify-content: space-between; gap: 9px; border-top: 1px solid rgb(32 52 77 / 65%); padding-top: 7px; }
+    .candidate-row:first-child { border-top: 0; padding-top: 0; }
+    .candidate-state { color: var(--muted); font-size: 11px; }
+    .candidate-state.responded { color: var(--green); }
+    .candidate-state.failed { color: var(--red); }
+    .section { margin-bottom: 16px; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 850px; }
+    th { color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .06em; text-align: left; text-transform: uppercase; }
+    th, td { border-bottom: 1px solid rgb(32 52 77 / 75%); padding: 12px 10px; vertical-align: top; }
+    tbody tr { cursor: pointer; transition: background .15s ease; }
+    tbody tr:hover, tbody tr.selected { background: rgb(30 58 90 / 38%); }
+    .status-pair { display: grid; gap: 5px; }
+    .status-line { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
+    .status-line b { color: var(--text); font-weight: 600; }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+    .dot.green { background: var(--green); box-shadow: 0 0 0 4px rgb(86 211 155 / 10%); }
+    .dot.amber { background: var(--amber); }
+    .dot.red { background: var(--red); }
+    .dot.gray { background: #60758e; }
+    .empty { padding: 24px 10px 5px; color: var(--muted); text-align: center; }
+    .detail { position: sticky; top: 16px; }
+    .detail-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, .42fr); gap: 16px; align-items: start; }
+    .detail-grid { display: grid; gap: 15px; }
+    .detail-block { border-top: 1px solid var(--line); padding-top: 14px; }
+    .detail-block:first-child { border-top: 0; padding-top: 0; }
+    .detail-block h3 { margin-bottom: 8px; }
+    .path-row { display: grid; grid-template-columns: 1fr auto; gap: 9px; border-bottom: 1px solid rgb(32 52 77 / 65%); padding: 8px 0; }
+    .path-row:last-child { border-bottom: 0; }
+    .error { color: var(--red); overflow-wrap: anywhere; }
+    .error-banner { display: none; margin-bottom: 16px; border: 1px solid #6b2b3a; border-radius: 12px; background: #321925; color: #ffb2bb; padding: 12px 15px; }
+    .error-banner.visible { display: block; }
+    @media (max-width: 980px) { .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } .overview, .detail-layout { grid-template-columns: 1fr; } .detail { position: static; } }
+    @media (max-width: 640px) { main { width: min(100% - 24px, 1440px); padding-top: 22px; } header { align-items: flex-start; flex-direction: column; } .refresh { text-align: left; } .metrics, .cards, .facts { grid-template-columns: 1fr; } .panel { padding: 16px; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <div class="eyebrow">Vela / Peer Dashboard</div>
+      <h1>Direct connectivity at a glance</h1>
+      <p class="subtle">Coordinator online status and direct UDP connection status are shown separately.</p>
+    </div>
+    <div class="refresh">Auto-refresh · <strong id="refresh-status">Connecting</strong><br><span id="updated-at">Waiting for data</span></div>
+  </header>
+
+  <div id="error" class="error-banner"></div>
+
+  <section class="grid metrics" aria-label="overview metrics">
+    <article class="metric"><span class="metric-label">Coordinator-online peers</span><strong id="metric-online" class="metric-value cyan">—</strong></article>
+    <article class="metric"><span class="metric-label">Direct connections</span><strong id="metric-connected" class="metric-value green">—</strong></article>
+    <article class="metric"><span class="metric-label">Connecting</span><strong id="metric-trying" class="metric-value amber">—</strong></article>
+    <article class="metric"><span class="metric-label">Discovered peers</span><strong id="metric-total" class="metric-value">—</strong></article>
+  </section>
+
+  <section class="grid overview">
+    <article class="panel">
+      <div class="panel-head"><div><h2>Local peer & coordinator</h2><p>Published candidates are not the same as the current active path.</p></div><span id="coordinator-badge" class="badge gray">Unknown</span></div>
+      <dl class="facts">
+        <div class="fact"><dt>Node ID</dt><dd id="node-id" class="mono">—</dd></div>
+        <div class="fact"><dt>Coordinator</dt><dd id="server" class="mono">—</dd></div>
+        <div class="fact"><dt>Local UDP addresses</dt><dd id="local-addrs" class="stack">—</dd></div>
+        <div class="fact"><dt>Published candidates</dt><dd id="published-candidates" class="stack">—</dd></div>
+      </dl>
+    </article>
+    <article class="panel">
+      <div class="panel-head"><div><h2>Snapshot & credential</h2><p>Values from the current registration.</p></div></div>
+      <dl class="facts">
+        <div class="fact"><dt>Snapshot generation</dt><dd id="snapshot-generation">—</dd></div>
+        <div class="fact"><dt>Snapshot expires</dt><dd id="snapshot-expires">—</dd></div>
+        <div class="fact"><dt>Credential expires</dt><dd id="credential-expires">—</dd></div>
+        <div class="fact"><dt>Last checked</dt><dd id="coordinator-checked">—</dd></div>
+      </dl>
+    </article>
+  </section>
+
+  <section class="panel section">
+    <div class="panel-head"><div><h2>Current direct connections</h2><p>Active path is the address currently used by the session.</p></div></div>
+    <div id="connected" class="grid cards"></div>
+  </section>
+
+  <section class="panel section">
+    <div class="panel-head"><div><h2>Connection attempts</h2><p>Probes, handshakes, automatic retries, and candidate responses.</p></div></div>
+    <div id="trying" class="grid cards"></div>
+  </section>
+
+  <section class="panel section">
+    <div class="panel-head"><div><h2>All peer status</h2><p>Coordinator online ≠ direct connected.</p></div></div>
+    <div class="table-wrap"><table><thead><tr><th>Peer</th><th>Coordinator</th><th>Direct UDP</th><th>Virtual IP</th><th>Candidates</th><th>Last status</th></tr></thead><tbody id="all-peers"></tbody></table></div>
+  </section>
+
+  <section class="panel detail" id="detail-panel">
+    <div class="panel-head"><div><h2>Peer details</h2><p>Select any peer above to view candidates, paths, and failures.</p></div></div>
+    <div id="detail-empty" class="empty">No peer selected.</div>
+    <div id="detail-content" class="detail-grid" hidden></div>
+  </section>
+</main>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const state = { snapshot: null, selected: null };
+  const labels = {
+    connected: 'Connected', connecting: 'Connecting', unreachable: 'Unreachable', idle: 'Idle',
+    probing: 'Probing', handshaking: 'Handshaking', retrying: 'Automatic retry',
+    pending: 'Pending', sent: 'Sent', responded: 'Responded', failed: 'Failed',
+    host: 'host', server_reflexive: 'server-reflexive', peer_reflexive: 'peer-reflexive'
+  };
+  const candidate = (value) => {
+    const key = value && typeof value === 'object' ? Object.keys(value)[0] : null;
+    return { type: key || 'unknown', address: key ? value[key] : value };
+  };
+  const label = (value) => labels[value] || value || 'Unknown';
+  const date = (seconds) => seconds ? new Date(seconds * 1000).toLocaleString() : '—';
+  const age = (seconds, now) => {
+    if (!seconds) return '—';
+    const delta = Math.max(0, (now || Math.floor(Date.now() / 1000)) - seconds);
+    if (delta < 60) return `${delta}s ago`;
+    if (delta < 3600) return `${Math.floor(delta / 60)}m ago`;
+    return `${Math.floor(delta / 3600)}h ago`;
+  };
+  const badgeClass = (status) => status === 'connected' || status === 'online' ? 'green' : status === 'connecting' || status === 'trying' ? 'amber' : status === 'unreachable' ? 'red' : 'gray';
+  const statusBadge = (status) => `<span class="badge ${badgeClass(status)}">${esc(label(status))}</span>`;
+  const chips = (items, empty = 'None') => items && items.length ? `<div class="stack">${items.map((item) => `<span class="chip mono">${esc(item)}</span>`).join('')}</div>` : `<span class="muted">${empty}</span>`;
+  const virtualIp = (peer) => [peer.virtual_ipv4, peer.virtual_ipv6].filter(Boolean);
+  const directName = (peer) => label(peer.direct?.state);
+  const directClass = (peer) => badgeClass(peer.direct?.state);
+  const candidateRows = (items) => items && items.length ? `<div class="candidate-list">${items.map((item) => {
+    const c = candidate(item.candidate);
+    const status = item.state || 'pending';
+    return `<div class="candidate-row"><span class="mono">${esc(c.address)} <span class="muted">· ${esc(label(c.type))}</span></span><span class="candidate-state ${esc(status)}">${esc(label(status))}</span></div>`;
+  }).join('')}</div>` : '<div class="muted" style="margin-top:10px">No candidate attempts yet.</div>';
+  const peerTitle = (peer) => peer.name || `Peer ${String(peer.node_id || '').slice(0, 12)}…`;
+
+  function renderOverview(data) {
+    const peers = data.peers || [];
+    $('metric-online').textContent = peers.filter((peer) => peer.coordinator_online).length;
+    $('metric-connected').textContent = peers.filter((peer) => peer.direct?.state === 'connected').length;
+    $('metric-trying').textContent = peers.filter((peer) => peer.direct?.state === 'connecting').length;
+    $('metric-total').textContent = peers.length;
+    $('node-id').textContent = data.node_id || '—';
+    $('server').textContent = data.server || '—';
+    $('local-addrs').innerHTML = chips(data.local_udp_addresses);
+    $('published-candidates').innerHTML = chips((data.published_candidates || []).map((item) => { const c = candidate(item); return `${c.address} · ${label(c.type)}`; }));
+    $('snapshot-generation').textContent = data.snapshot_generation ?? '—';
+    $('snapshot-expires').textContent = date(data.snapshot_expires_at);
+    $('credential-expires').textContent = date(data.credential_expires_at);
+    $('coordinator-checked').textContent = date(data.coordinator?.checked_at);
+    const online = Boolean(data.coordinator?.connected);
+    const badge = $('coordinator-badge');
+    badge.className = `badge ${online ? 'green' : 'red'}`;
+    badge.textContent = online ? 'coordinator connected' : 'coordinator offline';
+  }
+
+  function renderConnected(peers, now) {
+    const target = $('connected');
+    const connected = peers.filter((peer) => peer.direct?.state === 'connected');
+    if (!connected.length) { target.innerHTML = '<div class="empty">No direct UDP connections.</div>'; return; }
+    target.innerHTML = connected.map((peer) => {
+      const direct = peer.direct;
+      return `<article class="peer-card" data-peer="${esc(peer.node_id)}">
+        <div class="peer-card-top"><div><div class="peer-name">${esc(peerTitle(peer))}</div><div class="peer-id mono">${esc(peer.node_id)}</div></div>${statusBadge('connected')}</div>
+        <div class="peer-meta">
+          <div><div class="meta-label">Active path</div><div class="meta-value mono">${esc(direct.active_path || '—')}</div></div>
+          <div><div class="meta-label">Address type</div><div class="meta-value">${esc(label(direct.active_path_type))}</div></div>
+          <div><div class="meta-label">Connected at</div><div class="meta-value">${esc(date(direct.connected_at))}</div></div>
+          <div><div class="meta-label">Last path change</div><div class="meta-value">${esc(date(direct.path_changed_at))}</div></div>
+          <div><div class="meta-label">Last RTT</div><div class="meta-value">${direct.last_rtt_ms == null ? '—' : `${esc(direct.last_rtt_ms)} ms`}</div></div>
+          <div><div class="meta-label">RX / TX payload</div><div class="meta-value">${esc(formatBytes(direct.rx_bytes))} / ${esc(formatBytes(direct.tx_bytes))}</div></div>
+        </div>
+        <div style="margin-top:14px">${chips(virtualIp(peer), 'No virtual address')}</div>
+      </article>`;
+    }).join('');
+  }
+
+  function renderTrying(peers, now) {
+    const target = $('trying');
+    const trying = peers.filter((peer) => peer.direct?.state === 'connecting');
+    if (!trying.length) { target.innerHTML = '<div class="empty">No connection attempts.</div>'; return; }
+    target.innerHTML = trying.map((peer) => {
+      const attempt = peer.direct.attempt;
+      const retry = attempt?.retry_count ?? 0;
+      const started = attempt?.started_at;
+      return `<article class="peer-card" data-peer="${esc(peer.node_id)}">
+        <div class="peer-card-top"><div><div class="peer-name">${esc(peerTitle(peer))}</div><div class="peer-id mono">${esc(peer.node_id)}</div></div>${statusBadge('connecting')}</div>
+        <div class="peer-meta">
+          <div><div class="meta-label">Current phase</div><div class="meta-value">${esc(label(attempt?.phase || 'retrying'))}</div></div>
+          <div><div class="meta-label">Attempted for</div><div class="meta-value">${started ? esc(age(started, now)) : 'Waiting for scheduling'}</div></div>
+          <div><div class="meta-label">Retry count</div><div class="meta-value">${esc(retry)}</div></div>
+          <div><div class="meta-label">Timeout</div><div class="meta-value">${attempt?.timeout_at ? esc(date(attempt.timeout_at)) : 'Automatic retry queue'}</div></div>
+        </div>
+        ${attempt ? candidateRows(attempt.candidates) : '<div class="muted" style="margin-top:12px">Waiting for the next automatic reconnect.</div>'}
+        ${peer.direct.last_failure ? `<div class="error" style="margin-top:12px">Last failure: ${esc(peer.direct.last_failure.reason)} · ${esc(date(peer.direct.last_failure.occurred_at))}</div>` : ''}
+      </article>`;
+    }).join('');
+  }
+
+  function renderAll(peers, now) {
+    const target = $('all-peers');
+    if (!peers.length) { target.innerHTML = '<tr><td colspan="6" class="empty">No other peers in the snapshot.</td></tr>'; return; }
+    target.innerHTML = peers.map((peer) => {
+      const direct = peer.direct || {};
+      const selected = state.selected === peer.node_id ? ' selected' : '';
+      const candidateCount = direct.candidates?.length || 0;
+      return `<tr class="${selected}" data-peer="${esc(peer.node_id)}">
+        <td><div class="peer-name">${esc(peerTitle(peer))}</div><div class="peer-id mono">${esc(peer.node_id)}</div></td>
+        <td><div class="status-line"><span class="dot ${peer.coordinator_online ? 'green' : 'gray'}"></span><b>${peer.coordinator_online ? 'Online' : 'Offline'}</b></div><div class="muted">${esc(peer.coordinator_last_seen_at ? age(peer.coordinator_last_seen_at, now) : 'No record')}</div></td>
+        <td><div class="status-pair">${statusBadge(direct.state || 'idle')}<span class="muted">${esc(direct.active_path || '')}</span></div></td>
+        <td>${chips(virtualIp(peer), '—')}</td>
+        <td><span class="chip">${esc(candidateCount)} candidates</span></td>
+        <td>${esc(age(peer.last_status_at, now))}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  function renderDetail(peers, now) {
+    const peer = peers.find((item) => item.node_id === state.selected);
+    const empty = $('detail-empty');
+    const content = $('detail-content');
+    if (!peer) { empty.hidden = false; content.hidden = true; content.innerHTML = ''; return; }
+    const direct = peer.direct;
+    empty.hidden = true; content.hidden = false;
+    const allCandidates = (direct.candidates || []).map((item) => { const c = candidate(item); return `<div class="path-row"><span class="mono">${esc(c.address)}</span><span class="muted">${esc(label(c.type))}</span></div>`; }).join('');
+    const history = (direct.path_history || []).slice().reverse().map((item) => `<div class="path-row"><span><span class="mono">${esc(item.path)}</span><br><span class="muted">${esc(label(item.candidate_type))}</span></span><span class="muted">${esc(date(item.changed_at))}</span></div>`).join('');
+    content.innerHTML = `<div class="detail-block"><div class="peer-card-top"><div><h3>${esc(peerTitle(peer))}</h3><div class="peer-id mono">${esc(peer.node_id)}</div></div>${statusBadge(direct.state || 'idle')}</div><div class="facts" style="margin-top:14px"><div class="fact"><dt>Coordinator</dt><dd>${peer.coordinator_online ? 'Online' : 'Offline'} · ${esc(peer.coordinator_last_seen_at ? age(peer.coordinator_last_seen_at, now) : 'No record')}</dd></div><div class="fact"><dt>Virtual IP</dt><dd>${chips(virtualIp(peer))}</dd></div><div class="fact"><dt>Active path</dt><dd class="mono">${esc(direct.active_path || '—')} · ${esc(label(direct.active_path_type))}</dd></div><div class="fact"><dt>Latest RTT</dt><dd>${direct.last_rtt_ms == null ? '—' : `${esc(direct.last_rtt_ms)} ms`}</dd></div></div></div>
+      <div class="detail-block"><h3>All candidates</h3>${allCandidates || '<span class="muted">No candidates</span>'}</div>
+      <div class="detail-block"><h3>Path history</h3>${history || '<span class="muted">No path history</span>'}</div>
+      <div class="detail-block"><h3>Recent connection failure</h3>${direct.last_failure ? `<div class="error">${esc(direct.last_failure.reason)}<br><span class="muted">${esc(date(direct.last_failure.occurred_at))}</span></div>` : '<span class="muted">No failures recorded</span>'}</div>
+      <div class="detail-block"><h3>Credentials and capabilities</h3><div class="facts"><div class="fact"><dt>Credential expires</dt><dd>${esc(date(state.snapshot?.credential_expires_at))}</dd></div><div class="fact"><dt>Capabilities</dt><dd>${chips((peer.capabilities || []).map((value) => String(value)))}</dd></div></div></div>`;
+  }
+
+  function formatBytes(value) {
+    const bytes = Number(value || 0);
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+    return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
+  }
+
+  function render(data) {
+    state.snapshot = data;
+    const now = data.generated_at || Math.floor(Date.now() / 1000);
+    const peers = data.peers || [];
+    renderOverview(data);
+    renderConnected(peers, now);
+    renderTrying(peers, now);
+    renderAll(peers, now);
+    renderDetail(peers, now);
+    $('updated-at').textContent = `Last updated ${date(data.generated_at)}`;
+    $('refresh-status').textContent = data.coordinator?.connected ? 'Healthy' : 'Coordinator offline';
+    $('refresh-status').style.color = data.coordinator?.connected ? 'var(--green)' : 'var(--red)';
+    const error = data.coordinator?.last_error;
+    $('error').textContent = error ? `Coordinator: ${error}` : '';
+    $('error').classList.toggle('visible', Boolean(error));
+  }
+
+  async function refresh() {
+    try {
+      const response = await fetch('/api/v1/dashboard', { cache: 'no-store' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      render(await response.json());
+    } catch (error) {
+      $('refresh-status').textContent = 'Read failed';
+      $('refresh-status').style.color = 'var(--red)';
+      $('error').textContent = `Dashboard API: ${error.message}`;
+      $('error').classList.add('visible');
+    }
+  }
+
+  document.addEventListener('click', (event) => {
+    const row = event.target.closest('[data-peer]');
+    if (!row || !state.snapshot) return;
+    state.selected = row.dataset.peer;
+    render(state.snapshot);
+    $('detail-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+  refresh();
+  setInterval(refresh, 1000);
+})();
+</script>
+</body>
+</html>
