@@ -25,6 +25,15 @@ use vela_core::{
 use vela_crypto::{CryptoError, Identity, MembershipCredential};
 use vela_proto::{Candidate, ControlMessage, NetworkSnapshot, NodeId, PeerInfo, PeerSummary};
 
+mod local_control;
+mod runtime;
+
+pub use local_control::LocalControlClient;
+pub use runtime::{
+    DiagnosticRuntime, MAX_PING_COUNT, MAX_PING_TIMEOUT, MIN_PING_TIMEOUT, RuntimeHandle,
+    RuntimeProcess,
+};
+
 const STATE_FILE: &str = "state.json";
 const IDENTITY_FILE: &str = "identity";
 pub const CANDIDATE_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
@@ -37,14 +46,14 @@ fn unix_time() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DashboardCoordinatorStatus {
     pub connected: bool,
     pub checked_at: u64,
     pub last_error: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DashboardPeer {
     pub node_id: NodeId,
     pub name: String,
@@ -57,7 +66,7 @@ pub struct DashboardPeer {
     pub direct: PeerRuntimeStatus,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DashboardSnapshot {
     pub generated_at: u64,
     pub node_id: NodeId,
@@ -341,7 +350,10 @@ impl DiagnosticPeer {
         peer.refresh_candidates().await?;
         peer.state.last_local_addrs = peer.node.local_addrs()?;
         peer.node.start().await?;
-        peer.state.save(state_dir)?;
+        if let Err(error) = peer.state.save(state_dir) {
+            peer.node.shutdown().await;
+            return Err(error);
+        }
         Ok(peer)
     }
 
@@ -457,10 +469,15 @@ impl DiagnosticPeer {
     }
 
     pub async fn status(&mut self) -> Result<PeerStatus, DiagnosticError> {
-        Ok(PeerStatus {
+        let peers = self.list_peers().await?;
+        Ok(self.status_snapshot(&peers))
+    }
+
+    pub(crate) fn status_snapshot(&self, peers: &[PeerSummary]) -> PeerStatus {
+        PeerStatus {
             node_id: self.node_id(),
             server: self.state.server.clone(),
-            local_addrs: self.node.local_addrs()?,
+            local_addrs: self.node.local_addrs().unwrap_or_default(),
             doh_servers: self.state.doh_servers.clone(),
             stun_servers: self.state.stun_servers.clone(),
             candidates: self.candidates.clone(),
@@ -469,8 +486,8 @@ impl DiagnosticPeer {
                 .credential
                 .as_ref()
                 .map(|credential| credential.expires_at),
-            peers: self.list_peers().await?,
-        })
+            peers: peers.to_vec(),
+        }
     }
 
     pub async fn refresh_candidates(&mut self) -> Result<(), DiagnosticError> {
@@ -667,7 +684,7 @@ impl DiagnosticPeer {
         }
     }
 
-    async fn dashboard_snapshot(
+    pub(crate) async fn dashboard_snapshot(
         &self,
         coordinator_connected: bool,
         summaries: &[PeerSummary],
@@ -975,7 +992,7 @@ impl DiagnosticPeer {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerStatus {
     pub node_id: NodeId,
     pub server: String,
@@ -987,7 +1004,7 @@ pub struct PeerStatus {
     pub peers: Vec<PeerSummary>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PingReport {
     pub target: NodeId,
     pub direct: bool,
@@ -1068,6 +1085,16 @@ pub enum DiagnosticError {
     Revoked,
     #[error("no usable local or server-reflexive candidates were found")]
     NoCandidates,
+    #[error("a peer service is already running for this state directory")]
+    AlreadyRunning,
+    #[error("peer service is not running for this state directory")]
+    ServiceUnavailable,
+    #[error("local control protocol error: {0}")]
+    ControlProtocol(String),
+    #[error("local control service rejected request: {code}: {message}")]
+    ControlRequest { code: String, message: String },
+    #[error("ping request is outside the supported range: {0}")]
+    InvalidPingRequest(String),
 }
 
 fn merge_stun_servers(local: &[String], remote: &[String]) -> Vec<String> {
@@ -1120,7 +1147,7 @@ fn retain_server_reflexive_candidates(candidates: &mut Vec<Candidate>, previous:
     }
 }
 
-fn set_private(_path: &Path) -> Result<(), std::io::Error> {
+pub(crate) fn set_private(_path: &Path) -> Result<(), std::io::Error> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

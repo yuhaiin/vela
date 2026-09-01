@@ -101,11 +101,9 @@ cargo run -p vela-cli -- peer register \
   --invite <invite-token> \
   --port 0
 
-cargo run -p vela-cli -- peer run --state ./peer-a
-# Start the read-only local peer dashboard (default: http://127.0.0.1:7001)
-cargo run -p vela-cli -- peer dashboard --state ./peer-a
-# `peer up` also starts the dashboard; Linux/Windows default: vela0; macOS default: utun0.
+# `peer up` starts the only peer runtime, the TUN adapter, and the dashboard.
 cargo run -p vela-cli -- peer up --state ./peer-a --mtu 1200
+# The following commands connect to the already-running peer up service.
 cargo run -p vela-cli -- peer list --state ./peer-a --json
 cargo run -p vela-cli -- peer status --state ./peer-a --json
 cargo run -p vela-cli -- peer ping vela:<node-id-hex> --state ./peer-a --count 3 --json
@@ -126,31 +124,34 @@ the same `vela-cli` executable, a peer registration command, and a TUN startup
 command. The CLI download is protected by its own `X-Vela-Download-Token` and
 does not expose the admin session token.
 
-`peer run` is a diagnostic peer process, not a server or relay. The
+`peer up` is a diagnostic peer process, not a server or relay. The
 coordination server only exchanges registration and candidate information;
 the Probe, Noise handshake, and encrypted Echo/Pong packets travel directly
 between peer UDP sockets. Hostname resolution does not use the system resolver:
 peers use the built-in DoH endpoint `https://doh.pub` by default for the
 coordination endpoint and STUN hostnames. `--stun <host:port>` can be repeated
-during register or run to publish server-reflexive candidates; hostnames are
+during register or up to publish server-reflexive candidates; hostnames are
 resolved through DoH on every refresh. The server may be started with repeated
 `--doh <https-url>` and `--stun <host:port>` options, or both settings can be
 edited in `/admin`; changes are persisted, signed into snapshots, and pushed to
 online peers dynamically.
 
-`peer dashboard` and `peer up` run the peer lifecycle together with a read-only
-local HTTP dashboard at `127.0.0.1:7001` (use `--bind` to change it). Its API
-is `/api/v1/dashboard` and is polled by the page once per second. Coordinator
-online state and direct UDP state are deliberately separate; candidate lists
-show advertised addresses, while `active path` shows the address actually used
+`peer up` runs the peer lifecycle together with a read-only local HTTP dashboard
+at `127.0.0.1:7001` (use `--bind` to change it). Its dashboard API is
+`/api/v1/dashboard` and is polled by the page once per second. On Unix,
+`peer status`, `peer list`, and `peer ping` use the authenticated service
+through `control.sock`; on Windows they use the authenticated loopback HTTP
+endpoint recorded in `control.json`. They never load the full peer state or create another
+coordinator client. Coordinator online state and direct UDP state are deliberately separate;
+candidate lists show advertised addresses, while `active path` shows the address actually used
 by the encrypted session.
 The peer transport always creates one IPv4-only and one IPv6-only UDP socket.
 `--port <port>` selects the same local port for both sockets; omitting it lets
 the operating system choose an ephemeral port independently for each family.
 On restart, the last successful IPv4 and IPv6 ports are tried first and both
 families fall back to fresh ports together if that pair is unavailable. The
-peer transport no longer uses `--bind`; when a dashboard is enabled, that
-option selects the dashboard HTTP address. The sockets and their automatically
+peer transport no longer uses `--bind`; that option selects the dashboard HTTP
+address. The sockets and their automatically
 collected host candidates use each family's main-table
 default-route interface, so addresses from unrelated VPN, container, or
 virtual interfaces are not advertised. If a family has no default route, its

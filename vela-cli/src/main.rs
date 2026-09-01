@@ -1,51 +1,182 @@
-use std::{
-    collections::HashSet, env, io::Read, net::SocketAddr, path::PathBuf, str::FromStr,
-    time::Duration,
-};
+use clap::{ArgAction, Args, Parser, Subcommand};
+use std::{io::Read, net::SocketAddr, path::PathBuf, time::Duration};
 use vela_coord::CoordServer;
 use vela_crypto::Identity;
-use vela_diagnostic::{
-    DashboardHandle, DiagnosticControl, DiagnosticError, DiagnosticPeer, PeerState,
-};
-use vela_proto::{NetworkSnapshot, NodeId};
+use vela_diagnostic::{LocalControlClient, PeerState, RuntimeProcess};
+use vela_proto::NodeId;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
-fn usage() -> ! {
-    eprintln!(
-        "Usage:\n  vela-cli identity <path>\n  vela-cli server --path <dir> --bind <addr> --tenant <name> [--doh <https-url>] [--stun <host:port>] [--admin-password-stdin]\n  vela-cli invite --path <dir> --tenant <name> [--ttl <seconds>]\n  vela-cli peers --path <dir> --tenant <name>\n  vela-cli revoke <node-id> --path <dir> --tenant <name>\n  vela-cli admin password reset --path <dir> [--password-stdin]\n  vela-cli peer register --state <dir> --server <url> --server-key <base64> --invite <token> [--port <port>] [--stun <host:port>]\n  vela-cli peer run --state <dir> [--port <port>] [--stun <host:port>]\n  vela-cli peer up --state <dir> [--tun <name>] [--mtu <bytes>] [--bind <addr>] [--port <port>] [--stun <host:port>]\n  vela-cli peer list --state <dir> [--json]\n  vela-cli peer ping <node-id> --state <dir> [--count <n>] [--timeout <duration>] [--json]\n\nServer path defaults: <path>/vela.db, <path>/server.key, <path>/admin.credentials.\nThe server DoH/STUN settings can also be changed from the admin web page.\nLegacy --db/--signer and --admin-credentials overrides are still accepted."
-    );
-    eprintln!(
-        "  vela-cli peer dashboard --state <dir> [--bind <addr>] [--port <port>] [--stun <host:port>]"
-    );
-    eprintln!("  vela-cli peer status --state <dir> [--json]");
-    std::process::exit(2);
+#[derive(Debug, Parser)]
+#[command(name = "vela-cli", version, about = "Vela coordination and peer tools")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
 }
 
-fn option(args: &[String], name: &str) -> Option<String> {
-    args.windows(2)
-        .find_map(|pair| (pair[0] == name).then(|| pair[1].clone()))
+#[derive(Debug, Subcommand)]
+enum Command {
+    Identity(IdentityArgs),
+    Server(ServerArgs),
+    Invite(InviteArgs),
+    Peers(ServerPathArgs),
+    Revoke(RevokeArgs),
+    Admin(AdminArgs),
+    Peer {
+        #[command(subcommand)]
+        command: PeerCommand,
+    },
 }
 
-fn required(args: &[String], name: &str) -> String {
-    option(args, name).unwrap_or_else(|| {
-        eprintln!("missing {name}");
-        usage()
-    })
+#[derive(Debug, Args)]
+struct IdentityArgs {
+    path: PathBuf,
 }
 
-fn options(args: &[String], name: &str) -> Vec<String> {
-    args.windows(2)
-        .filter(|pair| pair[0] == name)
-        .map(|pair| pair[1].clone())
-        .collect()
+#[derive(Debug, Args)]
+struct ServerPathArgs {
+    #[arg(long)]
+    path: Option<PathBuf>,
+    #[arg(long)]
+    db: Option<PathBuf>,
+    #[arg(long)]
+    signer: Option<PathBuf>,
+    #[arg(long = "admin-credentials")]
+    admin_credentials: Option<PathBuf>,
+    #[arg(long)]
+    tenant: String,
+    #[arg(long = "doh", action = ArgAction::Append)]
+    doh: Vec<String>,
+    #[arg(long = "stun", action = ArgAction::Append)]
+    stun: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct ServerArgs {
+    #[command(flatten)]
+    paths: ServerPathArgs,
+    #[arg(long)]
+    bind: SocketAddr,
+    #[arg(long = "admin-password-stdin")]
+    admin_password_stdin: bool,
+}
+
+#[derive(Debug, Args)]
+struct InviteArgs {
+    #[command(flatten)]
+    paths: ServerPathArgs,
+    #[arg(long, default_value_t = 3600)]
+    ttl: u64,
+}
+
+#[derive(Debug, Args)]
+struct RevokeArgs {
+    node_id: NodeId,
+    #[command(flatten)]
+    paths: ServerPathArgs,
+}
+
+#[derive(Debug, Args)]
+struct AdminArgs {
+    #[command(subcommand)]
+    command: AdminCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminCommand {
+    Password(AdminPasswordArgs),
+}
+
+#[derive(Debug, Args)]
+struct AdminPasswordArgs {
+    #[command(subcommand)]
+    command: AdminPasswordCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminPasswordCommand {
+    Reset(AdminResetArgs),
+}
+
+#[derive(Debug, Args)]
+struct AdminResetArgs {
+    #[arg(long)]
+    path: PathBuf,
+    #[arg(long)]
+    password_stdin: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum PeerCommand {
+    Register(PeerRegisterArgs),
+    Up(PeerUpArgs),
+    List(PeerStateArgs),
+    Status(PeerStateArgs),
+    Ping(PeerPingArgs),
+}
+
+#[derive(Debug, Args)]
+struct PeerRegisterArgs {
+    #[arg(long)]
+    state: PathBuf,
+    #[arg(long)]
+    server: String,
+    #[arg(long = "server-key")]
+    server_key: String,
+    #[arg(long)]
+    invite: String,
+    #[arg(long)]
+    port: Option<u16>,
+    #[arg(long = "stun", action = ArgAction::Append)]
+    stun: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct PeerUpArgs {
+    #[arg(long)]
+    state: PathBuf,
+    #[arg(long)]
+    tun: Option<String>,
+    #[arg(long, default_value_t = 1200)]
+    mtu: usize,
+    #[arg(long, default_value = "127.0.0.1:7001")]
+    bind: SocketAddr,
+    #[arg(long)]
+    port: Option<u16>,
+    #[arg(long = "stun", action = ArgAction::Append)]
+    stun: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct PeerStateArgs {
+    #[arg(long)]
+    state: PathBuf,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct PeerPingArgs {
+    target: NodeId,
+    #[arg(long)]
+    state: PathBuf,
+    #[arg(long, default_value_t = 1, value_parser = parse_ping_count)]
+    count: usize,
+    #[arg(long, default_value = "8s", value_parser = parse_ping_timeout)]
+    timeout: Duration,
+    #[arg(long)]
+    json: bool,
+}
+
+fn invalid_input(message: impl Into<String>) -> Box<dyn std::error::Error> {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, message.into()).into()
 }
 
 fn parse_duration(value: &str) -> Result<Duration, String> {
-    let (number, multiplier) = if let Some(value) = value.strip_suffix("ms") {
-        (value, 1)
-    } else if let Some(value) = value.strip_suffix('s') {
-        (value, 1000)
+    let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
+        (number, 1u64)
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, 1000u64)
     } else {
         return Err(format!("duration must end in ms or s: {value}"));
     };
@@ -57,6 +188,32 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
     Ok(Duration::from_millis(millis))
 }
 
+fn parse_ping_count(value: &str) -> Result<usize, String> {
+    let count = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid ping count: {value}"))?;
+    if (1..=vela_diagnostic::MAX_PING_COUNT).contains(&count) {
+        Ok(count)
+    } else {
+        Err(format!(
+            "ping count must be between 1 and {}",
+            vela_diagnostic::MAX_PING_COUNT
+        ))
+    }
+}
+
+fn parse_ping_timeout(value: &str) -> Result<Duration, String> {
+    let timeout = parse_duration(value)?;
+    if !(vela_diagnostic::MIN_PING_TIMEOUT..=vela_diagnostic::MAX_PING_TIMEOUT).contains(&timeout) {
+        return Err(format!(
+            "ping timeout must be between {:?} and {:?}",
+            vela_diagnostic::MIN_PING_TIMEOUT,
+            vela_diagnostic::MAX_PING_TIMEOUT
+        ));
+    }
+    Ok(timeout)
+}
+
 fn decode_server_key(value: &str) -> Result<[u8; 32], String> {
     let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, value)
         .map_err(|_| "invalid base64 server key".to_owned())?;
@@ -65,10 +222,287 @@ fn decode_server_key(value: &str) -> Result<[u8; 32], String> {
         .map_err(|_| "server key must decode to 32 bytes".to_owned())
 }
 
-fn port_option(args: &[String]) -> Result<Option<u16>, Box<dyn std::error::Error>> {
-    option(args, "--port")
-        .map(|value| value.parse().map_err(Into::into))
-        .transpose()
+fn coordination_paths(
+    paths: &ServerPathArgs,
+) -> Result<(PathBuf, PathBuf, PathBuf), Box<dyn std::error::Error>> {
+    let database = paths
+        .db
+        .clone()
+        .or_else(|| paths.path.as_ref().map(|path| path.join("vela.db")))
+        .ok_or_else(|| invalid_input("missing --path or --db"))?;
+    let signer = paths
+        .signer
+        .clone()
+        .or_else(|| paths.path.as_ref().map(|path| path.join("server.key")))
+        .ok_or_else(|| invalid_input("missing --path or --signer"))?;
+    let credentials = paths
+        .admin_credentials
+        .clone()
+        .or_else(|| {
+            paths
+                .path
+                .as_ref()
+                .map(|path| path.join("admin.credentials"))
+        })
+        .unwrap_or_else(|| database.with_extension("admin-credentials"));
+    Ok((database, signer, credentials))
+}
+
+fn open_coordination_server(
+    paths: &ServerPathArgs,
+) -> Result<CoordServer, Box<dyn std::error::Error>> {
+    let (database, signer, credentials) = coordination_paths(paths)?;
+    Ok(CoordServer::open_with_admin_credentials_and_network_config(
+        database,
+        signer,
+        paths.tenant.clone(),
+        credentials,
+        paths.doh.clone(),
+        paths.stun.clone(),
+    )?)
+}
+
+fn read_password(enabled: bool) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if !enabled {
+        return Ok(None);
+    }
+    let mut password = String::new();
+    std::io::stdin().read_to_string(&mut password)?;
+    let password = password.trim_end_matches(['\r', '\n']).to_owned();
+    if password.is_empty() {
+        return Err(invalid_input("password stdin was empty"));
+    }
+    Ok(Some(password))
+}
+
+async fn run_command(command: Command) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        Command::Identity(args) => {
+            let identity = Identity::load_or_generate(args.path)?;
+            println!("{}", identity.public().node_id);
+        }
+        Command::Server(args) => {
+            let (database, signer, credentials) = coordination_paths(&args.paths)?;
+            if let Some(password) = read_password(args.admin_password_stdin)? {
+                CoordServer::reset_admin_password(&credentials, Some(&password))?;
+            }
+            let server = CoordServer::open_with_admin_credentials_and_network_config(
+                database,
+                signer,
+                args.paths.tenant,
+                credentials,
+                args.paths.doh,
+                args.paths.stun,
+            )?;
+            println!(
+                "coordination server public key: {}",
+                base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    server.server_public_key()
+                )
+            );
+            server
+                .serve(tokio::net::TcpListener::bind(args.bind).await?)
+                .await?;
+        }
+        Command::Invite(args) => {
+            let server = open_coordination_server(&args.paths)?;
+            println!("{}", server.create_invite(args.ttl)?);
+        }
+        Command::Peers(args) => {
+            let server = open_coordination_server(&args)?;
+            for peer in server.list_peers()? {
+                println!("{peer}");
+            }
+        }
+        Command::Revoke(args) => {
+            let server = open_coordination_server(&args.paths)?;
+            server.revoke_peer(args.node_id).await?;
+        }
+        Command::Admin(args) => run_admin_command(args).await?,
+        Command::Peer { command } => run_peer_command(command).await?,
+    }
+    Ok(())
+}
+
+async fn run_admin_command(args: AdminArgs) -> Result<(), Box<dyn std::error::Error>> {
+    match args.command {
+        AdminCommand::Password(args) => match args.command {
+            AdminPasswordCommand::Reset(args) => {
+                let credentials = args.path.join("admin.credentials");
+                let password = read_password(args.password_stdin)?;
+                let password = CoordServer::reset_admin_password(credentials, password.as_deref())?;
+                println!("admin username: admin");
+                println!("admin password: {password}");
+                println!("restart the server to load the new password");
+            }
+        },
+    }
+    Ok(())
+}
+
+async fn run_peer_command(command: PeerCommand) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        PeerCommand::Register(args) => {
+            let server_key = decode_server_key(&args.server_key)?;
+            let state = vela_diagnostic::register(
+                &args.state,
+                args.server,
+                server_key,
+                &args.invite,
+                args.port.unwrap_or(0),
+                args.stun,
+            )
+            .await?;
+            let identity = Identity::load(PeerState::identity_path(&args.state))?;
+            println!("registered {}", identity.public().node_id);
+            println!("state saved in {}", args.state.display());
+            let _ = state;
+        }
+        PeerCommand::Up(args) => run_peer_up(args).await?,
+        PeerCommand::List(args) => {
+            let control = LocalControlClient::open(&args.state).await?;
+            let peers = control.peers().await?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&peers)?);
+            } else {
+                print_peer_table(&peers);
+            }
+        }
+        PeerCommand::Status(args) => {
+            let control = LocalControlClient::open(&args.state).await?;
+            let status = control.status().await?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                println!("node\t{}", status.node_id);
+                println!("server\t{}", status.server);
+                println!("local_addrs\t{:?}", status.local_addrs);
+                println!("doh_servers\t{:?}", status.doh_servers);
+                println!("stun_servers\t{:?}", status.stun_servers);
+                println!("candidates\t{:?}", status.candidates);
+                println!("peers\t{}", status.peers.len());
+            }
+        }
+        PeerCommand::Ping(args) => {
+            let control = LocalControlClient::open(&args.state).await?;
+            let report = control.ping(args.target, args.count, args.timeout).await?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "direct ping {} via {} ({}) connect={}ms rtt={:?}ms",
+                    report.target,
+                    report.path,
+                    report.candidate_type,
+                    report.connect_ms,
+                    report.rtts_ms
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_peer_table(peers: &[vela_proto::PeerSummary]) {
+    println!("name\tnode\tstatus\tipv4\tipv6\tcapabilities");
+    for peer in peers {
+        let name = if peer.name.is_empty() {
+            "-"
+        } else {
+            peer.name.as_str()
+        };
+        let ipv4 = peer
+            .virtual_ipv4
+            .map_or_else(|| "-".to_owned(), |address| address.to_string());
+        let ipv6 = peer
+            .virtual_ipv6
+            .map_or_else(|| "-".to_owned(), |address| address.to_string());
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{:?}",
+            name,
+            peer.node_id,
+            if peer.online { "online" } else { "offline" },
+            ipv4,
+            ipv6,
+            peer.capabilities
+        );
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+async fn run_peer_up(_args: PeerUpArgs) -> Result<(), Box<dyn std::error::Error>> {
+    Err("peer up is unsupported on this platform".into())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+async fn run_peer_up(args: PeerUpArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let process = vela_diagnostic::DiagnosticRuntime::open(
+        &args.state,
+        args.port,
+        (!args.stun.is_empty()).then_some(args.stun),
+        args.bind,
+    )
+    .await?;
+    let snapshot = process
+        .io
+        .snapshots
+        .borrow()
+        .clone()
+        .ok_or_else(|| invalid_input("state has no network snapshot; register first"))?;
+    let tun_name = args.tun.unwrap_or_else(|| {
+        if cfg!(target_os = "macos") {
+            String::new()
+        } else {
+            "vela0".to_owned()
+        }
+    });
+    let tun = match vela_tun::TunDevice::open(vela_tun::TunConfig {
+        name: tun_name,
+        mtu: args.mtu,
+    }) {
+        Ok(tun) => tun,
+        Err(error) => {
+            stop_process(process).await;
+            return Err(error.into());
+        }
+    };
+    let routes = match vela_tun::RouteManager::for_tun(&tun).await {
+        Ok(routes) => routes,
+        Err(error) => {
+            stop_process(process).await;
+            return Err(error.into());
+        }
+    };
+    if let Err(error) = routes.set_mtu(args.mtu).await {
+        stop_process(process).await;
+        return Err(error.into());
+    }
+    let mut leases = Vec::new();
+    if let Err(error) =
+        apply_tun_snapshot(process.handle.node_id(), &routes, &mut leases, &snapshot).await
+    {
+        release_route_leases(&mut leases).await;
+        stop_process(process).await;
+        return Err(error);
+    }
+    let endpoint = process.handle.endpoint().address.map_or_else(
+        || "unavailable".to_owned(),
+        |address| format!("http://{address}"),
+    );
+    println!(
+        "peer {} up on TUN {}; dashboard available at {}",
+        process.handle.node_id(),
+        tun.name(),
+        endpoint
+    );
+    run_tun_peer(process, tun, routes, leases).await
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+async fn stop_process(process: RuntimeProcess) {
+    process.handle.stop();
+    let _ = process.task.await;
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -89,270 +523,29 @@ async fn release_route_leases(leases: &mut Vec<vela_tun::RouteLease>) {
     }
 }
 
-fn coordination_paths(args: &[String]) -> (PathBuf, PathBuf, PathBuf) {
-    let path = option(args, "--path").map(PathBuf::from);
-    let database = option(args, "--db")
-        .map(PathBuf::from)
-        .or_else(|| path.as_ref().map(|path| path.join("vela.db")))
-        .unwrap_or_else(|| {
-            eprintln!("missing --path");
-            usage()
-        });
-    let signer = option(args, "--signer")
-        .map(PathBuf::from)
-        .or_else(|| path.as_ref().map(|path| path.join("server.key")))
-        .unwrap_or_else(|| {
-            eprintln!("missing --path");
-            usage()
-        });
-    let credentials = option(args, "--admin-credentials")
-        .map(PathBuf::from)
-        .or_else(|| path.map(|path| path.join("admin.credentials")))
-        .unwrap_or_else(|| database.with_extension("admin-credentials"));
-    (database, signer, credentials)
-}
-
-fn open_coordination_server(args: &[String]) -> Result<CoordServer, Box<dyn std::error::Error>> {
-    let (database, signer, credentials) = coordination_paths(args);
-    Ok(CoordServer::open_with_admin_credentials_and_network_config(
-        database,
-        signer,
-        required(args, "--tenant"),
-        credentials,
-        options(args, "--doh"),
-        options(args, "--stun"),
-    )?)
-}
-
-fn password_from_stdin(args: &[String]) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    if !args
-        .iter()
-        .any(|arg| arg == "--password-stdin" || arg == "--admin-password-stdin")
-    {
-        return Ok(None);
-    }
-    let mut password = String::new();
-    std::io::stdin().read_to_string(&mut password)?;
-    let password = password.trim_end_matches(['\r', '\n']).to_owned();
-    if password.is_empty() {
-        return Err("password stdin was empty".into());
-    }
-    Ok(Some(password))
-}
-
-async fn run_peer_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(subcommand) = args.first() else {
-        usage();
-    };
-    let args = &args[1..];
-    match subcommand.as_str() {
-        "register" => {
-            let state_dir = required(args, "--state");
-            let server = required(args, "--server");
-            let server_key = decode_server_key(&required(args, "--server-key"))?;
-            let invite = required(args, "--invite");
-            let port = port_option(args)?.unwrap_or(0);
-            let stun = options(args, "--stun");
-            let state =
-                vela_diagnostic::register(&state_dir, server, server_key, &invite, port, stun)
-                    .await?;
-            let identity = Identity::load(PeerState::identity_path(&state_dir))?;
-            println!("registered {}", identity.public().node_id);
-            println!("state saved in {}", state_dir);
-            let _ = state;
-        }
-        "run" => {
-            let state_dir = required(args, "--state");
-            let stun_values = options(args, "--stun");
-            let stun = if stun_values.is_empty() {
-                None
-            } else {
-                Some(stun_values)
-            };
-            let peer = DiagnosticPeer::open(&state_dir, port_option(args)?, stun).await?;
-            println!(
-                "peer {} ready on {:?}",
-                peer.node_id(),
-                peer.node.local_addrs()?
-            );
-            peer.run().await?;
-        }
-        "dashboard" => {
-            let state_dir = required(args, "--state");
-            let stun_values = options(args, "--stun");
-            let stun = if stun_values.is_empty() {
-                None
-            } else {
-                Some(stun_values)
-            };
-            let bind = option(args, "--bind")
-                .unwrap_or_else(|| "127.0.0.1:7001".to_owned())
-                .parse::<SocketAddr>()?;
-            let peer = DiagnosticPeer::open(&state_dir, port_option(args)?, stun).await?;
-            println!(
-                "peer {} dashboard available at http://{}",
-                peer.node_id(),
-                bind
-            );
-            peer.run_with_dashboard(bind).await?;
-        }
-        "up" => {
-            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-            {
-                let _ = args;
-                return Err("peer up is unsupported on this platform".into());
-            }
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-            {
-                let state_dir = required(args, "--state");
-                let stun_values = options(args, "--stun");
-                let stun = if stun_values.is_empty() {
-                    None
-                } else {
-                    Some(stun_values)
-                };
-                let mut peer = DiagnosticPeer::open(&state_dir, port_option(args)?, stun).await?;
-                let bind = option(args, "--bind")
-                    .unwrap_or_else(|| "127.0.0.1:7001".to_owned())
-                    .parse::<SocketAddr>()?;
-                let dashboard = peer.open_dashboard().await?;
-                let snapshot = peer
-                    .state
-                    .snapshot
-                    .clone()
-                    .ok_or("state has no network snapshot; register first")?;
-                let tun_name = option(args, "--tun").unwrap_or_else(|| {
-                    if cfg!(target_os = "macos") {
-                        String::new()
-                    } else {
-                        "vela0".into()
-                    }
-                });
-                let mtu = option(args, "--mtu")
-                    .map(|value| value.parse::<usize>())
-                    .transpose()?
-                    .unwrap_or(1200);
-                let tun = vela_tun::TunDevice::open(vela_tun::TunConfig {
-                    name: tun_name,
-                    mtu,
-                })?;
-                let routes = vela_tun::RouteManager::for_tun(&tun).await?;
-                routes.set_mtu(mtu).await?;
-                let mut leases = Vec::new();
-                apply_tun_snapshot(&peer, &routes, &mut leases, &snapshot).await?;
-                println!(
-                    "peer {} up on TUN {}; dashboard available at http://{}",
-                    peer.node_id(),
-                    tun.name(),
-                    bind
-                );
-                run_tun_peer(peer, tun, routes, leases, dashboard, bind).await?;
-            }
-        }
-        "list" => {
-            let state_dir = required(args, "--state");
-            let mut control = DiagnosticControl::open(&state_dir).await?;
-            let peers = control.list_peers().await?;
-            if args.iter().any(|arg| arg == "--json") {
-                println!("{}", serde_json::to_string_pretty(&peers)?);
-            } else {
-                println!("name\tnode\tstatus\tipv4\tipv6\tcapabilities");
-                for peer in peers {
-                    let name = if peer.name.is_empty() {
-                        "-"
-                    } else {
-                        peer.name.as_str()
-                    };
-                    let ipv4 = peer
-                        .virtual_ipv4
-                        .map_or_else(|| "-".to_owned(), |address| address.to_string());
-                    let ipv6 = peer
-                        .virtual_ipv6
-                        .map_or_else(|| "-".to_owned(), |address| address.to_string());
-                    println!(
-                        "{}\t{}\t{}\t{}\t{}\t{:?}",
-                        name,
-                        peer.node_id,
-                        if peer.online { "online" } else { "offline" },
-                        ipv4,
-                        ipv6,
-                        peer.capabilities
-                    );
-                }
-            }
-        }
-        "status" => {
-            let state_dir = required(args, "--state");
-            let mut control = DiagnosticControl::open(&state_dir).await?;
-            let status = control.status().await?;
-            if args.iter().any(|arg| arg == "--json") {
-                println!("{}", serde_json::to_string_pretty(&status)?);
-            } else {
-                println!("node\t{}", status.node_id);
-                println!("server\t{}", status.server);
-                println!("local_addrs\t{:?}", status.local_addrs);
-                println!("doh_servers\t{:?}", status.doh_servers);
-                println!("stun_servers\t{:?}", status.stun_servers);
-                println!("candidates\t{:?}", status.candidates);
-                println!("peers\t{}", status.peers.len());
-            }
-        }
-        "ping" => {
-            let target = args
-                .first()
-                .ok_or_else(|| "missing target node id".to_owned())?
-                .parse::<NodeId>()?;
-            let state_dir = required(args, "--state");
-            let count = option(args, "--count")
-                .map(|value| value.parse())
-                .transpose()?
-                .unwrap_or(1);
-            let timeout = option(args, "--timeout")
-                .map(|value| parse_duration(&value))
-                .transpose()?
-                .unwrap_or_else(|| Duration::from_secs(8));
-            let mut peer = DiagnosticPeer::open(&state_dir, None, None).await?;
-            let report = peer.ping(target, count, timeout).await?;
-            if args.iter().any(|arg| arg == "--json") {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                println!(
-                    "direct ping {} via {} ({}) connect={}ms rtt={:?}ms",
-                    report.target,
-                    report.path,
-                    report.candidate_type,
-                    report.connect_ms,
-                    report.rtts_ms
-                );
-            }
-        }
-        _ => usage(),
-    }
-    Ok(())
-}
-
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 async fn apply_tun_snapshot(
-    peer: &DiagnosticPeer,
+    node_id: NodeId,
     routes: &vela_tun::RouteManager,
     leases: &mut Vec<vela_tun::RouteLease>,
     snapshot: &vela_proto::NetworkSnapshot,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    snapshot
+        .validate()
+        .map_err(|error| invalid_input(format!("invalid network snapshot: {error}")))?;
+    let local = snapshot
+        .peers
+        .iter()
+        .find(|peer| peer.node_id == node_id)
+        .ok_or_else(|| invalid_input("snapshot does not contain this node"))?;
     tracing::debug!(
         debug_marker = "vela-tun",
-        node_id = %peer.node_id(),
+        node_id = %node_id,
         generation = snapshot.generation,
         peer_count = snapshot.peers.len(),
         "applying network snapshot to TUN"
     );
-    for lease in leases.drain(..) {
-        let _ = lease.release().await;
-    }
-    let local = snapshot
-        .peers
-        .iter()
-        .find(|value| value.node_id == peer.node_id())
-        .ok_or("snapshot does not contain this node")?;
+    release_route_leases(leases).await;
     if let (Some(address), Some(cidr)) = (local.virtual_ipv4, snapshot.virtual_ipv4) {
         routes
             .add_local_address(address.into(), cidr.prefix_len)
@@ -363,500 +556,104 @@ async fn apply_tun_snapshot(
             .add_local_address(address.into(), cidr.prefix_len)
             .await?;
     }
-    *leases = vela_tun::install_snapshot_routes(routes, snapshot, peer.node_id()).await?;
-    tracing::debug!(
-        debug_marker = "vela-tun",
-        node_id = %peer.node_id(),
-        local_ipv4 = ?local.virtual_ipv4,
-        local_ipv6 = ?local.virtual_ipv6,
-        installed_route_leases = leases.len(),
-        "TUN addresses and peer routes installed"
-    );
+    *leases = vela_tun::install_snapshot_routes(routes, snapshot, node_id).await?;
     Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TunSendDisposition {
-    Drop,
-    Reconnect,
-    Fatal,
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn tun_send_disposition(error: &vela_core::SendError) -> TunSendDisposition {
-    match error {
-        vela_core::SendError::Ip(_) | vela_core::SendError::QueueFull => TunSendDisposition::Drop,
-        vela_core::SendError::SnapshotExpired => TunSendDisposition::Reconnect,
-        _ => TunSendDisposition::Fatal,
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 async fn run_tun_peer(
-    peer: DiagnosticPeer,
+    process: RuntimeProcess,
     tun: vela_tun::TunDevice,
     routes: vela_tun::RouteManager,
     mut leases: Vec<vela_tun::RouteLease>,
-    dashboard: DashboardHandle,
-    dashboard_bind: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let node = peer.node.clone();
-    let mut peer = Some(peer);
-    let mut refresh = tokio::time::interval(vela_diagnostic::CANDIDATE_REFRESH_INTERVAL);
-    let mut dashboard_refresh = tokio::time::interval(Duration::from_secs(1));
-    let mut dashboard_peer_refresh = tokio::time::interval(Duration::from_secs(5));
-    let mut control_connected = true;
-    let mut dashboard_error = None;
-    let mut dashboard_peers = peer
-        .as_mut()
-        .expect("control peer is available")
-        .list_peers()
-        .await?;
-    peer.as_ref()
-        .expect("control peer is available")
-        .publish_dashboard(&dashboard, true, &dashboard_peers, None)
-        .await;
-    let dashboard_server = dashboard.serve(dashboard_bind);
-    tokio::pin!(dashboard_server);
-    let mut pending_reconnects = HashSet::new();
-    let mut reconnect_backoff = Duration::from_secs(1);
-    let mut reconnect_sleep = Box::pin(tokio::time::sleep(Duration::ZERO));
-    let mut reconnect_task: Option<
-        tokio::task::JoinHandle<(DiagnosticPeer, Result<NetworkSnapshot, DiagnosticError>)>,
-    > = None;
+    let vela_diagnostic::RuntimeProcess {
+        handle,
+        io,
+        mut task,
+    } = process;
+    let mut packets = io.packets;
+    let mut snapshots = io.snapshots;
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
-    loop {
+
+    let mut runtime_result = None;
+    let loop_result: Result<(), Box<dyn std::error::Error>> = loop {
         tokio::select! {
-            result = &mut dashboard_server => {
-                return result.map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) });
-            }
-            _ = dashboard_refresh.tick() => {
-                if let Some(control_peer) = peer.as_ref() {
-                    control_peer
-                        .publish_dashboard(
-                            &dashboard,
-                            control_connected,
-                            &dashboard_peers,
-                            dashboard_error.clone(),
-                        )
-                        .await;
-                }
-            }
-            _ = dashboard_peer_refresh.tick(), if control_connected && peer.is_some() => {
-                let control_peer = peer.as_mut().expect("control peer is available");
-                match control_peer.list_peers().await {
-                    Ok(peers) => {
-                        dashboard_peers = peers;
-                        dashboard_error = None;
-                    }
-                    Err(error) if DiagnosticPeer::is_retryable_control_error(&error) => {
-                        dashboard_error = Some(error.to_string());
-                    }
-                    Err(error) => return Err(error.into()),
-                }
+            result = &mut task => {
+                runtime_result = Some(match result {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => Err(Box::new(error) as Box<dyn std::error::Error>),
+                    Err(error) => Err(Box::new(error) as Box<dyn std::error::Error>),
+                });
+                break Ok(());
             }
             packet = tun.recv() => {
                 let packet = packet?;
                 let packet_len = packet.len();
-                tracing::debug!(
-                    debug_marker = "vela-tun",
-                    packet_len,
-                    "received packet from TUN"
-                );
-                match node.send_ip(packet).await {
+                match handle.send_ip(packet).await {
                     Ok(()) => tracing::debug!(
                         debug_marker = "vela-tun",
                         packet_len,
                         "handed TUN packet to Vela core"
                     ),
-                    Err(vela_core::SendError::Ip(error)) => {
-                        tracing::debug!(
-                            debug_marker = "vela-tun",
-                            packet_len,
-                            error = %error,
-                            "dropping invalid or unrouted packet from TUN"
-                        );
-                    }
-                    Err(vela_core::SendError::QueueFull) => {
-                        tracing::debug!(
-                            debug_marker = "vela-tun",
-                            packet_len,
-                            "dropping packet because the peer send queue is full"
-                        );
-                    }
-                    Err(error)
-                        if tun_send_disposition(&error) == TunSendDisposition::Reconnect =>
-                    {
-                        if control_connected {
-                            tracing::warn!(
-                                debug_marker = "vela-tun",
-                                packet_len,
-                                error = %error,
-                                "network snapshot expired; reconnecting to coordination service"
-                            );
-                            control_connected = false;
-                            reconnect_sleep
-                                .as_mut()
-                                .reset(tokio::time::Instant::now());
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            debug_marker = "vela-tun",
-                            packet_len,
-                            error = %error,
-                            "fatal error while sending TUN packet"
-                        );
-                        return Err(error.into());
-                    }
+                    Err(vela_core::SendError::Ip(error)) => tracing::debug!(
+                        debug_marker = "vela-tun",
+                        packet_len,
+                        error = %error,
+                        "dropping invalid or unrouted packet from TUN"
+                    ),
+                    Err(vela_core::SendError::QueueFull) => tracing::debug!(
+                        debug_marker = "vela-tun",
+                        packet_len,
+                        "dropping packet because the peer send queue is full"
+                    ),
+                    Err(vela_core::SendError::SnapshotExpired) => tracing::warn!(
+                        debug_marker = "vela-control",
+                        packet_len,
+                        "network snapshot expired; waiting for runtime reconnect"
+                    ),
+                    Err(error) => break Err(Box::new(error)),
                 }
             }
-            event = node.next_event() => {
-                match event {
-                    Some(vela_core::VelaEvent::IpPacket { peer, packet }) => {
-                        tracing::debug!(
-                            debug_marker = "vela-tun",
-                            peer_id = %peer,
-                            source = ?packet.source(),
-                            destination = ?packet.destination(),
-                            packet_len = packet.as_bytes().len(),
-                            "received decrypted IP packet; writing to TUN"
-                        );
-                        tun.send(packet.as_bytes()).await?;
-                    }
-                    Some(vela_core::VelaEvent::PeerConnecting(peer)) => tracing::info!(
-                        debug_marker = "vela-session",
-                        peer_id = %peer,
-                        "peer session connecting"
-                    ),
-                    Some(vela_core::VelaEvent::PeerConnected(peer)) => tracing::info!(
-                        debug_marker = "vela-session",
-                        peer_id = %peer,
-                        "peer session connected"
-                    ),
-                    Some(vela_core::VelaEvent::PeerDisconnected(peer)) => tracing::warn!(
-                        debug_marker = "vela-session",
-                        peer_id = %peer,
-                        "peer session disconnected"
-                    ),
-                    Some(
-                        vela_core::VelaEvent::PeerConnectionRequested(peer_id)
-                        | vela_core::VelaEvent::PeerReconnectRequested(peer_id),
-                    ) => {
-                        if !control_connected {
-                            pending_reconnects.insert(peer_id);
-                            continue;
-                        }
-                        let control_peer = peer.as_mut().expect("control peer is available");
-                        if let Err(error) = control_peer.request_peer_connection(peer_id).await {
-                            if !DiagnosticPeer::is_retryable_control_error(&error) {
-                                return Err(error.into());
-                            }
-                            pending_reconnects.insert(peer_id);
-                            tracing::warn!(
-                                debug_marker = "vela-control",
-                                peer_id = %peer_id,
-                                error = %error,
-                                "failed to signal peer for bilateral connection; retrying coordination"
-                            );
-                            control_connected = false;
-                            reconnect_sleep.as_mut().reset(
-                                tokio::time::Instant::now() + reconnect_backoff,
-                            );
-                        }
-                    }
-                    Some(vela_core::VelaEvent::PeerUnreachable(peer)) => tracing::warn!(
-                        debug_marker = "vela-session",
-                        peer_id = %peer,
-                        "peer is unreachable"
-                    ),
-                    Some(vela_core::VelaEvent::PathChanged(peer, path)) => tracing::info!(
-                        debug_marker = "vela-session",
-                        peer_id = %peer,
-                        path = %path,
-                        "peer path changed"
-                    ),
-                    Some(vela_core::VelaEvent::TransportFailed { family, error }) => {
-                        return Err(format!("UDP transport failed ({family:?}): {error}").into());
-                    }
-                    None => return Err("Vela node stopped".into()),
-                }
+            event = packets.recv() => {
+                let Some((_peer, packet)) = event else {
+                    break Err(invalid_input("peer runtime packet channel closed"));
+                };
+                tun.send(packet.as_bytes()).await?;
             }
-            message = async {
-                peer.as_mut()
-                    .expect("control peer is available")
-                    .client
-                    .recv()
-                    .await
-            }, if control_connected && peer.is_some() => {
-                match message {
-                    Ok(vela_proto::ControlMessage::ConnectSignal { from, to }) if to == node.node_id() => {
-                        tracing::debug!(
-                            debug_marker = "vela-control",
-                            from = %from.node_id,
-                            "received peer connect signal"
-                        );
-                        let control_peer = peer.as_mut().expect("control peer is available");
-                        let info = control_peer.client.verify_public_peer(from)?;
-                        let peer_id = info.node_id;
-                        node.register_peer(info).await?;
-                        let connect_node = node.clone();
-                        tokio::spawn(async move {
-                            if let Err(error) = connect_node.connect(peer_id).await {
-                                tracing::warn!(
-                                    debug_marker = "vela-session",
-                                    peer_id = %peer_id,
-                                    error = %error,
-                                    "peer connection triggered by coordination signal failed"
-                                );
-                            }
-                        });
+            changed = snapshots.changed() => {
+                if changed.is_err() {
+                    break Err(invalid_input("peer runtime snapshot channel closed"));
+                }
+                if let Some(snapshot) = snapshots.borrow().clone() {
+                    if let Err(error) = apply_tun_snapshot(
+                        handle.node_id(),
+                        &routes,
+                        &mut leases,
+                        &snapshot,
+                    ).await {
+                        break Err(error);
                     }
-                    Ok(vela_proto::ControlMessage::Snapshot { snapshot }) => {
-                        tracing::debug!(
-                            debug_marker = "vela-control",
-                            generation = snapshot.generation,
-                            peer_count = snapshot.peers.len(),
-                            "received network snapshot"
-                        );
-                        let control_peer = peer.as_mut().expect("control peer is available");
-                        let refresh_candidates = control_peer.apply_snapshot(snapshot.clone()).await?;
-                        apply_tun_snapshot(control_peer, &routes, &mut leases, &snapshot).await?;
-                        if refresh_candidates {
-                            if let Err(error) = control_peer.refresh_candidates().await {
-                                if !DiagnosticPeer::is_retryable_control_error(&error) {
-                                    return Err(error.into());
-                                }
-                                tracing::warn!(error = %error, "coordination refresh failed; retrying");
-                                control_connected = false;
-                                reconnect_sleep.as_mut().reset(
-                                    tokio::time::Instant::now() + reconnect_backoff,
-                                );
-                            }
-                        }
-                    }
-                    Ok(vela_proto::ControlMessage::Revoke { node_id }) if node_id == node.node_id() => {
-                        for lease in leases.drain(..) {
-                            let _ = lease.release().await;
-                        }
-                        node.shutdown().await;
-                        return Err("peer membership was revoked".into());
-                    }
-                    Err(error) => {
-                        let error = vela_diagnostic::DiagnosticError::Coordination(error);
-                        if !DiagnosticPeer::is_retryable_control_error(&error) {
-                            return Err(error.into());
-                        }
-                        tracing::warn!(
-                            debug_marker = "vela-control",
-                            error = %error,
-                            "coordination connection lost; retrying while keeping data plane alive"
-                        );
-                        control_connected = false;
-                        reconnect_sleep.as_mut().reset(
-                            tokio::time::Instant::now() + reconnect_backoff,
-                        );
-                    }
-                    _ => {}
                 }
             }
             _ = &mut ctrl_c => {
                 tracing::info!(debug_marker = "vela-lifecycle", "shutdown requested");
-                node.shutdown().await;
-                release_route_leases(&mut leases).await;
-                return Ok(());
-            }
-            tick = refresh.tick(), if control_connected && peer.is_some() => {
-                let _ = tick;
-                let control_peer = peer.as_mut().expect("control peer is available");
-                if let Err(error) = control_peer.refresh_candidates().await {
-                    if !DiagnosticPeer::is_retryable_control_error(&error) {
-                        return Err(error.into());
-                    }
-                    tracing::warn!(error = %error, "coordination refresh failed; retrying");
-                    control_connected = false;
-                    reconnect_sleep.as_mut().reset(
-                        tokio::time::Instant::now() + reconnect_backoff,
-                    );
-                }
-            }
-            _ = &mut reconnect_sleep, if !control_connected && reconnect_task.is_none() => {
-                let mut reconnect_peer = peer.take().expect("control peer is available");
-                let reconnect_node_id = node.node_id();
-                tracing::info!(
-                    debug_marker = "vela-control",
-                    node_id = %reconnect_node_id,
-                    "starting coordination reconnect in background"
-                );
-                reconnect_task = Some(tokio::spawn(async move {
-                    let result = reconnect_peer.reconnect().await;
-                    (reconnect_peer, result)
-                }));
-            }
-            reconnect_result = async {
-                reconnect_task
-                    .as_mut()
-                    .expect("reconnect task is available")
-                    .await
-            }, if reconnect_task.is_some() => {
-                let (reconnected_peer, result) = reconnect_result
-                    .map_err(|error| format!("coordination reconnect task failed: {error}"))?;
-                peer = Some(reconnected_peer);
-                match result {
-                    Ok(snapshot) => {
-                        tracing::info!(
-                            debug_marker = "vela-control",
-                            generation = snapshot.generation,
-                            "coordination reconnected"
-                        );
-                        let control_peer = peer.as_ref().expect("control peer is available");
-                        apply_tun_snapshot(control_peer, &routes, &mut leases, &snapshot).await?;
-                        reconnect_task = None;
-                        control_connected = true;
-                        reconnect_backoff = Duration::from_secs(1);
-                        let pending = std::mem::take(&mut pending_reconnects);
-                        for peer_id in pending {
-                            let control_peer = peer.as_mut().expect("control peer is available");
-                            if let Err(error) = control_peer.request_peer_connection(peer_id).await {
-                                if !DiagnosticPeer::is_retryable_control_error(&error) {
-                                    return Err(error.into());
-                                }
-                                pending_reconnects.insert(peer_id);
-                                tracing::warn!(
-                                    debug_marker = "vela-control",
-                                    peer_id = %peer_id,
-                                    error = %error,
-                                    "failed to flush bilateral reconnect signal"
-                                );
-                                control_connected = false;
-                                reconnect_sleep.as_mut().reset(
-                                    tokio::time::Instant::now() + reconnect_backoff,
-                                );
-                                break;
-                            }
-                        }
-                    }
-                    Err(error) if DiagnosticPeer::is_retryable_control_error(&error) => {
-                        tracing::warn!(
-                            debug_marker = "vela-control",
-                            error = %error,
-                            backoff = ?reconnect_backoff,
-                            "coordination reconnect failed; data plane remains running"
-                        );
-                        reconnect_task = None;
-                        reconnect_sleep.as_mut().reset(
-                            tokio::time::Instant::now() + reconnect_backoff,
-                        );
-                        reconnect_backoff = reconnect_backoff
-                            .saturating_mul(2)
-                            .min(Duration::from_secs(30));
-                    }
-                    Err(error) => return Err(error.into()),
-                }
+                break Ok(());
             }
         }
-    }
-}
+    };
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    let result = runtime.block_on(async_main());
-    runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
-    result
-}
-
-async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
-    init_tracing();
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("Rustls crypto provider already installed");
-
-    let mut args = env::args().skip(1).collect::<Vec<_>>();
-    let command = args.first().cloned().unwrap_or_default();
-    if command.is_empty() {
-        usage();
+    if runtime_result.is_none() {
+        handle.stop();
+        runtime_result = Some(
+            task.await
+                .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?
+                .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) }),
+        );
     }
-    args.remove(0);
-    match command.as_str() {
-        "identity" => {
-            let path = args.first().map(PathBuf::from).unwrap_or_else(|| usage());
-            let identity = Identity::load_or_generate(&path)?;
-            println!("{}", identity.public().node_id);
-        }
-        "server" => {
-            let bind = SocketAddr::from_str(&required(&args, "--bind"))?;
-            let tenant = required(&args, "--tenant");
-            let (database, signer, credentials) = coordination_paths(&args);
-            if let Some(password) = password_from_stdin(&args)? {
-                CoordServer::reset_admin_password(&credentials, Some(&password))?;
-            }
-            let server = CoordServer::open_with_admin_credentials_and_network_config(
-                database,
-                signer,
-                tenant,
-                credentials,
-                options(&args, "--doh"),
-                options(&args, "--stun"),
-            )?;
-            println!(
-                "coordination server public key: {}",
-                base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    server.server_public_key()
-                )
-            );
-            server
-                .serve(tokio::net::TcpListener::bind(bind).await?)
-                .await?;
-        }
-        "invite" => {
-            let server = open_coordination_server(&args)?;
-            let ttl = option(&args, "--ttl")
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(3600);
-            println!("{}", server.create_invite(ttl)?);
-        }
-        "peers" => {
-            let server = open_coordination_server(&args)?;
-            for peer in server.list_peers()? {
-                println!("{peer}");
-            }
-        }
-        "revoke" => {
-            let node_id = args
-                .first()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or_else(|| {
-                    eprintln!("missing node id");
-                    usage()
-                });
-            let server = open_coordination_server(&args)?;
-            server.revoke_peer(node_id).await?;
-        }
-        "admin" => {
-            if args.first().map(String::as_str) != Some("password")
-                || args.get(1).map(String::as_str) != Some("reset")
-            {
-                usage();
-            }
-            let (_, _, credentials) = coordination_paths(&args);
-            let password = password_from_stdin(&args)?.unwrap_or_default();
-            let password = CoordServer::reset_admin_password(
-                credentials,
-                (!password.is_empty()).then_some(password.as_str()),
-            )?;
-            println!("admin username: admin");
-            println!("admin password: {password}");
-            println!("restart the server to load the new password");
-        }
-        "peer" => run_peer_command(&args).await?,
-        _ => usage(),
-    }
-    Ok(())
+    release_route_leases(&mut leases).await;
+    loop_result.and(runtime_result.expect("runtime result is set"))
 }
 
 fn init_tracing() {
@@ -868,26 +665,39 @@ fn init_tracing() {
         .try_init();
 }
 
-#[cfg(all(
-    test,
-    any(target_os = "linux", target_os = "macos", target_os = "windows")
-))]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(async {
+        init_tracing();
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .expect("Rustls crypto provider already installed");
+        run_command(Cli::parse().command).await
+    });
+    runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
+    result
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn expired_snapshot_requests_coordination_reconnect() {
-        assert_eq!(
-            tun_send_disposition(&vela_core::SendError::SnapshotExpired),
-            TunSendDisposition::Reconnect
+    fn removed_peer_commands_are_rejected() {
+        assert!(Cli::try_parse_from(["vela-cli", "peer", "run", "--state", "state"]).is_err());
+        assert!(
+            Cli::try_parse_from(["vela-cli", "peer", "dashboard", "--state", "state"]).is_err()
         );
     }
 
     #[test]
-    fn legacy_peer_bind_argument_is_ignored() {
-        let args = vec!["--bind".to_owned(), "192.0.2.10:40000".to_owned()];
-        assert_eq!(port_option(&args).unwrap(), None);
-        let args = vec!["--port".to_owned(), "40000".to_owned()];
-        assert_eq!(port_option(&args).unwrap(), Some(40000));
+    fn ping_limits_are_parsed_at_the_cli_boundary() {
+        assert_eq!(parse_ping_count("32"), Ok(32));
+        assert!(parse_ping_count("33").is_err());
+        assert_eq!(parse_ping_timeout("100ms"), Ok(Duration::from_millis(100)));
+        assert!(parse_ping_timeout("99ms").is_err());
+        assert!(parse_ping_timeout("61s").is_err());
     }
 }

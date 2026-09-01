@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use if_addrs::get_if_addrs;
 use rand::RngCore;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     collections::{HashMap, VecDeque},
@@ -819,12 +819,14 @@ impl VelaNodeBuilder {
             shutdown: Notify::new(),
             stopping: AtomicBool::new(false),
             started: AtomicBool::new(false),
+            tasks: StdMutex::new(Vec::new()),
             network_id: Mutex::new(network_id),
             snapshot_generation: AtomicU64::new(0),
             snapshot_expires_at: AtomicU64::new(u64::MAX),
             local_ipv4: Mutex::new(local_ipv4),
             local_ipv6: Mutex::new(local_ipv6),
             stun_waiters: Mutex::new(HashMap::new()),
+            snapshot_update: Mutex::new(()),
         });
         Ok(VelaNode { inner })
     }
@@ -892,13 +894,24 @@ impl VelaNode {
             return Ok(());
         }
         let reader = Arc::clone(&self.inner);
-        tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             reader.read_loop().await;
         });
         let maintenance = Arc::clone(&self.inner);
-        tokio::spawn(async move {
+        let maintenance = tokio::spawn(async move {
             maintenance.keepalive_loop().await;
         });
+        let mut tasks = self
+            .inner
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.inner.stopping.load(Ordering::Acquire) {
+            reader.abort();
+            maintenance.abort();
+        } else {
+            tasks.extend([reader, maintenance]);
+        }
         Ok(())
     }
 
@@ -907,6 +920,16 @@ impl VelaNode {
         self.inner.shutdown.notify_waiters();
         self.inner.stun_waiters.lock().await.clear();
         self.inner.socket.shutdown().await;
+        let tasks = std::mem::take(
+            &mut *self
+                .inner
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for task in tasks {
+            let _ = task.await;
+        }
     }
 
     pub async fn register_peer(&self, info: PeerInfo) -> Result<(), CoreError> {
@@ -1005,6 +1028,7 @@ impl VelaNode {
     /// in one operation ensures that an address is never routed using a peer
     /// record from a different generation of the snapshot.
     pub async fn apply_snapshot(&self, snapshot: NetworkSnapshot) -> Result<(), CoreError> {
+        let _snapshot_update = self.inner.snapshot_update.lock().await;
         if let Some(server_public_key) = self.inner.config.server_public_key {
             verify_snapshot(&snapshot, &server_public_key, unix_time())?;
         }
@@ -1090,8 +1114,8 @@ impl VelaNode {
             .copied()
             .collect::<std::collections::HashSet<_>>();
 
-        // send_payload takes the route lock before the peer lock, so preserve
-        // that order when swapping both views.
+        // Keep route and peer replacement together so an outbound lookup
+        // cannot observe a peer table from a different snapshot.
         let mut route_guard = self.inner.routes.lock().await;
         let mut peer_guard = self.inner.peers.lock().await;
         let old_peers = peer_guard.clone();
@@ -1621,6 +1645,7 @@ struct Inner {
     observer: Option<Arc<dyn TrafficObserver>>,
     peers: Mutex<HashMap<NodeId, Arc<PeerState>>>,
     routes: Mutex<RouteTable>,
+    snapshot_update: Mutex<()>,
     network_id: Mutex<[u8; 16]>,
     snapshot_generation: AtomicU64,
     snapshot_expires_at: AtomicU64,
@@ -1632,12 +1657,16 @@ struct Inner {
     shutdown: Notify,
     stopping: AtomicBool,
     started: AtomicBool,
+    tasks: StdMutex<Vec<JoinHandle<()>>>,
 }
 
 impl Inner {
     async fn read_loop(self: Arc<Self>) {
         let mut buffer = vec![0u8; 65535];
         loop {
+            if self.stopping.load(Ordering::Acquire) {
+                break;
+            }
             tokio::select! {
                 _ = self.shutdown.notified() => break,
                 result = self.socket.recv_from(&mut buffer) => match result {
@@ -1708,6 +1737,9 @@ impl Inner {
             .checked_mul(3)
             .unwrap_or(Duration::MAX);
         loop {
+            if self.stopping.load(Ordering::Acquire) {
+                break;
+            }
             tokio::select! {
                 _ = self.shutdown.notified() => break,
                 _ = interval.tick() => {
@@ -2525,6 +2557,13 @@ impl Inner {
             return Err(SendError::SnapshotExpired);
         }
         let packet = IpPacket::parse(payload.clone()).map_err(SendError::Ip)?;
+        if packet.as_bytes().len() > self.config.virtual_mtu {
+            return Err(SendError::PacketTooLarge);
+        }
+        if payload.len() > self.config.max_payload_size {
+            return Err(SendError::PacketTooLarge);
+        }
+        let mut active = peer.active.lock().await;
         let routed_peer = self
             .routes
             .lock()
@@ -2534,13 +2573,6 @@ impl Inner {
         if routed_peer != peer.info().node_id {
             return Err(SendError::WrongPeer);
         }
-        if packet.as_bytes().len() > self.config.virtual_mtu {
-            return Err(SendError::PacketTooLarge);
-        }
-        if payload.len() > self.config.max_payload_size {
-            return Err(SendError::PacketTooLarge);
-        }
-        let mut active = peer.active.lock().await;
         let Some(session) = active.as_mut() else {
             let mut queue = peer.queue.lock().await;
             if queue.len() >= self.config.per_peer_queue_limit {
@@ -2575,30 +2607,42 @@ impl Inner {
         }
         .encode()
         .map_err(SendError::Protocol)?;
+        let path = session.path;
+        let session_id = session.session_id;
+        let wire_len = packet.len();
+        drop(active);
         self.socket
-            .send_to(&packet, session.path)
+            .send_to(&packet, path)
             .await
             .map_err(SendError::Io)?;
         debug!(
             debug_marker = "vela-data",
             peer_id = %peer.info().node_id,
-            path = %session.path,
-            session_id = session.session_id,
+            path = %path,
+            session_id,
             sequence,
             packet_len = payload.len(),
-            wire_len = packet.len(),
+            wire_len,
             "sent encrypted IP packet"
         );
-        session
-            .tx_bytes
-            .fetch_add(payload.len() as u64, Ordering::Relaxed);
+        if let Some(session) = peer
+            .active
+            .lock()
+            .await
+            .as_ref()
+            .filter(|session| session.session_id == session_id)
+        {
+            session
+                .tx_bytes
+                .fetch_add(payload.len() as u64, Ordering::Relaxed);
+        }
         self.observe(TrafficSample {
             peer: Some(peer.info().node_id),
             direction: TrafficDirection::Sent,
-            path: session.path,
+            path,
             payload_bytes: payload.len(),
             encrypted_bytes: encrypted_len,
-            wire_bytes: packet.len(),
+            wire_bytes: wire_len,
         });
         Ok(())
     }
@@ -2763,7 +2807,7 @@ pub struct PeerHandle {
     peer_id: NodeId,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerRuntimeStatus {
     pub node_id: NodeId,
     pub online: bool,
@@ -2785,14 +2829,14 @@ pub struct PeerRuntimeStatus {
     pub last_failure: Option<PeerFailureStatus>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerPathChange {
     pub path: SocketAddr,
     pub candidate_type: String,
     pub changed_at: u64,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PeerRuntimeState {
     Idle,
@@ -2801,7 +2845,7 @@ pub enum PeerRuntimeState {
     Unreachable,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerAttemptStatus {
     pub phase: PeerAttemptPhase,
     pub started_at: u64,
@@ -2810,7 +2854,7 @@ pub struct PeerAttemptStatus {
     pub candidates: Vec<PeerCandidateAttempt>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PeerAttemptPhase {
     Probing,
@@ -2818,7 +2862,7 @@ pub enum PeerAttemptPhase {
     Retrying,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerCandidateAttempt {
     pub candidate: Candidate,
     pub state: PeerCandidateState,
@@ -2827,7 +2871,7 @@ pub struct PeerCandidateAttempt {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PeerCandidateState {
     Pending,
@@ -2836,7 +2880,7 @@ pub enum PeerCandidateState {
     Failed,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerFailureStatus {
     pub reason: String,
     pub occurred_at: u64,

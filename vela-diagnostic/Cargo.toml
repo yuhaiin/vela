@@ -7,6 +7,10 @@ rust-version.workspace = true
 
 [dependencies]
 axum = "0.8"
+base64.workspace = true
+bytes.workspace = true
+fs2.workspace = true
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -15,6 +19,7 @@ tracing.workspace = true
 vela-coord-client = { path = "../vela-coord-client" }
 vela-core = { path = "../vela-core" }
 vela-crypto = { path = "../vela-crypto" }
+vela-ip = { path = "../vela-ip" }
 vela-proto = { path = "../vela-proto" }
 vela-stun = { path = "../vela-stun" }
 
