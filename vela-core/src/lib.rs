@@ -231,11 +231,11 @@ fn bind_dual_stack_socket_to_interface(
     socket: &Socket,
     interface: &DefaultRouteInterface,
 ) -> io::Result<()> {
-    // Darwin keeps IPv4 and IPv6 interface bindings separately. A dual-stack
-    // IPv6 socket therefore needs both options for IPv4-mapped sends to use
-    // the selected interface as well.
-    bind_socket_to_interface(socket, interface, false)?;
-    bind_socket_to_interface(socket, interface, true)
+    // This is an AF_INET6 socket. Darwin rejects the IPv4 IP_BOUND_IF option
+    // on it with EINVAL, even when IPV6_V6ONLY is disabled. IPv4-mapped
+    // datagrams therefore use the system IPv4 route, while native IPv6
+    // datagrams are pinned to the selected interface.
+    bind_socket_to_interface(socket, interface, false)
 }
 
 #[cfg(not(any(
@@ -263,7 +263,14 @@ impl DatagramProvider for TokioDatagramProvider {
         let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
         let dual_stack = options.local_addr.is_ipv6() && options.local_addr.ip().is_unspecified();
         if dual_stack {
-            socket.set_only_v6(false)?;
+            if let Err(error) = socket.set_only_v6(false) {
+                tracing::debug!(
+                    debug_marker = "vela-udp",
+                    error = %error,
+                    "failed to enable IPv4-mapped traffic on dual-stack socket"
+                );
+                return Err(error.into());
+            }
         }
         let selected_interface = if options.local_addr.ip().is_unspecified() {
             Some(default_route_interface(options.local_addr)?.ok_or_else(|| {
@@ -283,13 +290,41 @@ impl DatagramProvider for TokioDatagramProvider {
                 "binding peer UDP socket to the default-route interface"
             );
             if dual_stack {
-                bind_dual_stack_socket_to_interface(&socket, interface)?;
+                if let Err(error) = bind_dual_stack_socket_to_interface(&socket, interface) {
+                    tracing::debug!(
+                        debug_marker = "vela-udp",
+                        interface = %interface.name,
+                        index = ?interface.index,
+                        error = %error,
+                        "failed to bind dual-stack socket to interface"
+                    );
+                    return Err(error.into());
+                }
             } else {
-                bind_socket_to_interface(&socket, interface, options.local_addr.is_ipv4())?;
+                if let Err(error) =
+                    bind_socket_to_interface(&socket, interface, options.local_addr.is_ipv4())
+                {
+                    tracing::debug!(
+                        debug_marker = "vela-udp",
+                        interface = %interface.name,
+                        index = ?interface.index,
+                        error = %error,
+                        "failed to bind socket to interface"
+                    );
+                    return Err(error.into());
+                }
             }
         }
         socket.set_nonblocking(true)?;
-        socket.bind(&options.local_addr.into())?;
+        if let Err(error) = socket.bind(&options.local_addr.into()) {
+            tracing::debug!(
+                debug_marker = "vela-udp",
+                local_addr = %options.local_addr,
+                error = %error,
+                "failed to bind peer UDP socket"
+            );
+            return Err(error.into());
+        }
         *self
             .selected_interface
             .lock()

@@ -340,6 +340,23 @@ async fn apply_tun_snapshot(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TunSendDisposition {
+    Drop,
+    Reconnect,
+    Fatal,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn tun_send_disposition(error: &vela_core::SendError) -> TunSendDisposition {
+    match error {
+        vela_core::SendError::Ip(_) | vela_core::SendError::QueueFull => TunSendDisposition::Drop,
+        vela_core::SendError::SnapshotExpired => TunSendDisposition::Reconnect,
+        _ => TunSendDisposition::Fatal,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 async fn run_tun_peer(
     peer: DiagnosticPeer,
     tun: vela_tun::TunDevice,
@@ -387,6 +404,22 @@ async fn run_tun_peer(
                             packet_len,
                             "dropping packet because the peer send queue is full"
                         );
+                    }
+                    Err(error)
+                        if tun_send_disposition(&error) == TunSendDisposition::Reconnect =>
+                    {
+                        if control_connected {
+                            tracing::warn!(
+                                debug_marker = "vela-tun",
+                                packet_len,
+                                error = %error,
+                                "network snapshot expired; reconnecting to coordination service"
+                            );
+                            control_connected = false;
+                            reconnect_sleep
+                                .as_mut()
+                                .reset(tokio::time::Instant::now());
+                        }
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -690,4 +723,20 @@ fn init_tracing() {
         .with_ansi(false)
         .with_env_filter(filter)
         .try_init();
+}
+
+#[cfg(all(
+    test,
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expired_snapshot_requests_coordination_reconnect() {
+        assert_eq!(
+            tun_send_disposition(&vela_core::SendError::SnapshotExpired),
+            TunSendDisposition::Reconnect
+        );
+    }
 }
