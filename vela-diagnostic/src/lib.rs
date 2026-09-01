@@ -211,6 +211,7 @@ pub async fn register(
         stun_servers,
         port,
         None,
+        NodeConfig::default().virtual_mtu,
     )
     .await?;
     let candidates = peer.candidates.clone();
@@ -311,6 +312,21 @@ impl DiagnosticPeer {
         port: Option<u16>,
         stun_servers: Option<Vec<String>>,
     ) -> Result<Self, DiagnosticError> {
+        Self::open_with_mtu(
+            state_dir,
+            port,
+            stun_servers,
+            NodeConfig::default().virtual_mtu,
+        )
+        .await
+    }
+
+    pub async fn open_with_mtu(
+        state_dir: impl AsRef<Path>,
+        port: Option<u16>,
+        stun_servers: Option<Vec<String>>,
+        virtual_mtu: usize,
+    ) -> Result<Self, DiagnosticError> {
         let state_dir = state_dir.as_ref();
         let mut state = PeerState::load(state_dir)?;
         // Keep an explicitly configured local STUN endpoint across restarts;
@@ -332,6 +348,7 @@ impl DiagnosticPeer {
             manual_stun_servers,
             port,
             preferred_ports,
+            virtual_mtu,
         )
         .await?;
         let registration = peer
@@ -364,6 +381,7 @@ impl DiagnosticPeer {
         manual_stun_servers: Vec<String>,
         port: u16,
         preferred_ports: Option<[Option<u16>; 2]>,
+        virtual_mtu: usize,
     ) -> Result<Self, DiagnosticError> {
         let provider = match preferred_ports {
             Some(preferred_ports) => Arc::new(TokioDatagramProvider::with_preferred_ports(
@@ -379,6 +397,7 @@ impl DiagnosticPeer {
             manual_stun_servers,
             port,
             provider,
+            virtual_mtu,
         )
         .await
     }
@@ -390,6 +409,7 @@ impl DiagnosticPeer {
         manual_stun_servers: Vec<String>,
         port: u16,
         provider: Arc<dyn DatagramProvider>,
+        virtual_mtu: usize,
     ) -> Result<Self, DiagnosticError> {
         let local = state.snapshot.as_ref().and_then(|snapshot| {
             snapshot
@@ -402,6 +422,7 @@ impl DiagnosticPeer {
             .datagram_provider(provider)
             .config(NodeConfig {
                 bind: BindOptions { port },
+                max_payload_size: virtual_mtu,
                 network_id: state
                     .snapshot
                     .as_ref()
@@ -409,6 +430,7 @@ impl DiagnosticPeer {
                 server_public_key: Some(state.server_key),
                 virtual_ipv4: local.and_then(|peer| peer.virtual_ipv4),
                 virtual_ipv6: local.and_then(|peer| peer.virtual_ipv6),
+                virtual_mtu,
                 ..NodeConfig::default()
             })
             .build()
@@ -1252,6 +1274,7 @@ mod tests {
             Vec::new(),
             address.port(),
             Arc::new(RecordingProvider::new(address, sent_probes)),
+            NodeConfig::default().virtual_mtu,
         )
         .await
         .unwrap();

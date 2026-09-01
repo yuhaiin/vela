@@ -742,6 +742,9 @@ pub struct NodeConfig {
 }
 
 const DATA_WORKER_QUEUE_LIMIT: usize = 2048;
+type DataPacket = (Bytes, SocketAddr);
+type DataSender = mpsc::Sender<DataPacket>;
+type DataReceiver = mpsc::Receiver<DataPacket>;
 
 fn data_worker_count() -> usize {
     std::thread::available_parallelism().map_or(4, |parallelism| parallelism.get().max(4))
@@ -1250,7 +1253,7 @@ impl VelaNode {
             .ok_or(SendError::UnknownPeer)?;
         let active_session_before = peer.active.lock().await.is_some();
         let should_connect = !active_session_before && peer.attempt.lock().await.is_none();
-        let result = self.inner.send_payload(&peer, packet.into_bytes()).await;
+        let result = self.inner.send_ip_packet(&peer, packet).await;
         let active_session_after = peer.active.lock().await.is_some();
         match &result {
             Ok(()) => debug!(
@@ -1728,8 +1731,8 @@ struct Inner {
     stun_waiters: Mutex<HashMap<[u8; 12], StunWaiter>>,
     event_tx: mpsc::Sender<VelaEvent>,
     event_rx: Mutex<Option<mpsc::Receiver<VelaEvent>>>,
-    data_senders: Vec<mpsc::Sender<(Bytes, SocketAddr)>>,
-    data_receivers: StdMutex<Option<Vec<mpsc::Receiver<(Bytes, SocketAddr)>>>>,
+    data_senders: Vec<DataSender>,
+    data_receivers: StdMutex<Option<Vec<DataReceiver>>>,
     sessions: StdMutex<HashMap<u64, Arc<PeerState>>>,
     shutdown: Notify,
     stopping: AtomicBool,
@@ -1854,7 +1857,7 @@ impl Inner {
         }
     }
 
-    async fn data_loop(self: Arc<Self>, mut receiver: mpsc::Receiver<(Bytes, SocketAddr)>) {
+    async fn data_loop(self: Arc<Self>, mut receiver: DataReceiver) {
         loop {
             if self.stopping.load(Ordering::Acquire) {
                 break;
@@ -2818,18 +2821,7 @@ impl Inner {
     }
 
     async fn send_payload(&self, peer: &Arc<PeerState>, payload: Bytes) -> Result<(), SendError> {
-        if unix_time() >= self.snapshot_expires_at.load(Ordering::Acquire) {
-            self.invalidate_session(peer, true).await;
-            return Err(SendError::SnapshotExpired);
-        }
-        let packet = IpPacket::parse(payload.clone()).map_err(SendError::Ip)?;
-        if packet.as_bytes().len() > self.config.virtual_mtu {
-            return Err(SendError::PacketTooLarge);
-        }
-        if payload.len() > self.config.max_payload_size {
-            return Err(SendError::PacketTooLarge);
-        }
-        let mut active = peer.active.lock().await;
+        let packet = IpPacket::parse(payload).map_err(SendError::Ip)?;
         let routed_peer = self
             .routes
             .lock()
@@ -2839,12 +2831,32 @@ impl Inner {
         if routed_peer != peer.info().node_id {
             return Err(SendError::WrongPeer);
         }
+        self.send_ip_packet(peer, packet).await
+    }
+
+    async fn send_ip_packet(
+        &self,
+        peer: &Arc<PeerState>,
+        packet: IpPacket,
+    ) -> Result<(), SendError> {
+        if unix_time() >= self.snapshot_expires_at.load(Ordering::Acquire) {
+            self.invalidate_session(peer, true).await;
+            return Err(SendError::SnapshotExpired);
+        }
+        if packet.as_bytes().len() > self.config.virtual_mtu {
+            return Err(SendError::PacketTooLarge);
+        }
+        if packet.as_bytes().len() > self.config.max_payload_size {
+            return Err(SendError::PacketTooLarge);
+        }
+        let packet_len = packet.as_bytes().len();
+        let mut active = peer.active.lock().await;
         let Some(session) = active.as_mut() else {
             let mut queue = peer.queue.lock().await;
             if queue.len() >= self.config.per_peer_queue_limit {
                 return Err(SendError::QueueFull);
             }
-            queue.push_back(payload);
+            queue.push_back(packet.into_bytes());
             debug!(
                 debug_marker = "vela-data",
                 peer_id = %peer.info().node_id,
@@ -2854,7 +2866,7 @@ impl Inner {
             return Ok(());
         };
         let sequence = session.tx_sequence.fetch_add(1, Ordering::Relaxed);
-        let encrypted_len = payload.len() + 16;
+        let encrypted_len = packet_len + 16;
         let header = Header::new(
             PacketType::Data,
             session.session_id,
@@ -2863,22 +2875,21 @@ impl Inner {
         )
         .map_err(SendError::Protocol)?;
         let aad = encoded_header(&header);
-        let encrypted = session
+        let mut wire_packet = BytesMut::with_capacity(vela_proto::HEADER_LEN + encrypted_len);
+        header.encode(&mut wire_packet);
+        wire_packet.extend_from_slice(packet.as_bytes());
+        let tag = session
             .cipher
-            .encrypt(sequence, &aad, &payload)
+            .encrypt_in_place_detached(sequence, &aad, &mut wire_packet[vela_proto::HEADER_LEN..])
             .map_err(SendError::Crypto)?;
-        let packet = WirePacket {
-            header,
-            payload: Bytes::from(encrypted),
-        }
-        .encode()
-        .map_err(SendError::Protocol)?;
+        wire_packet.extend_from_slice(&tag);
+        let wire_packet = wire_packet.freeze();
         let path = session.path;
         let session_id = session.session_id;
-        let wire_len = packet.len();
+        let wire_len = wire_packet.len();
         drop(active);
         self.socket
-            .send_to(&packet, path)
+            .send_to(&wire_packet, path)
             .await
             .map_err(SendError::Io)?;
         debug!(
@@ -2887,7 +2898,7 @@ impl Inner {
             path = %path,
             session_id,
             sequence,
-            packet_len = payload.len(),
+            packet_len,
             wire_len,
             "sent encrypted IP packet"
         );
@@ -2900,13 +2911,13 @@ impl Inner {
         {
             session
                 .tx_bytes
-                .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                .fetch_add(packet_len as u64, Ordering::Relaxed);
         }
         self.observe(TrafficSample {
             peer: Some(peer.info().node_id),
             direction: TrafficDirection::Sent,
             path,
-            payload_bytes: payload.len(),
+            payload_bytes: packet_len,
             encrypted_bytes: encrypted_len,
             wire_bytes: wire_len,
         });

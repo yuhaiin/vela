@@ -386,14 +386,25 @@ impl SessionCipher {
         associated_data: &[u8],
         plaintext: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
-        let nonce = nonce(sequence);
         let mut out = plaintext.to_vec();
-        let tag = self
-            .tx
-            .encrypt_in_place_detached(&nonce, associated_data, &mut out)
-            .map_err(|_| CryptoError::Aead)?;
+        let tag = self.encrypt_in_place_detached(sequence, associated_data, &mut out)?;
         out.extend_from_slice(&tag);
         Ok(out)
+    }
+
+    pub fn encrypt_in_place_detached(
+        &self,
+        sequence: u64,
+        associated_data: &[u8],
+        plaintext: &mut [u8],
+    ) -> Result<[u8; 16], CryptoError> {
+        let tag = self
+            .tx
+            .encrypt_in_place_detached(&nonce(sequence), associated_data, plaintext)
+            .map_err(|_| CryptoError::Aead)?;
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&tag);
+        Ok(bytes)
     }
 
     pub fn decrypt(

@@ -10,7 +10,7 @@ use tokio::{
     time::{Instant, interval},
 };
 use tracing::{debug, info, warn};
-use vela_core::{SendError, VelaEvent, VelaNode};
+use vela_core::{NodeConfig, SendError, VelaEvent, VelaNode};
 use vela_proto::{NetworkSnapshot, NodeId, PeerInfo, PeerSummary};
 
 pub const MAX_PING_COUNT: usize = 32;
@@ -141,9 +141,27 @@ impl DiagnosticRuntime {
         stun_servers: Option<Vec<String>>,
         dashboard_bind: SocketAddr,
     ) -> Result<RuntimeProcess, DiagnosticError> {
+        Self::open_with_mtu(
+            state_dir,
+            port,
+            stun_servers,
+            dashboard_bind,
+            NodeConfig::default().virtual_mtu,
+        )
+        .await
+    }
+
+    pub async fn open_with_mtu(
+        state_dir: impl AsRef<Path>,
+        port: Option<u16>,
+        stun_servers: Option<Vec<String>>,
+        dashboard_bind: SocketAddr,
+        virtual_mtu: usize,
+    ) -> Result<RuntimeProcess, DiagnosticError> {
         let state_dir = state_dir.as_ref();
         let lock = crate::local_control::StateLock::acquire(state_dir)?;
-        let peer = DiagnosticPeer::open(state_dir, port, stun_servers).await?;
+        let peer =
+            DiagnosticPeer::open_with_mtu(state_dir, port, stun_servers, virtual_mtu).await?;
         Self::start_with_lock(peer, dashboard_bind, lock).await
     }
 

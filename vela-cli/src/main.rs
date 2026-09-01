@@ -437,11 +437,12 @@ async fn run_peer_up(_args: PeerUpArgs) -> Result<(), Box<dyn std::error::Error>
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 async fn run_peer_up(args: PeerUpArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let process = vela_diagnostic::DiagnosticRuntime::open(
+    let process = vela_diagnostic::DiagnosticRuntime::open_with_mtu(
         &args.state,
         args.port,
         (!args.stun.is_empty()).then_some(args.stun),
         args.bind,
+        args.mtu,
     )
     .await?;
     let snapshot = process

@@ -69,8 +69,8 @@ async fn run_server(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 async fn run_client(args: ClientArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let started = Instant::now();
     let mut stream = TcpStream::connect(&args.connect).await?;
+    let started = Instant::now();
     let mut buffer = vec![0u8; BUFFER_SIZE];
     let mut bytes = 0u64;
     while bytes < args.bytes {
