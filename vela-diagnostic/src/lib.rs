@@ -83,6 +83,24 @@ impl DashboardStore {
     }
 }
 
+#[derive(Clone)]
+pub struct DashboardHandle {
+    store: Arc<DashboardStore>,
+}
+
+impl DashboardHandle {
+    pub async fn serve(&self, bind: SocketAddr) -> Result<(), DiagnosticError> {
+        let listener = TcpListener::bind(bind).await?;
+        let app = Router::new()
+            .route("/", get(dashboard_page))
+            .route("/api/v1/dashboard", get(dashboard_data))
+            .with_state(Arc::clone(&self.store));
+        axum::serve(listener, app)
+            .await
+            .map_err(DiagnosticError::Io)
+    }
+}
+
 async fn dashboard_page() -> Html<&'static str> {
     Html(include_str!("dashboard.html"))
 }
@@ -629,22 +647,23 @@ impl DiagnosticPeer {
         self.run_loop(None).await
     }
 
+    pub async fn open_dashboard(&mut self) -> Result<DashboardHandle, DiagnosticError> {
+        let summaries = self.list_peers().await?;
+        Ok(DashboardHandle {
+            store: Arc::new(DashboardStore::new(
+                self.dashboard_snapshot(true, &summaries, None).await,
+            )),
+        })
+    }
+
     /// Runs the peer together with a loopback-only read-only dashboard.
     pub async fn run_with_dashboard(self, bind: SocketAddr) -> Result<(), DiagnosticError> {
         let mut peer = self;
-        let summaries = peer.list_peers().await?;
-        let store = Arc::new(DashboardStore::new(
-            peer.dashboard_snapshot(true, &summaries, None).await,
-        ));
-        let listener = TcpListener::bind(bind).await?;
-        let app = Router::new()
-            .route("/", get(dashboard_page))
-            .route("/api/v1/dashboard", get(dashboard_data))
-            .with_state(Arc::clone(&store));
-        let server = axum::serve(listener, app);
+        let dashboard = peer.open_dashboard().await?;
+        let server = dashboard.serve(bind);
         tokio::select! {
-            result = peer.run_loop(Some(store)) => result,
-            result = server => result.map_err(DiagnosticError::Io),
+            result = peer.run_loop(Some(dashboard.clone())) => result,
+            result = server => result,
         }
     }
 
@@ -719,22 +738,19 @@ impl DiagnosticPeer {
         }
     }
 
-    async fn publish_dashboard(
+    pub async fn publish_dashboard(
         &self,
-        store: &DashboardStore,
+        dashboard: &DashboardHandle,
         coordinator_connected: bool,
         summaries: &[PeerSummary],
         last_error: Option<String>,
     ) {
-        *store.snapshot.write().await = self
+        *dashboard.store.snapshot.write().await = self
             .dashboard_snapshot(coordinator_connected, summaries, last_error)
             .await;
     }
 
-    async fn run_loop(
-        mut self,
-        dashboard: Option<Arc<DashboardStore>>,
-    ) -> Result<(), DiagnosticError> {
+    async fn run_loop(mut self, dashboard: Option<DashboardHandle>) -> Result<(), DiagnosticError> {
         let mut refresh = interval(CANDIDATE_REFRESH_INTERVAL);
         let mut dashboard_refresh = interval(DASHBOARD_REFRESH_INTERVAL);
         let mut dashboard_peer_refresh = interval(DASHBOARD_PEER_REFRESH_INTERVAL);
@@ -913,7 +929,10 @@ impl DiagnosticPeer {
                         Some(VelaEvent::TransportFailed { family, error }) => {
                             return Err(DiagnosticError::TransportFailed { family, error });
                         }
-                        Some(VelaEvent::PeerReconnectRequested(peer_id)) => {
+                        Some(
+                            VelaEvent::PeerConnectionRequested(peer_id)
+                            | VelaEvent::PeerReconnectRequested(peer_id),
+                        ) => {
                             if !control_connected {
                                 pending_reconnects.insert(peer_id);
                                 continue;
@@ -928,7 +947,7 @@ impl DiagnosticPeer {
                                     debug_marker = "vela-control",
                                     peer_id = %peer_id,
                                     error = %error,
-                                    "failed to signal peer for bilateral reconnect; retrying coordination"
+                                    "failed to signal peer for bilateral connection; retrying coordination"
                                 );
                                 control_connected = false;
                                 reconnect_sleep.as_mut().reset(
@@ -1114,7 +1133,7 @@ fn set_private(_path: &Path) -> Result<(), std::io::Error> {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use std::sync::Mutex as StdMutex;
+    use std::{net::Ipv4Addr, sync::Mutex as StdMutex};
     use tokio::net::TcpListener;
     use vela_coord::CoordServer;
     use vela_core::DatagramSocket;
@@ -1227,6 +1246,26 @@ mod tests {
         peer
     }
 
+    fn ipv4_packet(source: Ipv4Addr, destination: Ipv4Addr) -> Vec<u8> {
+        let mut packet = vec![0u8; 20];
+        packet[0] = 0x45;
+        let packet_len = packet.len() as u16;
+        packet[2..4].copy_from_slice(&packet_len.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&source.octets());
+        packet[16..20].copy_from_slice(&destination.octets());
+        let mut checksum = 0u32;
+        for chunk in packet.chunks(2) {
+            checksum = checksum.wrapping_add(u32::from(u16::from_be_bytes([chunk[0], chunk[1]])));
+            while checksum > u32::from(u16::MAX) {
+                checksum = (checksum & u32::from(u16::MAX)) + (checksum >> 16);
+            }
+        }
+        packet[10..12].copy_from_slice(&(!(checksum as u16)).to_be_bytes());
+        packet
+    }
+
     #[tokio::test]
     async fn coordination_signal_starts_bilateral_probe_attempts() {
         let base = std::env::temp_dir().join(format!(
@@ -1263,7 +1302,7 @@ mod tests {
         let server_url = format!("ws://{server_address}/ws");
         let identity_a = Identity::generate();
         let identity_b = Identity::generate();
-        let mut peer_a = build_registered_peer(
+        let peer_a = build_registered_peer(
             &state_a,
             &server_url,
             server_key,
@@ -1297,11 +1336,31 @@ mod tests {
         let peer_b_id = peer_b.node_id();
         let peer_b_task = tokio::spawn(async move { peer_b.run().await });
         peer_a.node.register_peer(peer).await.unwrap();
-        peer_a.request_peer_connection(peer_b_id).await.unwrap();
+        let source = peer_a
+            .state
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .peers
+            .iter()
+            .find(|peer| peer.node_id == peer_a.node_id())
+            .and_then(|peer| peer.virtual_ipv4)
+            .unwrap();
+        let destination = peer_a
+            .node
+            .peer_statuses()
+            .await
+            .into_iter()
+            .find(|status| status.node_id == peer_b_id)
+            .and_then(|status| status.virtual_ipv4)
+            .unwrap();
+        peer_a
+            .node
+            .send_ip(ipv4_packet(source, destination))
+            .await
+            .unwrap();
         let node_a = peer_a.node.clone();
-        let connect_task = tokio::spawn(async move {
-            let _ = node_a.connect(peer_b_id).await;
-        });
+        let peer_a_task = tokio::spawn(async move { peer_a.run().await });
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let a_sent = sent_a
@@ -1333,9 +1392,9 @@ mod tests {
                 .contains(&address_a)
         );
 
-        connect_task.abort();
+        peer_a_task.abort();
         node_b.shutdown().await;
-        peer_a.node.shutdown().await;
+        node_a.shutdown().await;
         peer_b_task.abort();
         server_task.abort();
         let _ = std::fs::remove_dir_all(&state_a);

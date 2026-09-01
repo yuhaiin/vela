@@ -104,7 +104,7 @@ cargo run -p vela-cli -- peer register \
 cargo run -p vela-cli -- peer run --state ./peer-a
 # Start the read-only local peer dashboard (default: http://127.0.0.1:7001)
 cargo run -p vela-cli -- peer dashboard --state ./peer-a
-# Linux/Windows default: vela0; macOS default: utun0.
+# `peer up` also starts the dashboard; Linux/Windows default: vela0; macOS default: utun0.
 cargo run -p vela-cli -- peer up --state ./peer-a --mtu 1200
 cargo run -p vela-cli -- peer list --state ./peer-a --json
 cargo run -p vela-cli -- peer status --state ./peer-a --json
@@ -138,9 +138,9 @@ resolved through DoH on every refresh. The server may be started with repeated
 edited in `/admin`; changes are persisted, signed into snapshots, and pushed to
 online peers dynamically.
 
-`peer dashboard` runs the same peer lifecycle together with a read-only local
-HTTP dashboard at `127.0.0.1:7001` (use `--bind` to change it). Its API is
-`/api/v1/dashboard` and is polled by the page once per second. Coordinator
+`peer dashboard` and `peer up` run the peer lifecycle together with a read-only
+local HTTP dashboard at `127.0.0.1:7001` (use `--bind` to change it). Its API
+is `/api/v1/dashboard` and is polled by the page once per second. Coordinator
 online state and direct UDP state are deliberately separate; candidate lists
 show advertised addresses, while `active path` shows the address actually used
 by the encrypted session.
@@ -149,8 +149,9 @@ The peer transport always creates one IPv4-only and one IPv6-only UDP socket.
 the operating system choose an ephemeral port independently for each family.
 On restart, the last successful IPv4 and IPv6 ports are tried first and both
 families fall back to fresh ports together if that pair is unavailable. The
-older peer `--bind` option is ignored for compatibility. The sockets and their
-automatically collected host candidates use each family's main-table
+peer transport no longer uses `--bind`; when a dashboard is enabled, that
+option selects the dashboard HTTP address. The sockets and their automatically
+collected host candidates use each family's main-table
 default-route interface, so addresses from unrelated VPN, container, or
 virtual interfaces are not advertised. If a family has no default route, its
 socket remains usable but no host candidate is published for that family; STUN

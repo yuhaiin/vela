@@ -28,7 +28,7 @@ use tokio::{
     task::JoinHandle,
     time::{Instant, timeout},
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use vela_coord_client::{CoordClientError, CoordinationClient, Registration};
 use vela_crypto::{
     CryptoError, CryptoPolicy, Identity, MembershipCredential, NoiseHandshake, SessionCipher,
@@ -1172,6 +1172,9 @@ impl VelaNode {
             ),
         }
         if result.is_ok() && should_connect {
+            self.inner
+                .emit(VelaEvent::PeerConnectionRequested(peer_id))
+                .await;
             let node = self.clone();
             tokio::spawn(async move {
                 debug!(
@@ -1932,6 +1935,13 @@ impl Inner {
         let peer_info = peer.info();
         validate_peer_membership(&peer_info, self.config.server_public_key)?;
         verify_probe(&probe, &peer_info)?;
+        info!(
+            debug_marker = "vela-session",
+            peer_id = %probe.sender,
+            source = %source,
+            session_id = probe.session_id,
+            "received authenticated peer connection probe"
+        );
         let payload = encode_probe(
             self.identity.public().node_id,
             probe.sender,
@@ -2851,6 +2861,10 @@ impl PeerHandle {
             peer.active.lock().await.is_none() && peer.attempt.lock().await.is_none();
         let result = self.node.inner.send_payload(&peer, payload.into()).await;
         if result.is_ok() && should_connect {
+            self.node
+                .inner
+                .emit(VelaEvent::PeerConnectionRequested(self.peer_id))
+                .await;
             let node = self.node.clone();
             let peer_id = self.peer_id;
             tokio::spawn(async move {
@@ -2951,6 +2965,7 @@ pub struct DiagnosticPingResult {
 #[derive(Clone, Debug)]
 pub enum VelaEvent {
     PeerConnecting(NodeId),
+    PeerConnectionRequested(NodeId),
     PeerConnected(NodeId),
     PeerDisconnected(NodeId),
     PeerReconnectRequested(NodeId),
