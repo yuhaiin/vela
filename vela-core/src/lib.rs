@@ -28,7 +28,7 @@ use tokio::{
     task::JoinHandle,
     time::{Instant, timeout},
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use vela_coord_client::{CoordClientError, CoordinationClient, Registration};
 use vela_crypto::{
     CryptoError, CryptoPolicy, Identity, MembershipCredential, NoiseHandshake, SessionCipher,
@@ -1570,7 +1570,7 @@ impl VelaNode {
         } else {
             Instant::now() + Duration::from_millis(100)
         };
-        let mut next_probe = Instant::now() + Duration::from_millis(250);
+        let mut next_probe = Instant::now() + PROBE_RETRY_INTERVAL;
         // The remote side may win the simultaneous probe race and replace our
         // attempt. Keep waiting for that attempt to establish the session so
         // the caller observes the shared connection rather than Superseded.
@@ -1630,7 +1630,7 @@ impl VelaNode {
             if !superseded && Instant::now() >= next_probe {
                 send_probes(candidates.clone()).await;
                 fallback_sent = true;
-                next_probe = Instant::now() + Duration::from_millis(250);
+                next_probe = Instant::now() + PROBE_RETRY_INTERVAL;
                 continue;
             }
             let wait_for_probe = if superseded {
@@ -2383,7 +2383,7 @@ impl Inner {
         let peer_info = peer.info();
         validate_peer_membership(&peer_info, self.config.server_public_key)?;
         verify_probe(&probe, &peer_info)?;
-        info!(
+        debug!(
             debug_marker = "vela-session",
             peer_id = %probe.sender,
             source = %source,
@@ -3808,6 +3808,7 @@ struct Attempt {
     candidates: Vec<PeerCandidateAttempt>,
 }
 
+const PROBE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const HANDSHAKE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
 struct ActiveSession {
@@ -4431,6 +4432,11 @@ mod tests {
                 Candidate::PeerReflexive("198.51.100.10:34352".parse().unwrap()),
             ]
         );
+    }
+
+    #[test]
+    fn peer_probe_retries_use_a_one_second_interval() {
+        assert_eq!(PROBE_RETRY_INTERVAL, Duration::from_secs(1));
     }
 
     #[tokio::test]
