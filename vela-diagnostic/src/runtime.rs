@@ -30,7 +30,7 @@ const COMMAND_QUEUE_CAPACITY: usize = 256;
 // Absorb short TUN writer bursts without making the control loop wait. The
 // queue remains bounded; sustained pressure is still visible in the drop
 // counter instead of growing memory without limit.
-const PACKET_QUEUE_CAPACITY: usize = 1024;
+const PACKET_QUEUE_CAPACITY: usize = 4096;
 
 pub(crate) struct RuntimeStore {
     snapshot: RwLock<RuntimeSnapshot>,
