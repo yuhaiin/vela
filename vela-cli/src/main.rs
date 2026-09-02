@@ -443,21 +443,42 @@ async fn run_peer_up(_args: PeerUpArgs) -> Result<(), Box<dyn std::error::Error>
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[derive(Clone)]
+struct PeerUpRuntimeConfig {
+    state: PathBuf,
+    port: Option<u16>,
+    stun: Option<Vec<String>>,
+    bind: SocketAddr,
+    mtu: usize,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 async fn run_peer_up(args: PeerUpArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let config = PeerUpRuntimeConfig {
+        state: args.state.clone(),
+        port: args.port,
+        stun: (!args.stun.is_empty()).then(|| args.stun.clone()),
+        bind: args.bind,
+        mtu: args.mtu,
+    };
     let process = vela_diagnostic::DiagnosticRuntime::open_with_mtu(
-        &args.state,
-        args.port,
-        (!args.stun.is_empty()).then_some(args.stun),
-        args.bind,
-        args.mtu,
+        &config.state,
+        config.port,
+        config.stun.clone(),
+        config.bind,
+        config.mtu,
     )
     .await?;
-    let snapshot = process
-        .io
-        .snapshots
-        .borrow()
-        .clone()
-        .ok_or_else(|| invalid_input("state has no network snapshot; register first"))?;
+    let snapshot = process.io.snapshots.borrow().clone();
+    let snapshot = match snapshot {
+        Some(snapshot) => snapshot,
+        None => {
+            stop_process(process).await;
+            return Err(invalid_input(
+                "state has no network snapshot; register first",
+            ));
+        }
+    };
     let tun_name = args.tun.unwrap_or_else(|| {
         if cfg!(target_os = "macos") {
             String::new()
@@ -504,7 +525,7 @@ async fn run_peer_up(args: PeerUpArgs) -> Result<(), Box<dyn std::error::Error>>
         tun.name(),
         endpoint
     );
-    run_tun_peer(process, tun, routes, leases).await
+    run_tun_peer(process, tun, routes, leases, config).await
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -528,6 +549,14 @@ async fn release_route_leases(leases: &mut HashMap<IpAddr, vela_tun::RouteLease>
             timeout = ?SHUTDOWN_TIMEOUT,
             "timed out while releasing TUN routes during shutdown"
         );
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+async fn wait_for_peer_restart(delay: Duration) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => true,
+        _ = tokio::signal::ctrl_c() => false,
     }
 }
 
@@ -597,14 +626,111 @@ async fn run_tun_peer(
     process: RuntimeProcess,
     tun: vela_tun::TunDevice,
     routes: vela_tun::RouteManager,
-    mut leases: HashMap<IpAddr, vela_tun::RouteLease>,
+    leases: HashMap<IpAddr, vela_tun::RouteLease>,
+    config: PeerUpRuntimeConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tun = Arc::new(tun);
+    let mut process = process;
+    let mut leases = leases;
+    let mut restart_delay = Duration::from_secs(1);
+
+    loop {
+        match run_tun_peer_once(process, Arc::clone(&tun), &routes, &mut leases).await {
+            Ok(()) => {
+                release_route_leases(&mut leases).await;
+                return Ok(());
+            }
+            Err(error) => {
+                tracing::warn!(
+                    debug_marker = "vela-lifecycle",
+                    error = %error,
+                    restart_delay = ?restart_delay,
+                    "peer runtime stopped; restarting"
+                );
+            }
+        }
+
+        loop {
+            if !wait_for_peer_restart(restart_delay).await {
+                tracing::info!(debug_marker = "vela-lifecycle", "shutdown requested");
+                release_route_leases(&mut leases).await;
+                return Ok(());
+            }
+
+            let next_process = match vela_diagnostic::DiagnosticRuntime::open_with_mtu(
+                &config.state,
+                config.port,
+                config.stun.clone(),
+                config.bind,
+                config.mtu,
+            )
+            .await
+            {
+                Ok(process) => process,
+                Err(error) => {
+                    tracing::warn!(
+                        debug_marker = "vela-lifecycle",
+                        error = %error,
+                        "peer runtime restart failed"
+                    );
+                    restart_delay =
+                        std::cmp::min(restart_delay + restart_delay, Duration::from_secs(30));
+                    continue;
+                }
+            };
+            let snapshot = next_process.io.snapshots.borrow().clone();
+            let snapshot = match snapshot {
+                Some(snapshot) => snapshot,
+                None => {
+                    stop_process(next_process).await;
+                    tracing::warn!(
+                        debug_marker = "vela-lifecycle",
+                        "peer runtime restart produced no network snapshot"
+                    );
+                    restart_delay =
+                        std::cmp::min(restart_delay + restart_delay, Duration::from_secs(30));
+                    continue;
+                }
+            };
+            if let Err(error) = apply_tun_snapshot(
+                next_process.handle.node_id(),
+                &routes,
+                &mut leases,
+                &snapshot,
+            )
+            .await
+            {
+                stop_process(next_process).await;
+                tracing::warn!(
+                    debug_marker = "vela-lifecycle",
+                    error = %error,
+                    "peer runtime restart snapshot could not be applied"
+                );
+                restart_delay =
+                    std::cmp::min(restart_delay + restart_delay, Duration::from_secs(30));
+                continue;
+            }
+
+            tracing::info!(debug_marker = "vela-lifecycle", "peer runtime restarted");
+            process = next_process;
+            restart_delay = Duration::from_secs(1);
+            break;
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+async fn run_tun_peer_once(
+    process: RuntimeProcess,
+    tun: Arc<vela_tun::TunDevice>,
+    routes: &vela_tun::RouteManager,
+    leases: &mut HashMap<IpAddr, vela_tun::RouteLease>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let vela_diagnostic::RuntimeProcess {
         handle,
         io,
         mut task,
     } = process;
-    let tun = Arc::new(tun);
     let tun_reader = Arc::clone(&tun);
     let reader_handle = handle.clone();
     let mut tun_to_vela = tokio::spawn(async move {
@@ -667,6 +793,7 @@ async fn run_tun_peer(
     tokio::pin!(ctrl_c);
 
     let mut runtime_result = None;
+    let mut shutdown_requested = false;
     let loop_result: Result<(), Box<dyn std::error::Error>> = loop {
         tokio::select! {
             result = &mut task => {
@@ -693,13 +820,16 @@ async fn run_tun_peer(
             }
             changed = snapshots.changed() => {
                 if changed.is_err() {
-                    break Err(invalid_input("peer runtime snapshot channel closed"));
+                    // The sender is owned by the runtime task. Wait for that
+                    // task below so its real error is returned to the
+                    // supervisor instead of masking it with a channel error.
+                    break Ok(());
                 }
                 if let Some(snapshot) = snapshots.borrow().clone() {
                     if let Err(error) = apply_tun_snapshot(
                         handle.node_id(),
-                        &routes,
-                        &mut leases,
+                        routes,
+                        leases,
                         &snapshot,
                     ).await {
                         break Err(error);
@@ -708,6 +838,7 @@ async fn run_tun_peer(
             }
             _ = &mut ctrl_c => {
                 tracing::info!(debug_marker = "vela-lifecycle", "shutdown requested");
+                shutdown_requested = true;
                 break Ok(());
             }
         }
@@ -715,6 +846,11 @@ async fn run_tun_peer(
 
     tun_to_vela.abort();
     vela_to_tun.abort();
+    if shutdown_requested {
+        handle.stop();
+        let _ = task.await;
+        return Ok(());
+    }
     if runtime_result.is_none() {
         handle.stop();
         runtime_result = Some(
@@ -723,7 +859,6 @@ async fn run_tun_peer(
                 .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) }),
         );
     }
-    release_route_leases(&mut leases).await;
     loop_result.and(runtime_result.expect("runtime result is set"))
 }
 
