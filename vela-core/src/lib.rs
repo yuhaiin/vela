@@ -1454,7 +1454,7 @@ impl VelaNode {
                 peer_id,
             });
         }
-        let candidates = peer.info().candidates;
+        let candidates = ordered_connection_candidates(peer.info().candidates);
         if candidates.is_empty() {
             debug!(
                 debug_marker = "vela-session",
@@ -1499,50 +1499,77 @@ impl VelaNode {
         peer.clear_failure();
         let node_id = self.node_id();
         let timestamp = unix_time();
-        let send_probes = || async {
-            let payload = encode_probe(
-                node_id,
-                peer_id,
-                session_id,
-                timestamp,
-                nonce,
-                &self.inner.identity,
-            );
-            for candidate in &candidates {
-                let address = candidate.address();
-                match self
-                    .inner
-                    .send_packet(address, PacketType::Probe, session_id, 0, &payload)
-                    .await
-                {
-                    Ok(()) => {
-                        self.inner
-                            .record_candidate_probe(&peer, session_id, address, None)
-                            .await
-                    }
-                    Err(error) => {
-                        self.inner
-                            .record_candidate_probe(
-                                &peer,
+        let preferred_candidates = candidates
+            .iter()
+            .filter(|candidate| candidate_priority(candidate) == 0)
+            .cloned()
+            .collect::<Vec<_>>();
+        let fallback_candidates = candidates
+            .iter()
+            .filter(|candidate| candidate_priority(candidate) != 0)
+            .cloned()
+            .collect::<Vec<_>>();
+        let deadline = Instant::now() + self.inner.config.connect_timeout;
+        let send_probes = |probe_candidates: Vec<Candidate>| {
+            let peer = Arc::clone(&peer);
+            async move {
+                let payload = encode_probe(
+                    node_id,
+                    peer_id,
+                    session_id,
+                    timestamp,
+                    nonce,
+                    &self.inner.identity,
+                );
+                for candidate in probe_candidates {
+                    let address = candidate.address();
+                    match self
+                        .inner
+                        .send_packet(address, PacketType::Probe, session_id, 0, &payload)
+                        .await
+                    {
+                        Ok(()) => {
+                            self.inner
+                                .record_candidate_probe(&peer, session_id, address, None)
+                                .await
+                        }
+                        Err(error) => {
+                            self.inner
+                                .record_candidate_probe(
+                                    &peer,
+                                    session_id,
+                                    address,
+                                    Some(error.to_string()),
+                                )
+                                .await;
+                            debug!(
+                                debug_marker = "vela-session",
+                                peer_id = %peer_id,
+                                target = %address,
                                 session_id,
-                                address,
-                                Some(error.to_string()),
-                            )
-                            .await;
-                        debug!(
-                            debug_marker = "vela-session",
-                            peer_id = %peer_id,
-                            target = %address,
-                            session_id,
-                            error = %error,
-                            "peer probe send failed"
-                        );
+                                error = %error,
+                                "peer probe send failed"
+                            );
+                        }
                     }
                 }
             }
         };
-        send_probes().await;
-        let deadline = Instant::now() + self.inner.config.connect_timeout;
+        // A private host candidate is usually on the same LAN. Give it a
+        // short head start so a reachable public IPv6 host candidate cannot
+        // win the handshake merely because it was scheduled first. The
+        // fallback keeps cross-network peers connectable.
+        if preferred_candidates.is_empty() {
+            send_probes(fallback_candidates.clone()).await;
+        } else {
+            send_probes(preferred_candidates.clone()).await;
+        }
+        let mut fallback_sent = preferred_candidates.is_empty() || fallback_candidates.is_empty();
+        let next_fallback = if fallback_sent {
+            deadline
+        } else {
+            Instant::now() + Duration::from_millis(100)
+        };
         let mut next_probe = Instant::now() + Duration::from_millis(250);
         // The remote side may win the simultaneous probe race and replace our
         // attempt. Keep waiting for that attempt to establish the session so
@@ -1595,8 +1622,14 @@ impl VelaNode {
                 }
             }
             drop(current_attempt);
+            if !superseded && !fallback_sent && Instant::now() >= next_fallback {
+                send_probes(fallback_candidates.clone()).await;
+                fallback_sent = true;
+                continue;
+            }
             if !superseded && Instant::now() >= next_probe {
-                send_probes().await;
+                send_probes(candidates.clone()).await;
+                fallback_sent = true;
                 next_probe = Instant::now() + Duration::from_millis(250);
                 continue;
             }
@@ -1605,7 +1638,12 @@ impl VelaNode {
             } else {
                 next_probe.saturating_duration_since(Instant::now())
             };
-            let wait_for = remaining.min(wait_for_probe);
+            let wait_for_fallback = if superseded || fallback_sent {
+                remaining
+            } else {
+                next_fallback.saturating_duration_since(Instant::now())
+            };
+            let wait_for = remaining.min(wait_for_probe).min(wait_for_fallback);
             if timeout(wait_for, peer.notify.notified()).await.is_err() {
                 continue;
             }
@@ -4076,6 +4114,40 @@ fn candidate_type(candidates: &[Candidate], address: SocketAddr) -> &'static str
         })
 }
 
+fn candidate_priority(candidate: &Candidate) -> u8 {
+    match candidate {
+        Candidate::Host(address) if is_private_address(*address) => 0,
+        Candidate::Host(_) => 1,
+        Candidate::PeerReflexive(_) => 2,
+        Candidate::ServerReflexive(_) => 3,
+    }
+}
+
+fn is_private_address(address: SocketAddr) -> bool {
+    match address.ip() {
+        IpAddr::V4(address) => address.is_private(),
+        IpAddr::V6(address) => address.is_unique_local(),
+    }
+}
+
+fn ordered_connection_candidates(candidates: Vec<Candidate>) -> Vec<Candidate> {
+    let mut ordered = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let Some(existing_index) = ordered
+            .iter()
+            .position(|existing: &Candidate| existing.address() == candidate.address())
+        else {
+            ordered.push(candidate);
+            continue;
+        };
+        if candidate_priority(&candidate) < candidate_priority(&ordered[existing_index]) {
+            ordered[existing_index] = candidate;
+        }
+    }
+    ordered.sort_by_key(candidate_priority);
+    ordered
+}
+
 fn encoded_header(header: &Header) -> [u8; vela_proto::HEADER_LEN] {
     let mut bytes = [0u8; vela_proto::HEADER_LEN];
     bytes[..4].copy_from_slice(&vela_proto::MAGIC);
@@ -4338,6 +4410,27 @@ mod tests {
             interface.ip(),
             local_addrs[0].port(),
         ))));
+    }
+
+    #[test]
+    fn connection_candidates_prefer_private_hosts_and_dedupe_addresses() {
+        let private: SocketAddr = "192.168.2.104:34352".parse().unwrap();
+        let global: SocketAddr = "[2409:8a28:641:ae31::bd0]:36986".parse().unwrap();
+        let candidates = ordered_connection_candidates(vec![
+            Candidate::ServerReflexive(private),
+            Candidate::Host(global),
+            Candidate::PeerReflexive("198.51.100.10:34352".parse().unwrap()),
+            Candidate::Host(private),
+        ]);
+
+        assert_eq!(
+            candidates,
+            vec![
+                Candidate::Host(private),
+                Candidate::Host(global),
+                Candidate::PeerReflexive("198.51.100.10:34352".parse().unwrap()),
+            ]
+        );
     }
 
     #[tokio::test]
