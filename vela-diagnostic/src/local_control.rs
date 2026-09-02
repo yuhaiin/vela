@@ -28,6 +28,7 @@ use tracing::warn;
 use vela_proto::{NodeId, PeerSummary};
 
 const CONTROL_FILE: &str = "control.json";
+#[cfg(unix)]
 const CONTROL_SOCKET: &str = "control.sock";
 const LOCK_FILE: &str = "peer.lock";
 const CONTROL_VERSION: u8 = 1;
@@ -130,8 +131,7 @@ impl LocalControlServer {
         };
 
         #[cfg(not(unix))]
-        let (socket_path, socket_listener, transport) =
-            (None, None::<TcpListener>, ControlTransport::Tcp);
+        let (socket_path, transport) = (None, ControlTransport::Tcp);
 
         let endpoint = ControlEndpoint {
             version: CONTROL_VERSION,
@@ -144,19 +144,23 @@ impl LocalControlServer {
         };
         write_endpoint(&endpoint_path, &endpoint)?;
         let shutdown = Arc::new(Notify::new());
-        let mut tasks = vec![tokio::spawn(run_tcp_listener(
+        let tasks = vec![tokio::spawn(run_tcp_listener(
             dashboard_listener,
             Arc::clone(&state),
             Arc::clone(&shutdown),
         ))];
         #[cfg(unix)]
-        if let Some(listener) = socket_listener {
-            tasks.push(tokio::spawn(run_unix_listener(
-                listener,
-                Arc::clone(&state),
-                Arc::clone(&shutdown),
-            )));
-        }
+        let tasks = {
+            let mut tasks = tasks;
+            if let Some(listener) = socket_listener {
+                tasks.push(tokio::spawn(run_unix_listener(
+                    listener,
+                    Arc::clone(&state),
+                    Arc::clone(&shutdown),
+                )));
+            }
+            tasks
+        };
         if !dashboard_addr.ip().is_loopback() {
             warn!(
                 address = %dashboard_addr,
@@ -215,7 +219,7 @@ fn control_socket_path(_state_dir: &Path) -> PathBuf {
     PathBuf::from(format!("/run/user/{uid}/vela")).join(CONTROL_SOCKET)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn control_socket_path(state_dir: &Path) -> PathBuf {
     state_dir.join(CONTROL_SOCKET)
 }

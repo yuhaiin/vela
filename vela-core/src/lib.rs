@@ -141,6 +141,18 @@ impl TokioDatagramProvider {
 #[derive(Clone, Debug)]
 struct DefaultRouteInterface {
     name: String,
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "ios",
+        target_os = "visionos",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "illumos",
+        target_os = "solaris",
+    ))]
     index: Option<std::num::NonZeroU32>,
 }
 
@@ -153,9 +165,34 @@ fn default_route_interface(ipv4: bool) -> io::Result<Option<DefaultRouteInterfac
     let Some(name) = route.if_name().cloned() else {
         return Ok(None);
     };
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "ios",
+        target_os = "visionos",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "illumos",
+        target_os = "solaris",
+    ))]
+    let index = route.if_index().and_then(std::num::NonZeroU32::new);
     Ok(Some(DefaultRouteInterface {
         name,
-        index: route.if_index().and_then(std::num::NonZeroU32::new),
+        #[cfg(any(
+            target_os = "android",
+            target_os = "fuchsia",
+            target_os = "linux",
+            target_os = "ios",
+            target_os = "visionos",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "illumos",
+            target_os = "solaris",
+        ))]
+        index,
     }))
 }
 
