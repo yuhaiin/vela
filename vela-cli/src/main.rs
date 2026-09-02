@@ -647,13 +647,20 @@ async fn run_tun_peer(
     let tun_writer = Arc::clone(&tun);
     let mut vela_to_tun = tokio::spawn(async move {
         let mut packets = io.packets;
-        while let Some((_peer, packet)) = packets.recv().await {
-            tun_writer
-                .send(packet.as_bytes())
-                .await
-                .map_err(|error| error.to_string())?;
+        let mut batch = Vec::with_capacity(64);
+        loop {
+            batch.clear();
+            let received = packets.recv_many(&mut batch, 64).await;
+            if received == 0 {
+                return Err::<(), _>("peer runtime packet channel closed".to_owned());
+            }
+            for (_peer, packet) in batch.drain(..) {
+                tun_writer
+                    .send(packet.as_bytes())
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
         }
-        Err::<(), _>("peer runtime packet channel closed".to_owned())
     });
     let mut snapshots = io.snapshots;
     let ctrl_c = tokio::signal::ctrl_c();

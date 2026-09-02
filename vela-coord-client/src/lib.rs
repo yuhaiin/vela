@@ -23,6 +23,7 @@ use vela_proto::{
 type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 const CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct CoordinationClient {
     endpoint: String,
@@ -214,6 +215,28 @@ impl CoordinationClient {
         credential: Option<&MembershipCredential>,
         candidates: Vec<Candidate>,
     ) -> Result<Registration, CoordClientError> {
+        timeout(
+            CONTROL_REQUEST_TIMEOUT,
+            self.register_with_incarnation_inner(
+                identity,
+                incarnation,
+                token,
+                credential,
+                candidates,
+            ),
+        )
+        .await
+        .map_err(|_| CoordClientError::Timeout("register"))?
+    }
+
+    async fn register_with_incarnation_inner(
+        &mut self,
+        identity: &Identity,
+        incarnation: u64,
+        token: Option<&str>,
+        credential: Option<&MembershipCredential>,
+        candidates: Vec<Candidate>,
+    ) -> Result<Registration, CoordClientError> {
         let public = identity.public();
         let credential = match credential {
             Some(value) => {
@@ -280,7 +303,50 @@ impl CoordinationClient {
             .await
     }
 
+    /// Updates the published candidates and waits for the corresponding fresh
+    /// network snapshot. This turns candidate refresh into a control-plane
+    /// request/response instead of treating a successful local socket write as
+    /// proof that the server processed the update.
+    pub async fn update_candidates_and_get_snapshot(
+        &mut self,
+        candidates: Vec<Candidate>,
+    ) -> Result<NetworkSnapshot, CoordClientError> {
+        timeout(
+            CONTROL_REQUEST_TIMEOUT,
+            self.update_candidates_and_get_snapshot_inner(candidates),
+        )
+        .await
+        .map_err(|_| CoordClientError::Timeout("update candidates"))?
+    }
+
+    async fn update_candidates_and_get_snapshot_inner(
+        &mut self,
+        candidates: Vec<Candidate>,
+    ) -> Result<NetworkSnapshot, CoordClientError> {
+        self.send(ControlMessage::UpdateCandidates { candidates })
+            .await?;
+        loop {
+            let message = self.recv_wire().await?;
+            match message {
+                ControlMessage::Snapshot { snapshot } => return Ok(snapshot),
+                message @ ControlMessage::ConnectSignal { .. } => {
+                    self.pending.push_back(message);
+                }
+                ControlMessage::Error { code, message } => {
+                    return Err(CoordClientError::Server { code, message });
+                }
+                _ => return Err(CoordClientError::UnexpectedMessage),
+            }
+        }
+    }
+
     pub async fn lookup_peer(&mut self, node_id: NodeId) -> Result<PeerInfo, CoordClientError> {
+        timeout(CONTROL_REQUEST_TIMEOUT, self.lookup_peer_inner(node_id))
+            .await
+            .map_err(|_| CoordClientError::Timeout("lookup peer"))?
+    }
+
+    async fn lookup_peer_inner(&mut self, node_id: NodeId) -> Result<PeerInfo, CoordClientError> {
         self.send(ControlMessage::LookupPeer { node_id }).await?;
         loop {
             match self.recv_wire().await? {
@@ -296,6 +362,12 @@ impl CoordinationClient {
     }
 
     pub async fn list_peers(&mut self) -> Result<Vec<PeerSummary>, CoordClientError> {
+        timeout(CONTROL_REQUEST_TIMEOUT, self.list_peers_inner())
+            .await
+            .map_err(|_| CoordClientError::Timeout("list peers"))?
+    }
+
+    async fn list_peers_inner(&mut self) -> Result<Vec<PeerSummary>, CoordClientError> {
         self.send(ControlMessage::ListPeers).await?;
         loop {
             match self.recv_wire().await? {
@@ -419,6 +491,8 @@ pub enum CoordClientError {
     UnexpectedMessage,
     #[error("coordination connection closed")]
     Closed,
+    #[error("coordination request timed out: {0}")]
+    Timeout(&'static str),
 }
 
 fn current_time() -> u64 {

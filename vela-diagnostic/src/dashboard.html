@@ -137,6 +137,8 @@
         <div class="fact"><dt>Coordinator</dt><dd id="server" class="mono">—</dd></div>
         <div class="fact"><dt>Local UDP addresses</dt><dd id="local-addrs" class="stack">—</dd></div>
         <div class="fact"><dt>Published candidates</dt><dd id="published-candidates" class="stack">—</dd></div>
+        <div class="fact"><dt>UDP data / queue drops</dt><dd id="transport-receive" class="mono">—</dd></div>
+        <div class="fact"><dt>TUN queue drops</dt><dd id="tun-queue-drops" class="mono">—</dd></div>
       </dl>
     </article>
     <article class="panel">
@@ -218,6 +220,9 @@
     $('server').textContent = data.server || '—';
     $('local-addrs').innerHTML = chips(data.local_udp_addresses);
     $('published-candidates').innerHTML = chips((data.published_candidates || []).map((item) => { const c = candidate(item); return `${c.address} · ${label(c.type)}`; }));
+    const transport = data.transport_receive || {};
+    $('transport-receive').textContent = `${transport.data_datagrams || 0} / ${transport.data_queue_drops || 0} dropped / ${transport.worker_data_datagrams || 0} worker`;
+    $('tun-queue-drops').textContent = String(data.tun_packet_queue_drops || 0);
     $('snapshot-generation').textContent = data.snapshot_generation ?? '—';
     $('snapshot-expires').textContent = date(data.snapshot_expires_at);
     $('credential-expires').textContent = date(data.credential_expires_at);

@@ -11,7 +11,10 @@ use std::{
 use tokio::{net::TcpListener, time::sleep};
 use vela_coord::CoordServer;
 use vela_coord_client::CoordinationClient;
-use vela_core::{BindOptions, NodeConfig, TokioDatagramProvider, VelaEvent, VelaNode};
+use vela_core::{
+    BindOptions, NodeConfig, PeerReceiveStats, TokioDatagramProvider, TransportReceiveStats,
+    VelaEvent, VelaNode,
+};
 use vela_crypto::Identity;
 use vela_proto::{Candidate, ControlMessage, NodeId};
 
@@ -80,6 +83,8 @@ struct PeerResult {
     received_packets: u64,
     accepted_bytes: u64,
     received_bytes: u64,
+    receive: Option<PeerReceiveStats>,
+    transport_receive: TransportReceiveStats,
 }
 
 #[tokio::main]
@@ -217,10 +222,17 @@ async fn run_peer(args: PeerArgs) -> Result<(), Box<dyn std::error::Error>> {
             return Err(error.into());
         }
     }
-    let result = match args.role {
+    let mut result = match args.role {
         PeerRole::Sender => run_sender(&args, &node, remote_id, local_ipv4).await?,
         PeerRole::Receiver => run_receiver(&args, &node).await?,
     };
+    result.receive = node
+        .peer_statuses()
+        .await
+        .into_iter()
+        .find(|status| status.node_id == remote_id)
+        .map(|status| status.receive);
+    result.transport_receive = node.transport_receive_stats();
     fs::write(
         args.run_dir.join(format!("{}.result", args.name)),
         serde_json::to_string(&result)?,
@@ -276,6 +288,8 @@ async fn run_sender(
         received_packets: 0,
         accepted_bytes: accepted_packets * args.packet_size as u64,
         received_bytes: 0,
+        receive: None,
+        transport_receive: TransportReceiveStats::default(),
     })
 }
 
@@ -289,21 +303,25 @@ async fn run_receiver(
         + Duration::from_secs(args.duration_seconds)
         + Duration::from_secs(args.drain_seconds);
     let mut received_packets = 0;
+    let mut events = Vec::with_capacity(64);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
         }
-        let event = tokio::time::timeout(remaining, node.next_event()).await;
-        let Some(event) = event.ok().flatten() else {
+        let received =
+            tokio::time::timeout(remaining, node.next_event_batch(&mut events, 64)).await;
+        if received.ok().is_none_or(|count| count == 0) {
             break;
-        };
-        if let VelaEvent::IpPacket { packet, .. } = event {
-            if packet.as_bytes().len() == args.packet_size
-                && packet.as_bytes().first() == Some(&0x45)
-                && packet.as_bytes().get(9) == Some(&17)
-            {
-                received_packets += 1;
+        }
+        for event in events.drain(..) {
+            if let VelaEvent::IpPacket { packet, .. } = event {
+                if packet.as_bytes().len() == args.packet_size
+                    && packet.as_bytes().first() == Some(&0x45)
+                    && packet.as_bytes().get(9) == Some(&17)
+                {
+                    received_packets += 1;
+                }
             }
         }
     }
@@ -318,6 +336,8 @@ async fn run_receiver(
         received_packets,
         accepted_bytes: 0,
         received_bytes: received_packets * args.packet_size as u64,
+        receive: None,
+        transport_receive: TransportReceiveStats::default(),
     })
 }
 

@@ -21,13 +21,16 @@ use std::{
     collections::{HashMap, HashSet},
     net::{Ipv4Addr, Ipv6Addr},
     path::Path,
-    sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tokio::{
     net::TcpListener,
-    sync::{Mutex as AsyncMutex, mpsc},
+    sync::{Mutex as AsyncMutex, Notify, mpsc},
 };
 use tracing::debug;
 use vela_crypto::{CryptoError, MembershipCredential, ServerSigner};
@@ -41,6 +44,8 @@ mod admin;
 const VIRTUAL_IPV4_NETWORK_BASE: u32 = u32::from_be_bytes([10, 254, 0, 0]);
 const VIRTUAL_IPV4_PREFIX_LEN: u8 = 16;
 const VIRTUAL_IPV4_USABLE_HOSTS: u32 = (1 << 16) - 2;
+const CONTROL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const CONTROL_HEARTBEAT_TIMEOUT_SECONDS: u64 = 45;
 
 #[derive(Clone)]
 pub struct CoordServer {
@@ -341,24 +346,45 @@ async fn handle_socket(state: Arc<ServerInner>, socket: WebSocket) {
             }
         }
     });
+    let last_pong_at = Arc::new(AtomicU64::new(unix_time()));
+    let heartbeat_failed = Arc::new(Notify::new());
     let heartbeat_tx = outbound_tx.clone();
+    let heartbeat_last_pong_at = Arc::clone(&last_pong_at);
+    let heartbeat_failed_signal = Arc::clone(&heartbeat_failed);
     let heartbeat_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+        let mut interval = tokio::time::interval(CONTROL_HEARTBEAT_INTERVAL);
         loop {
             interval.tick().await;
+            if unix_time().saturating_sub(heartbeat_last_pong_at.load(Ordering::Acquire))
+                >= CONTROL_HEARTBEAT_TIMEOUT_SECONDS
+            {
+                debug!(
+                    debug_marker = "vela-control",
+                    "coordination heartbeat timed out"
+                );
+                heartbeat_failed_signal.notify_one();
+                break;
+            }
             if heartbeat_tx
-                .send(ControlMessage::Ping {
+                .try_send(ControlMessage::Ping {
                     nonce: rand::random(),
                 })
-                .await
                 .is_err()
             {
+                heartbeat_failed_signal.notify_one();
                 break;
             }
         }
     });
     let mut registered = None;
-    while let Some(Ok(message)) = reader.next().await {
+    loop {
+        let message = tokio::select! {
+            _ = heartbeat_failed.notified() => break,
+            message = reader.next() => {
+                let Some(Ok(message)) = message else { break };
+                message
+            }
+        };
         let Message::Text(text) = message else {
             continue;
         };
@@ -371,6 +397,9 @@ async fn handle_socket(state: Arc<ServerInner>, socket: WebSocket) {
                 continue;
             }
         };
+        if matches!(&request, ControlMessage::Pong { .. }) {
+            last_pong_at.store(unix_time(), Ordering::Release);
+        }
         match handle_message(&state, &outbound_tx, connection_id, registered, request).await {
             Ok(next_registered) => registered = next_registered,
             Err(error) => {

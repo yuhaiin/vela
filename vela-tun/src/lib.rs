@@ -771,13 +771,15 @@ pub async fn run_bridge(node: vela_core::VelaNode, tun: TunDevice) -> Result<(),
     });
     let writer_tun = Arc::clone(&tun);
     let mut vela_to_tun = tokio::spawn(async move {
+        let mut events = Vec::with_capacity(64);
         loop {
-            match node.next_event().await {
-                Some(vela_core::VelaEvent::IpPacket { packet, .. }) => {
+            if node.next_event_batch(&mut events, 64).await == 0 {
+                return Err(TunError::Closed);
+            }
+            for event in events.drain(..) {
+                if let vela_core::VelaEvent::IpPacket { packet, .. } = event {
                     writer_tun.send(packet.as_bytes()).await?;
                 }
-                Some(_) => {}
-                None => return Err(TunError::Closed),
             }
         }
     });

@@ -21,6 +21,10 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.85"
 
+[profile.dev]
+# Keep debug assertions and symbols while making data-plane benchmarks useful.
+opt-level = 2
+
 [profile.release]
 opt-level = 3
 lto = "fat"

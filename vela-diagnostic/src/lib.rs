@@ -19,8 +19,8 @@ use tracing::{debug, warn};
 use vela_coord_client::{CoordClientError, CoordinationClient};
 use vela_core::{
     AddressFamily, BindOptions, ConnectError, CoreError, DatagramProvider, DiagnosticPingError,
-    DiagnosticPingResult, NodeConfig, PeerRuntimeStatus, TokioDatagramProvider, VelaEvent,
-    VelaNode,
+    DiagnosticPingResult, NodeConfig, PeerRuntimeStatus, TokioDatagramProvider,
+    TransportReceiveStats, VelaEvent, VelaNode,
 };
 use vela_crypto::{CryptoError, Identity, MembershipCredential};
 use vela_proto::{Candidate, ControlMessage, NetworkSnapshot, NodeId, PeerInfo, PeerSummary};
@@ -77,6 +77,8 @@ pub struct DashboardSnapshot {
     pub snapshot_generation: Option<u64>,
     pub snapshot_expires_at: Option<u64>,
     pub credential_expires_at: Option<u64>,
+    pub transport_receive: TransportReceiveStats,
+    pub tun_packet_queue_drops: u64,
     pub peers: Vec<DashboardPeer>,
 }
 
@@ -534,7 +536,11 @@ impl DiagnosticPeer {
             candidates = ?candidates,
             "uploading refreshed local candidates"
         );
-        self.client.update_candidates(candidates.clone()).await?;
+        let snapshot = self
+            .client
+            .update_candidates_and_get_snapshot(candidates.clone())
+            .await?;
+        self.apply_snapshot(snapshot).await?;
         self.candidates = candidates.clone();
         self.state.candidates = candidates;
         self.state.save(&self.state_dir)?;
@@ -569,6 +575,10 @@ impl DiagnosticPeer {
         // control connection was down. Refresh both address families before
         // advertising the reconnected peer as fully up to date.
         self.refresh_candidates().await?;
+        // Candidate refresh applies the coordinator's newest snapshot. Return
+        // that snapshot to the runtime so its TUN route watcher does not
+        // briefly regress to the older snapshot carried by RegisterOk.
+        let snapshot = self.state.snapshot.clone().unwrap_or(snapshot);
         self.state.save(&self.state_dir)?;
         debug!(
             debug_marker = "vela-control",
@@ -594,7 +604,9 @@ impl DiagnosticPeer {
         matches!(
             error,
             DiagnosticError::Coordination(
-                CoordClientError::WebSocket(_) | CoordClientError::Closed
+                CoordClientError::WebSocket(_)
+                    | CoordClientError::Closed
+                    | CoordClientError::Timeout(_)
             )
         )
     }
@@ -773,6 +785,8 @@ impl DiagnosticPeer {
                 .credential
                 .as_ref()
                 .map(|credential| credential.expires_at),
+            transport_receive: self.node.transport_receive_stats(),
+            tun_packet_queue_drops: 0,
             peers,
         }
     }
@@ -1317,7 +1331,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coordination_signal_starts_bilateral_probe_attempts() {
+    async fn coordination_signal_establishes_peer_when_incoming_probe_wins() {
         let base = std::env::temp_dir().join(format!(
             "vela-diagnostic-bilateral-probe-test-{}-{}",
             std::process::id(),
@@ -1411,17 +1425,17 @@ mod tests {
             .unwrap();
         let node_a = peer_a.node.clone();
         let peer_a_task = tokio::spawn(async move { peer_a.run().await });
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 let a_sent = sent_a
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .contains(&address_b);
-                let b_sent = sent_b
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .contains(&address_a);
-                if a_sent && b_sent {
+                let b_connected =
+                    node_b.peer_statuses().await.into_iter().any(|status| {
+                        matches!(status.state, vela_core::PeerRuntimeState::Connected)
+                    });
+                if a_sent && b_connected {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -1436,10 +1450,11 @@ mod tests {
                 .contains(&address_b)
         );
         assert!(
-            sent_b
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(&address_a)
+            node_b
+                .peer_statuses()
+                .await
+                .into_iter()
+                .any(|status| matches!(status.state, vela_core::PeerRuntimeState::Connected))
         );
 
         peer_a_task.abort();

@@ -78,6 +78,43 @@ async fn client_reconnects_and_reregisters_with_existing_credential() {
 }
 
 #[tokio::test]
+async fn candidate_refresh_returns_a_fresh_network_snapshot() {
+    let base = std::env::temp_dir().join(format!(
+        "vela-coord-client-snapshot-refresh-test-{}",
+        std::process::id()
+    ));
+    let db = base.with_extension("db");
+    let signer = base.with_extension("key");
+    let server = CoordServer::open(&db, &signer, "integration").unwrap();
+    let token = server.create_invite(60).unwrap();
+    let server_key = server.server_public_key();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server_task = tokio::spawn(async move { server.serve(listener).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let mut client = CoordinationClient::connect(format!("ws://{address}/ws"))
+        .await
+        .unwrap();
+    client.trust_server_key(server_key);
+    let registration = client
+        .register(&Identity::generate(), Some(&token), None, Vec::new())
+        .await
+        .unwrap();
+    let refreshed = client
+        .update_candidates_and_get_snapshot(Vec::new())
+        .await
+        .unwrap();
+
+    assert!(refreshed.generation > registration.snapshot.generation);
+    assert!(refreshed.expires_at >= registration.snapshot.expires_at);
+
+    server_task.abort();
+    let _ = std::fs::remove_file(db);
+    let _ = std::fs::remove_file(signer);
+}
+
+#[tokio::test]
 async fn clients_discover_online_peers_and_receive_connect_signal() {
     let base = std::env::temp_dir().join(format!(
         "vela-coord-client-discovery-test-{}",

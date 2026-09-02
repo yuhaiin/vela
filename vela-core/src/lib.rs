@@ -24,7 +24,7 @@ use std::{
 use thiserror::Error;
 use tokio::{
     net::UdpSocket,
-    sync::{Mutex, Notify, mpsc, oneshot},
+    sync::{Mutex, Notify, RwLock, mpsc, oneshot},
     task::JoinHandle,
     time::{Instant, timeout},
 };
@@ -760,7 +760,15 @@ pub struct NodeConfig {
 }
 
 const DATA_WORKER_QUEUE_LIMIT: usize = 2048;
-type DataPacket = (Bytes, SocketAddr);
+const DATA_WORKER_BATCH_SIZE: usize = 64;
+const CORE_EVENT_QUEUE_LIMIT: usize = 4096;
+
+struct DataPacket {
+    header: Header,
+    payload: BytesMut,
+    source: SocketAddr,
+}
+
 type DataSender = mpsc::Sender<DataPacket>;
 type DataReceiver = mpsc::Receiver<DataPacket>;
 
@@ -846,7 +854,8 @@ impl VelaNodeBuilder {
         let incarnation = self.incarnation.unwrap_or_else(random_session_id);
         let provider = self.provider.ok_or(CoreError::MissingProvider)?;
         let socket = provider.bind(self.config.bind.clone()).await?;
-        let (event_tx, event_rx) = mpsc::channel(256);
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let (data_tx, data_rx) = mpsc::channel(CORE_EVENT_QUEUE_LIMIT);
         let data_worker_count = data_worker_count();
         let mut data_senders = Vec::with_capacity(data_worker_count);
         let mut data_receivers = Vec::with_capacity(data_worker_count);
@@ -873,9 +882,13 @@ impl VelaNodeBuilder {
             config: self.config,
             observer: self.observer,
             peers: Mutex::new(HashMap::new()),
-            routes: Mutex::new(RouteTable::new(local_addresses)),
-            event_tx,
-            event_rx: Mutex::new(Some(event_rx)),
+            routes: RwLock::new(RouteTable::new(local_addresses)),
+            control_tx,
+            data_tx,
+            event_rx: Mutex::new(Some(EventReceivers {
+                control: control_rx,
+                data: data_rx,
+            })),
             shutdown: Notify::new(),
             stopping: AtomicBool::new(false),
             started: AtomicBool::new(false),
@@ -890,6 +903,7 @@ impl VelaNodeBuilder {
             data_senders,
             data_receivers: StdMutex::new(Some(data_receivers)),
             sessions: StdMutex::new(HashMap::new()),
+            receive: TransportReceiveCounters::default(),
         });
         Ok(VelaNode { inner })
     }
@@ -1029,9 +1043,9 @@ impl VelaNode {
             .map(IpAddr::V4)
             .chain(info.virtual_ipv6.into_iter().map(IpAddr::V6))
             .collect::<Vec<_>>();
-        let replacement = Arc::new(PeerState::new(info));
+        let replacement = Arc::new(PeerState::new(info, self.inner.config.server_public_key));
         let previous = {
-            let mut routes = self.inner.routes.lock().await;
+            let mut routes = self.inner.routes.write().await;
             let mut peers = self.inner.peers.lock().await;
             let previous = peers.insert(peer_id, replacement);
             if let Some(previous) = &previous {
@@ -1081,7 +1095,7 @@ impl VelaNode {
         };
         let _connect_guard = peer.connect.lock().await;
         let peer = {
-            let mut routes = self.inner.routes.lock().await;
+            let mut routes = self.inner.routes.write().await;
             let mut peers = self.inner.peers.lock().await;
             if !peers
                 .get(&peer_id)
@@ -1175,7 +1189,7 @@ impl VelaNode {
                     if !retain {
                         self.inner.invalidate_session(peer, true).await;
                     }
-                    peer.update_info(info.clone());
+                    peer.update_info(info.clone(), self.inner.config.server_public_key);
                     let online = online_peers.contains(&info.node_id);
                     peer.online.store(online, Ordering::Release);
                     if online {
@@ -1191,7 +1205,14 @@ impl VelaNode {
                     continue;
                 }
                 let online = online_peers.contains(&info.node_id);
-                replacement.insert(info.node_id, Arc::new(PeerState::with_online(info, online)));
+                replacement.insert(
+                    info.node_id,
+                    Arc::new(PeerState::with_online(
+                        info,
+                        online,
+                        self.inner.config.server_public_key,
+                    )),
+                );
             }
         }
         let mut routes = RouteTable::new(local_addresses);
@@ -1211,7 +1232,7 @@ impl VelaNode {
 
         // Keep route and peer replacement together so an outbound lookup
         // cannot observe a peer table from a different snapshot.
-        let mut route_guard = self.inner.routes.lock().await;
+        let mut route_guard = self.inner.routes.write().await;
         let mut peer_guard = self.inner.peers.lock().await;
         let old_peers = peer_guard.clone();
         *route_guard = routes;
@@ -1249,7 +1270,7 @@ impl VelaNode {
         let peer_id = self
             .inner
             .routes
-            .lock()
+            .read()
             .await
             .validate_outbound(&packet)
             .map_err(SendError::Ip)?;
@@ -1577,7 +1598,58 @@ impl VelaNode {
 
     pub async fn next_event(&self) -> Option<VelaEvent> {
         let mut receiver = self.inner.event_rx.lock().await;
-        receiver.as_mut()?.recv().await
+        let receiver = receiver.as_mut()?;
+        tokio::select! {
+            biased;
+            event = receiver.control.recv() => event,
+            event = receiver.data.recv() => event,
+        }
+    }
+
+    /// Receives one ready event and drains additional ready events without
+    /// reacquiring the receiver mutex for every packet. Control events are
+    /// checked before data so a data burst cannot delay lifecycle handling.
+    pub async fn next_event_batch(&self, events: &mut Vec<VelaEvent>, limit: usize) -> usize {
+        events.clear();
+        if limit == 0 {
+            return 0;
+        }
+        let mut receiver = self.inner.event_rx.lock().await;
+        let Some(receiver) = receiver.as_mut() else {
+            return 0;
+        };
+        let first = tokio::select! {
+            biased;
+            event = receiver.control.recv() => event,
+            event = receiver.data.recv() => event,
+        };
+        let Some(first) = first else {
+            return 0;
+        };
+        events.push(first);
+        while events.len() < limit {
+            match receiver.control.try_recv() {
+                Ok(event) => events.push(event),
+                Err(mpsc::error::TryRecvError::Disconnected) => match receiver.data.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(mpsc::error::TryRecvError::Empty)
+                    | Err(mpsc::error::TryRecvError::Disconnected) => break,
+                },
+                Err(mpsc::error::TryRecvError::Empty) => match receiver.data.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(mpsc::error::TryRecvError::Empty)
+                    | Err(mpsc::error::TryRecvError::Disconnected) => break,
+                },
+            }
+        }
+        events.len()
+    }
+
+    /// Returns counters for the receive pipeline. These counters are
+    /// intentionally separate from per-peer payload bytes so a dashboard can
+    /// tell whether loss happened before or after the data worker.
+    pub fn transport_receive_stats(&self) -> TransportReceiveStats {
+        self.inner.receive.snapshot()
     }
 
     /// Returns a redacted, read-only view of every peer's direct transport
@@ -1703,6 +1775,7 @@ impl VelaNode {
                         .collect(),
                 })
             });
+            let receive = peer.receive.snapshot();
             statuses.push(PeerRuntimeStatus {
                 node_id: info.node_id,
                 online: peer.online.load(Ordering::Acquire),
@@ -1727,6 +1800,7 @@ impl VelaNode {
                 last_rtt_ms,
                 tx_bytes,
                 rx_bytes,
+                receive,
                 attempt: attempt_status,
                 last_failure: failure,
             });
@@ -1744,7 +1818,7 @@ struct Inner {
     config: NodeConfig,
     observer: Option<Arc<dyn TrafficObserver>>,
     peers: Mutex<HashMap<NodeId, Arc<PeerState>>>,
-    routes: Mutex<RouteTable>,
+    routes: RwLock<RouteTable>,
     snapshot_update: Mutex<()>,
     network_id: Mutex<[u8; 16]>,
     snapshot_generation: AtomicU64,
@@ -1752,15 +1826,45 @@ struct Inner {
     local_ipv4: Mutex<Option<Ipv4Addr>>,
     local_ipv6: Mutex<Option<Ipv6Addr>>,
     stun_waiters: Mutex<HashMap<[u8; 12], StunWaiter>>,
-    event_tx: mpsc::Sender<VelaEvent>,
-    event_rx: Mutex<Option<mpsc::Receiver<VelaEvent>>>,
+    control_tx: mpsc::UnboundedSender<VelaEvent>,
+    data_tx: mpsc::Sender<VelaEvent>,
+    event_rx: Mutex<Option<EventReceivers>>,
     data_senders: Vec<DataSender>,
     data_receivers: StdMutex<Option<Vec<DataReceiver>>>,
     sessions: StdMutex<HashMap<u64, Arc<PeerState>>>,
+    receive: TransportReceiveCounters,
     shutdown: Notify,
     stopping: AtomicBool,
     started: AtomicBool,
     tasks: StdMutex<Vec<JoinHandle<()>>>,
+}
+
+struct EventReceivers {
+    control: mpsc::UnboundedReceiver<VelaEvent>,
+    data: mpsc::Receiver<VelaEvent>,
+}
+
+#[derive(Default)]
+struct TransportReceiveCounters {
+    udp_datagrams: AtomicU64,
+    stun_datagrams: AtomicU64,
+    data_datagrams: AtomicU64,
+    data_queue_drops: AtomicU64,
+    worker_data_datagrams: AtomicU64,
+    unassociated_data_datagrams: AtomicU64,
+}
+
+impl TransportReceiveCounters {
+    fn snapshot(&self) -> TransportReceiveStats {
+        TransportReceiveStats {
+            udp_datagrams: self.udp_datagrams.load(Ordering::Relaxed),
+            stun_datagrams: self.stun_datagrams.load(Ordering::Relaxed),
+            data_datagrams: self.data_datagrams.load(Ordering::Relaxed),
+            data_queue_drops: self.data_queue_drops.load(Ordering::Relaxed),
+            worker_data_datagrams: self.worker_data_datagrams.load(Ordering::Relaxed),
+            unassociated_data_datagrams: self.unassociated_data_datagrams.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl Inner {
@@ -1794,6 +1898,7 @@ impl Inner {
                 _ = self.shutdown.notified() => break,
                 result = self.socket.recv_packet() => match result {
                     Ok((packet, source)) => {
+                        self.receive.udp_datagrams.fetch_add(1, Ordering::Relaxed);
                         debug!(
                             debug_marker = "vela-udp",
                             source = %source,
@@ -1801,6 +1906,7 @@ impl Inner {
                             "received UDP datagram"
                         );
                         if let Some(transaction) = stun_transaction_id(&packet) {
+                            self.receive.stun_datagrams.fetch_add(1, Ordering::Relaxed);
                             debug!(
                                 debug_marker = "vela-stun",
                                 source = %source,
@@ -1836,15 +1942,31 @@ impl Inner {
                                 }
                                 continue;
                             }
+                            self.receive.data_datagrams.fetch_add(1, Ordering::Relaxed);
+                            let packet = match decode_data_packet(packet, header, source) {
+                                Ok(packet) => packet,
+                                Err(error) => {
+                                    debug!(
+                                        debug_marker = "vela-udp",
+                                        error = %error,
+                                        %source,
+                                        "dropping malformed Vela data packet"
+                                    );
+                                    continue;
+                                }
+                            };
                             // Keep one session's packets on one worker. The read loop
                             // preserves wire order, while the replay window and the
                             // IP/TCP stack both benefit from ordered delivery after
                             // decryption. Different sessions still run in parallel.
                             let worker = header.session_id as usize % self.data_senders.len();
                             let sender = &self.data_senders[worker];
-                            match sender.try_send((packet, source)) {
+                            match sender.try_send(packet) {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(_)) => {
+                                    self.receive
+                                        .data_queue_drops
+                                        .fetch_add(1, Ordering::Relaxed);
                                     // Data is intentionally lossy at this boundary. A
                                     // congested UDP transport must not prevent the read
                                     // loop from dispatching STUN, probes, handshakes or
@@ -1884,24 +2006,40 @@ impl Inner {
     }
 
     async fn data_loop(self: Arc<Self>, mut receiver: DataReceiver) {
+        let mut batch = Vec::with_capacity(DATA_WORKER_BATCH_SIZE);
         loop {
             if self.stopping.load(Ordering::Acquire) {
                 break;
             }
-            let message = tokio::select! {
+            batch.clear();
+            let received = tokio::select! {
                 _ = self.shutdown.notified() => break,
-                message = receiver.recv() => message,
+                received = receiver.recv_many(&mut batch, DATA_WORKER_BATCH_SIZE) => received,
             };
-            let Some((packet, source)) = message else {
+            if received == 0 {
                 break;
-            };
-            if let Err(error) = self.handle_packet(packet, source).await {
-                debug!(
-                    debug_marker = "vela-udp",
-                    error = %error,
-                    %source,
-                    "dropping invalid Vela data packet"
-                );
+            }
+            for packet in batch.drain(..) {
+                let source = packet.source;
+                self.receive
+                    .worker_data_datagrams
+                    .fetch_add(1, Ordering::Relaxed);
+                if unix_time() >= self.snapshot_expires_at.load(Ordering::Acquire) {
+                    debug!(
+                        debug_marker = "vela-udp",
+                        %source,
+                        "dropping Vela data packet because the snapshot expired"
+                    );
+                    continue;
+                }
+                if let Err(error) = self.handle_ip_data(packet).await {
+                    debug!(
+                        debug_marker = "vela-udp",
+                        error = %error,
+                        %source,
+                        "dropping invalid Vela data packet"
+                    );
+                }
             }
         }
     }
@@ -1923,12 +2061,8 @@ impl Inner {
                     let peers = self.peers.lock().await.values().cloned().collect::<Vec<_>>();
                     for peer in peers {
                         let peer_info = peer.info();
-                        let membership_expired = self
-                            .config
-                            .server_public_key
-                            .is_some_and(|server_key| {
-                                validate_peer_membership(&peer_info, Some(server_key)).is_err()
-                            });
+                        let membership_expired = self.config.server_public_key.is_some()
+                            && peer.membership_expired();
                         if unix_time() >= self.snapshot_expires_at.load(Ordering::Acquire)
                             || membership_expired
                         {
@@ -2534,7 +2668,11 @@ impl Inner {
 
     async fn handle_data(&self, packet: WirePacket, source: SocketAddr) -> Result<(), CoreError> {
         if packet.header.packet_type == PacketType::Data {
-            return self.handle_ip_data(packet, source).await;
+            let header = packet.header;
+            let encoded = packet.encode()?;
+            return self
+                .handle_ip_data(decode_data_packet(encoded, header, source)?)
+                .await;
         }
         let peers = self
             .peers
@@ -2614,7 +2752,7 @@ impl Inner {
                         packet_len = ip_packet.as_bytes().len(),
                         "decrypted inbound IP packet"
                     );
-                    if !self.routes.lock().await.is_local(destination) {
+                    if !self.routes.read().await.is_local(destination) {
                         return Err(CoreError::Ip(vela_ip::IpError::DestinationUnknown(
                             destination,
                         )));
@@ -2707,19 +2845,26 @@ impl Inner {
         Ok(())
     }
 
-    async fn handle_ip_data(
-        &self,
-        packet: WirePacket,
-        source: SocketAddr,
-    ) -> Result<(), CoreError> {
+    async fn handle_ip_data(&self, mut packet: DataPacket) -> Result<(), CoreError> {
+        let source = packet.source;
         let encrypted_len = packet.payload.len();
-        let wire_len = input_wire_len(&packet);
+        let wire_len = vela_proto::HEADER_LEN + encrypted_len;
         let Some(peer) = self.session_peer(packet.header.session_id) else {
+            self.receive
+                .unassociated_data_datagrams
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(());
         };
-        let peer_info = peer.info();
+        let peer_id = peer.node_id();
+        if self.config.server_public_key.is_some() && peer.membership_expired() {
+            self.invalidate_session(&peer, true).await;
+            return Err(CoreError::PeerCredentialExpired);
+        }
+        peer.receive
+            .worker_data_packets
+            .fetch_add(1, Ordering::Relaxed);
         let cipher = {
-            let mut active = peer.active.lock().await;
+            let active = peer.active.lock().await;
             let Some(session) = active
                 .as_ref()
                 .filter(|session| session.session_id == packet.header.session_id)
@@ -2727,27 +2872,26 @@ impl Inner {
                 self.remove_session(&peer, packet.header.session_id);
                 return Ok(());
             };
-            if let Some(server_key) = self.config.server_public_key {
-                if validate_peer_membership(&peer_info, Some(server_key)).is_err() {
-                    active.take();
-                    drop(active);
-                    self.remove_session(&peer, packet.header.session_id);
-                    *peer.attempt.lock().await = None;
-                    peer.queue.lock().await.clear();
-                    self.emit(VelaEvent::PeerDisconnected(peer_info.node_id))
-                        .await;
-                    return Err(CoreError::PeerCredentialExpired);
-                }
-            }
             session.cipher.clone()
         };
         let aad = encoded_header(&packet.header);
-        let mut plaintext = packet
-            .payload
-            .try_into_mut()
-            .unwrap_or_else(|payload| BytesMut::from(&payload[..]));
-        cipher.decrypt_in_place(packet.header.sequence, &aad, &mut plaintext)?;
-        let ip_packet = IpPacket::parse(plaintext.freeze()).map_err(CoreError::Ip)?;
+        if let Err(error) =
+            cipher.decrypt_in_place(packet.header.sequence, &aad, &mut packet.payload)
+        {
+            peer.receive
+                .decrypt_failures
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(error.into());
+        }
+        let ip_packet = match IpPacket::parse(packet.payload.freeze()) {
+            Ok(packet) => packet,
+            Err(error) => {
+                peer.receive
+                    .ip_parse_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(CoreError::Ip(error));
+            }
+        };
         let destination = ip_packet.destination();
         let path_changed = {
             let mut active = peer.active.lock().await;
@@ -2758,6 +2902,7 @@ impl Inner {
                 return Ok(());
             };
             if !session.replay.accept(packet.header.sequence) {
+                peer.receive.replay_drops.fetch_add(1, Ordering::Relaxed);
                 return Ok(());
             }
             session.last_rx = Instant::now();
@@ -2765,20 +2910,27 @@ impl Inner {
             session.path = source;
             if path_changed {
                 session.path_changed_at = Some(unix_time());
-                peer.record_path(source, &peer_info.candidates);
+                let candidates = peer.candidates();
+                peer.record_path(source, &candidates);
             }
             session
                 .rx_bytes
                 .fetch_add(encrypted_len as u64, Ordering::Relaxed);
             path_changed
         };
-        if !self.routes.lock().await.is_local(destination) {
+        if !self.routes.read().await.is_local(destination) {
+            peer.receive
+                .invalid_destinations
+                .fetch_add(1, Ordering::Relaxed);
             return Err(CoreError::Ip(vela_ip::IpError::DestinationUnknown(
                 destination,
             )));
         }
+        peer.receive
+            .accepted_ip_packets
+            .fetch_add(1, Ordering::Relaxed);
         self.observe(TrafficSample {
-            peer: Some(peer_info.node_id),
+            peer: Some(peer_id),
             direction: TrafficDirection::Received,
             path: source,
             payload_bytes: ip_packet.as_bytes().len(),
@@ -2786,14 +2938,19 @@ impl Inner {
             wire_bytes: wire_len,
         });
         if path_changed {
-            self.emit(VelaEvent::PathChanged(peer_info.node_id, source))
-                .await;
+            self.emit(VelaEvent::PathChanged(peer_id, source)).await;
         }
-        self.emit(VelaEvent::IpPacket {
-            peer: peer_info.node_id,
-            packet: ip_packet,
-        })
-        .await;
+        if !self
+            .emit(VelaEvent::IpPacket {
+                peer: peer_id,
+                packet: ip_packet,
+            })
+            .await
+        {
+            peer.receive
+                .event_queue_drops
+                .fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -2866,11 +3023,11 @@ impl Inner {
         let packet = IpPacket::parse(payload).map_err(SendError::Ip)?;
         let routed_peer = self
             .routes
-            .lock()
+            .read()
             .await
             .validate_outbound(&packet)
             .map_err(SendError::Ip)?;
-        if routed_peer != peer.info().node_id {
+        if routed_peer != peer.node_id() {
             return Err(SendError::WrongPeer);
         }
         self.send_ip_packet(peer, packet).await
@@ -2881,6 +3038,7 @@ impl Inner {
         peer: &Arc<PeerState>,
         packet: IpPacket,
     ) -> Result<(), SendError> {
+        let peer_id = peer.node_id();
         if unix_time() >= self.snapshot_expires_at.load(Ordering::Acquire) {
             self.invalidate_session(peer, true).await;
             return Err(SendError::SnapshotExpired);
@@ -2901,7 +3059,7 @@ impl Inner {
             queue.push_back(packet.into_bytes());
             debug!(
                 debug_marker = "vela-data",
-                peer_id = %peer.info().node_id,
+                peer_id = %peer_id,
                 queued_packets = queue.len(),
                 "queued IP packet until peer session is established"
             );
@@ -2940,7 +3098,7 @@ impl Inner {
         }
         debug!(
             debug_marker = "vela-data",
-            peer_id = %peer.info().node_id,
+            peer_id = %peer_id,
             path = %path,
             session_id,
             sequence,
@@ -2960,7 +3118,7 @@ impl Inner {
                 .fetch_add(packet_len as u64, Ordering::Relaxed);
         }
         self.observe(TrafficSample {
-            peer: Some(peer.info().node_id),
+            peer: Some(peer_id),
             direction: TrafficDirection::Sent,
             path,
             payload_bytes: packet_len,
@@ -3114,15 +3272,17 @@ impl Inner {
         Ok(())
     }
 
-    async fn emit(&self, event: VelaEvent) {
+    async fn emit(&self, event: VelaEvent) -> bool {
         if matches!(&event, VelaEvent::IpPacket { .. }) {
             // TUN/runtime backpressure must not stop the UDP dispatcher from
             // servicing control packets. Dropping here is preferable to
             // stalling the transport; TCP will retransmit and UDP is already
             // lossy by contract.
-            let _ = self.event_tx.try_send(event);
+            self.data_tx.try_send(event).is_ok()
         } else {
-            let _ = self.event_tx.send(event).await;
+            // Control events use their own low-rate queue so a burst of IP
+            // packets cannot make session lifecycle events wait behind data.
+            self.control_tx.send(event).is_ok()
         }
     }
 
@@ -3167,8 +3327,35 @@ pub struct PeerRuntimeStatus {
     pub last_rtt_ms: Option<u64>,
     pub tx_bytes: u64,
     pub rx_bytes: u64,
+    /// Receive-stage counters used to distinguish network loss from local
+    /// queue, crypto, replay, and event-delivery loss.
+    pub receive: PeerReceiveStats,
     pub attempt: Option<PeerAttemptStatus>,
     pub last_failure: Option<PeerFailureStatus>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PeerReceiveStats {
+    /// Data datagrams pulled from a worker queue for decryption/processing.
+    pub worker_data_packets: u64,
+    pub decrypt_failures: u64,
+    pub replay_drops: u64,
+    pub ip_parse_failures: u64,
+    pub invalid_destinations: u64,
+    /// Decrypted, parsed, route-valid IP packets before event delivery.
+    pub accepted_ip_packets: u64,
+    /// IP events discarded because the core event queue was full.
+    pub event_queue_drops: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TransportReceiveStats {
+    pub udp_datagrams: u64,
+    pub stun_datagrams: u64,
+    pub data_datagrams: u64,
+    pub data_queue_drops: u64,
+    pub worker_data_datagrams: u64,
+    pub unassociated_data_datagrams: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3371,7 +3558,9 @@ pub enum VelaEvent {
 }
 
 struct PeerState {
+    node_id: NodeId,
     info: StdMutex<PeerInfo>,
+    membership_expires_at: AtomicU64,
     online: AtomicBool,
     last_failure: StdMutex<Option<PeerFailureStatus>>,
     path_history: StdMutex<Vec<PeerPathChange>>,
@@ -3382,16 +3571,46 @@ struct PeerState {
     reconnect: Mutex<ReconnectState>,
     notify: Notify,
     queue: Mutex<VecDeque<Bytes>>,
+    receive: PeerReceiveCounters,
+}
+
+#[derive(Default)]
+struct PeerReceiveCounters {
+    worker_data_packets: AtomicU64,
+    decrypt_failures: AtomicU64,
+    replay_drops: AtomicU64,
+    ip_parse_failures: AtomicU64,
+    invalid_destinations: AtomicU64,
+    accepted_ip_packets: AtomicU64,
+    event_queue_drops: AtomicU64,
+}
+
+impl PeerReceiveCounters {
+    fn snapshot(&self) -> PeerReceiveStats {
+        PeerReceiveStats {
+            worker_data_packets: self.worker_data_packets.load(Ordering::Relaxed),
+            decrypt_failures: self.decrypt_failures.load(Ordering::Relaxed),
+            replay_drops: self.replay_drops.load(Ordering::Relaxed),
+            ip_parse_failures: self.ip_parse_failures.load(Ordering::Relaxed),
+            invalid_destinations: self.invalid_destinations.load(Ordering::Relaxed),
+            accepted_ip_packets: self.accepted_ip_packets.load(Ordering::Relaxed),
+            event_queue_drops: self.event_queue_drops.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl PeerState {
-    fn new(info: PeerInfo) -> Self {
-        Self::with_online(info, true)
+    fn new(info: PeerInfo, server_public_key: Option<[u8; 32]>) -> Self {
+        Self::with_online(info, true, server_public_key)
     }
 
-    fn with_online(info: PeerInfo, online: bool) -> Self {
+    fn with_online(info: PeerInfo, online: bool, server_public_key: Option<[u8; 32]>) -> Self {
+        let node_id = info.node_id;
+        let membership_expires_at = membership_expires_at(&info, server_public_key);
         Self {
+            node_id,
             info: StdMutex::new(info),
+            membership_expires_at: AtomicU64::new(membership_expires_at),
             online: AtomicBool::new(online),
             last_failure: StdMutex::new(None),
             path_history: StdMutex::new(Vec::new()),
@@ -3402,6 +3621,7 @@ impl PeerState {
             reconnect: Mutex::new(ReconnectState::default()),
             notify: Notify::new(),
             queue: Mutex::new(VecDeque::new()),
+            receive: PeerReceiveCounters::default(),
         }
     }
 
@@ -3412,7 +3632,23 @@ impl PeerState {
             .clone()
     }
 
-    fn update_info(&self, info: PeerInfo) {
+    fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    fn candidates(&self) -> Vec<Candidate> {
+        self.info().candidates
+    }
+
+    fn membership_expired(&self) -> bool {
+        unix_time() >= self.membership_expires_at.load(Ordering::Acquire)
+    }
+
+    fn update_info(&self, info: PeerInfo, server_public_key: Option<[u8; 32]>) {
+        self.membership_expires_at.store(
+            membership_expires_at(&info, server_public_key),
+            Ordering::Release,
+        );
         *self
             .info
             .lock()
@@ -3751,6 +3987,14 @@ fn validate_peer_info(info: &PeerInfo) -> Result<(), CoreError> {
     Ok(())
 }
 
+fn membership_expires_at(info: &PeerInfo, server_public_key: Option<[u8; 32]>) -> u64 {
+    if server_public_key.is_none() {
+        return u64::MAX;
+    }
+    serde_json::from_slice::<MembershipCredential>(&info.credential)
+        .map_or(0, |credential| credential.expires_at)
+}
+
 fn validate_peer_membership(
     info: &PeerInfo,
     server_public_key: Option<[u8; 32]>,
@@ -3824,6 +4068,29 @@ fn encrypt_payload(
 }
 fn input_wire_len(packet: &WirePacket) -> usize {
     vela_proto::HEADER_LEN + packet.payload.len()
+}
+
+fn decode_data_packet(
+    input: Bytes,
+    header: Header,
+    source: SocketAddr,
+) -> Result<DataPacket, ProtoError> {
+    let end = vela_proto::HEADER_LEN + header.payload_len as usize;
+    if input.len() < end {
+        return Err(ProtoError::Truncated);
+    }
+    if input.len() != end {
+        return Err(ProtoError::TrailingBytes);
+    }
+    let mut input = input
+        .try_into_mut()
+        .unwrap_or_else(|input| BytesMut::from(&input[..]));
+    let payload = input.split_off(vela_proto::HEADER_LEN);
+    Ok(DataPacket {
+        header,
+        payload,
+        source,
+    })
 }
 
 #[derive(Debug, Error)]
@@ -4115,6 +4382,48 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn control_events_are_not_blocked_by_a_full_ip_event_queue() {
+        let node = VelaNode::builder()
+            .datagram_provider(Arc::new(TokioDatagramProvider::new(vec![Candidate::Host(
+                "127.0.0.1:1".parse().unwrap(),
+            )])))
+            .config(NodeConfig::default())
+            .build()
+            .await
+            .unwrap();
+        let peer = node.node_id();
+        let packet = IpPacket::parse(ipv4_test_packet(
+            Ipv4Addr::new(10, 254, 0, 1),
+            Ipv4Addr::new(10, 254, 0, 2),
+        ))
+        .unwrap();
+        for _ in 0..CORE_EVENT_QUEUE_LIMIT {
+            assert!(
+                node.inner
+                    .emit(VelaEvent::IpPacket {
+                        peer,
+                        packet: packet.clone(),
+                    })
+                    .await
+            );
+        }
+
+        assert!(
+            timeout(
+                Duration::from_millis(50),
+                node.inner.emit(VelaEvent::PeerDisconnected(peer)),
+            )
+            .await
+            .expect("control event must not wait for the data queue")
+        );
+        assert!(matches!(
+            node.next_event().await,
+            Some(VelaEvent::PeerDisconnected(id)) if id == peer
+        ));
+        node.shutdown().await;
     }
 
     #[cfg(target_os = "macos")]

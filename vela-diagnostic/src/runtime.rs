@@ -3,7 +3,16 @@ use crate::{
     local_control::{ControlEndpoint, LocalControlServer},
 };
 use bytes::Bytes;
-use std::{collections::HashSet, net::SocketAddr, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    net::SocketAddr,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 use tokio::{
     sync::{Notify, RwLock, Semaphore, mpsc, oneshot, watch},
     task::{JoinHandle, JoinSet},
@@ -18,7 +27,10 @@ pub const MIN_PING_TIMEOUT: Duration = Duration::from_millis(100);
 pub const MAX_PING_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_CONCURRENT_PINGS: usize = 8;
 const COMMAND_QUEUE_CAPACITY: usize = 256;
-const PACKET_QUEUE_CAPACITY: usize = 256;
+// Absorb short TUN writer bursts without making the control loop wait. The
+// queue remains bounded; sustained pressure is still visible in the drop
+// counter instead of growing memory without limit.
+const PACKET_QUEUE_CAPACITY: usize = 1024;
 
 pub(crate) struct RuntimeStore {
     snapshot: RwLock<RuntimeSnapshot>,
@@ -84,6 +96,7 @@ pub struct RuntimeHandle {
     node_id: NodeId,
     node: VelaNode,
     commands: mpsc::Sender<RuntimeCommand>,
+    snapshot_expired_notified: Arc<AtomicBool>,
     endpoint: ControlEndpoint,
     stop: Arc<Notify>,
 }
@@ -100,7 +113,18 @@ impl RuntimeHandle {
     pub async fn send_ip(&self, packet: impl Into<Bytes>) -> Result<(), SendError> {
         let result = self.node.send_ip(packet).await;
         if matches!(result, Err(SendError::SnapshotExpired)) {
-            let _ = self.commands.try_send(RuntimeCommand::SnapshotExpired);
+            if !self.snapshot_expired_notified.swap(true, Ordering::AcqRel)
+                && self
+                    .commands
+                    .try_send(RuntimeCommand::SnapshotExpired)
+                    .is_err()
+            {
+                self.snapshot_expired_notified
+                    .store(false, Ordering::Release);
+            }
+        } else if result.is_ok() {
+            self.snapshot_expired_notified
+                .store(false, Ordering::Release);
         }
         result
     }
@@ -132,6 +156,8 @@ pub struct DiagnosticRuntime {
     pings: JoinSet<()>,
     control: Option<LocalControlServer>,
     stop: Arc<Notify>,
+    snapshot_expired_notified: Arc<AtomicBool>,
+    tun_packet_queue_drops: Arc<AtomicU64>,
 }
 
 impl DiagnosticRuntime {
@@ -189,6 +215,8 @@ impl DiagnosticRuntime {
         let store = Arc::new(RuntimeStore::new(&peer, summaries).await);
         let (commands, command_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
         let (packet_tx, packet_rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
+        let tun_packet_queue_drops = Arc::new(AtomicU64::new(0));
+        let snapshot_expired_notified = Arc::new(AtomicBool::new(false));
         let (snapshot_tx, snapshot_rx) = watch::channel(peer.state.snapshot.clone());
         let stop = Arc::new(Notify::new());
         let control = match LocalControlServer::start_with_lock(
@@ -213,6 +241,7 @@ impl DiagnosticRuntime {
             node_id: peer.node_id(),
             node: peer.node.clone(),
             commands: commands.clone(),
+            snapshot_expired_notified: Arc::clone(&snapshot_expired_notified),
             endpoint,
             stop: Arc::clone(&stop),
         };
@@ -227,6 +256,8 @@ impl DiagnosticRuntime {
             pings: JoinSet::new(),
             control: Some(control),
             stop,
+            snapshot_expired_notified,
+            tun_packet_queue_drops,
         };
         let task = tokio::spawn(task_runtime.run());
         Ok(RuntimeProcess {
@@ -265,6 +296,7 @@ impl DiagnosticRuntime {
             .await;
         let mut reconnect_backoff = Duration::from_secs(1);
         let mut reconnect_sleep = Box::pin(tokio::time::sleep(Duration::ZERO));
+        let mut event_batch = Vec::with_capacity(64);
 
         loop {
             tokio::select! {
@@ -274,11 +306,15 @@ impl DiagnosticRuntime {
                 command = self.commands.recv() => {
                     match command {
                         Some(RuntimeCommand::SnapshotExpired) => {
-                            control_connected = false;
-                            dashboard_error = Some("network snapshot has expired".to_owned());
-                            reconnect_sleep.as_mut().reset(
-                                tokio::time::Instant::now() + reconnect_backoff,
-                            );
+                            if control_connected
+                                && self.snapshot_expired_notified.load(Ordering::Acquire)
+                            {
+                                control_connected = false;
+                                dashboard_error = Some("network snapshot has expired".to_owned());
+                                reconnect_sleep.as_mut().reset(
+                                    tokio::time::Instant::now() + reconnect_backoff,
+                                );
+                            }
                         }
                         Some(RuntimeCommand::Ping { target, count, timeout, reply }) => {
                             self.start_ping(target, count, timeout, reply).await;
@@ -312,6 +348,8 @@ impl DiagnosticRuntime {
                         Ok(vela_proto::ControlMessage::Snapshot { snapshot }) => {
                             let changed = self.peer.apply_snapshot(snapshot.clone()).await?;
                             self.snapshot_tx.send_replace(Some(snapshot));
+                            self.snapshot_expired_notified
+                                .store(false, Ordering::Release);
                             if changed {
                                 self.refresh_after_config_change(
                                     &mut control_connected,
@@ -354,6 +392,8 @@ impl DiagnosticRuntime {
                     match self.peer.reconnect().await {
                         Ok(snapshot) => {
                             self.snapshot_tx.send_replace(Some(snapshot));
+                            self.snapshot_expired_notified
+                                .store(false, Ordering::Release);
                             control_connected = true;
                             dashboard_error = None;
                             reconnect_backoff = Duration::from_secs(1);
@@ -374,6 +414,12 @@ impl DiagnosticRuntime {
                         }
                         Err(error) if DiagnosticPeer::is_retryable_control_error(&error) => {
                             dashboard_error = Some(error.to_string());
+                            warn!(
+                                debug_marker = "vela-control",
+                                error = %error,
+                                backoff = ?reconnect_backoff,
+                                "coordination reconnect failed"
+                            );
                             reconnect_sleep.as_mut().reset(
                                 tokio::time::Instant::now() + reconnect_backoff,
                             );
@@ -401,72 +447,87 @@ impl DiagnosticRuntime {
                         Err(error) => return Err(error),
                     }
                 }
-                event = self.peer.node.next_event() => {
-                    let publish_state = match event {
-                        Some(VelaEvent::IpPacket { peer, packet }) => {
-                            match self.packet_tx.try_send((peer, packet)) {
-                                Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    // Keep consuming core events when the TUN-facing
-                                    // queue is full. Dropping an IP packet is safer
-                                    // than blocking probes, handshakes and keepalives;
-                                    // TCP will retransmit it and UDP is lossy already.
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    return Err(DiagnosticError::ServiceUnavailable);
-                                }
-                            }
-                            false
-                        }
-                        Some(VelaEvent::PeerConnectionRequested(peer_id) | VelaEvent::PeerReconnectRequested(peer_id)) => {
-                            if !control_connected {
-                                pending_reconnects.insert(peer_id);
-                                false
-                            } else {
-                                if let Err(error) = self.peer.request_peer_connection(peer_id).await {
-                                    if !DiagnosticPeer::is_retryable_control_error(&error) {
-                                        return Err(error);
-                                    }
-                                    pending_reconnects.insert(peer_id);
-                                    dashboard_error = Some(error.to_string());
-                                    control_connected = false;
-                                    reconnect_sleep.as_mut().reset(
-                                        tokio::time::Instant::now() + reconnect_backoff,
-                                    );
-                                }
-                                true
-                            }
-                        }
-                        Some(VelaEvent::PeerConnecting(peer_id)) => {
-                            debug!(peer_id = %peer_id, "peer session connecting");
-                            true
-                        }
-                        Some(VelaEvent::PeerConnected(peer_id)) => {
-                            info!(peer_id = %peer_id, "peer session connected");
-                            true
-                        }
-                        Some(VelaEvent::PeerDisconnected(peer_id)) => {
-                            warn!(peer_id = %peer_id, "peer session disconnected");
-                            true
-                        }
-                        Some(VelaEvent::PeerUnreachable(peer_id)) => {
-                            warn!(peer_id = %peer_id, "peer is unreachable");
-                            true
-                        }
-                        Some(VelaEvent::PathChanged(peer_id, path)) => {
-                            info!(peer_id = %peer_id, path = %path, "peer path changed");
-                            true
-                        }
-                        Some(VelaEvent::TransportFailed { family, error }) => {
-                            return Err(DiagnosticError::TransportFailed { family, error });
-                        }
-                        None => return Err(DiagnosticError::TransportFailed {
+                received = self.peer.node.next_event_batch(&mut event_batch, 64) => {
+                    if received == 0 {
+                        return Err(DiagnosticError::TransportFailed {
                             family: None,
                             error: "Vela node stopped".to_owned(),
-                        }),
-                    };
+                        });
+                    }
+                    let mut publish_state = false;
+                    for event in event_batch.drain(..) {
+                        publish_state |= match event {
+                            VelaEvent::IpPacket { peer, packet } => {
+                                match self.packet_tx.try_send((peer, packet)) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        self.tun_packet_queue_drops
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        // Keep consuming core events when the TUN-facing
+                                        // queue is full. Dropping an IP packet is safer
+                                        // than blocking probes, handshakes and keepalives;
+                                        // TCP will retransmit it and UDP is lossy already.
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        return Err(DiagnosticError::ServiceUnavailable);
+                                    }
+                                }
+                                false
+                            }
+                            VelaEvent::PeerConnectionRequested(peer_id)
+                            | VelaEvent::PeerReconnectRequested(peer_id) => {
+                                if !control_connected {
+                                    pending_reconnects.insert(peer_id);
+                                    false
+                                } else {
+                                    if let Err(error) =
+                                        self.peer.request_peer_connection(peer_id).await
+                                    {
+                                        if !DiagnosticPeer::is_retryable_control_error(&error) {
+                                            return Err(error);
+                                        }
+                                        pending_reconnects.insert(peer_id);
+                                        dashboard_error = Some(error.to_string());
+                                        control_connected = false;
+                                        reconnect_sleep.as_mut().reset(
+                                            tokio::time::Instant::now() + reconnect_backoff,
+                                        );
+                                    }
+                                    true
+                                }
+                            }
+                            VelaEvent::PeerConnecting(peer_id) => {
+                                debug!(peer_id = %peer_id, "peer session connecting");
+                                true
+                            }
+                            VelaEvent::PeerConnected(peer_id) => {
+                                info!(peer_id = %peer_id, "peer session connected");
+                                true
+                            }
+                            VelaEvent::PeerDisconnected(peer_id) => {
+                                warn!(peer_id = %peer_id, "peer session disconnected");
+                                true
+                            }
+                            VelaEvent::PeerUnreachable(peer_id) => {
+                                warn!(peer_id = %peer_id, "peer is unreachable");
+                                true
+                            }
+                            VelaEvent::PathChanged(peer_id, path) => {
+                                info!(peer_id = %peer_id, path = %path, "peer path changed");
+                                true
+                            }
+                            VelaEvent::TransportFailed { family, error } => {
+                                return Err(DiagnosticError::TransportFailed { family, error });
+                            }
+                        };
+                    }
                     if publish_state {
-                        self.publish_state(control_connected, &dashboard_peers, dashboard_error.clone()).await;
+                        self.publish_state(
+                            control_connected,
+                            &dashboard_peers,
+                            dashboard_error.clone(),
+                        )
+                        .await;
                     }
                 }
             }
@@ -543,10 +604,11 @@ impl DiagnosticRuntime {
         error: Option<String>,
     ) {
         let status = self.peer.status_snapshot(peers);
-        let dashboard = self
+        let mut dashboard = self
             .peer
             .dashboard_snapshot(control_connected, peers, error)
             .await;
+        dashboard.tun_packet_queue_drops = self.tun_packet_queue_drops.load(Ordering::Relaxed);
         self.store.update(status, peers.to_vec(), dashboard).await;
     }
 }

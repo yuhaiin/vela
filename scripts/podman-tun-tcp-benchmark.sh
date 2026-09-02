@@ -5,9 +5,24 @@ repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 run_dir=$(mktemp -d "${TMPDIR:-/tmp}/vela-tun-e2e.XXXXXX")
 network="vela-tun-e2e-$$"
 image="docker.io/library/debian:bookworm-slim"
-coord_bin="$repo_dir/target/release/examples/e2e_bench"
-cli_bin="$repo_dir/target/release/vela-cli"
-tcp_bin="$repo_dir/target/release/examples/tun_tcp_bench"
+build_profile="${BUILD_PROFILE:-debug}"
+case "$build_profile" in
+    debug)
+        build_args=()
+        target_dir="$repo_dir/target/debug"
+        ;;
+    release)
+        build_args=(--release)
+        target_dir="$repo_dir/target/release"
+        ;;
+    *)
+        echo "BUILD_PROFILE must be debug or release" >&2
+        exit 2
+        ;;
+esac
+coord_bin="$target_dir/examples/e2e_bench"
+cli_bin="$target_dir/vela-cli"
+tcp_bin="$target_dir/examples/tun_tcp_bench"
 bench_bytes="${BENCH_BYTES:-1073741824}"
 tun_mtu="${TUN_MTU:-1200}"
 server_name="${network}-server"
@@ -36,7 +51,7 @@ refresh_peer_logs() {
     podman logs "$peer_b_name" >"$run_dir/peer-b.log" 2>&1 || true
 }
 
-cargo build --release \
+cargo build "${build_args[@]}" \
     -p vela-core --example e2e_bench \
     -p vela-cli --bin vela-cli \
     -p vela-cli --example tun_tcp_bench
