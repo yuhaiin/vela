@@ -404,10 +404,16 @@ impl DiagnosticRuntime {
                 event = self.peer.node.next_event() => {
                     let publish_state = match event {
                         Some(VelaEvent::IpPacket { peer, packet }) => {
-                            tokio::select! {
-                                _ = self.stop.notified() => return Ok(()),
-                                result = self.packet_tx.send((peer, packet)) => {
-                                    result.map_err(|_| DiagnosticError::ServiceUnavailable)?;
+                            match self.packet_tx.try_send((peer, packet)) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    // Keep consuming core events when the TUN-facing
+                                    // queue is full. Dropping an IP packet is safer
+                                    // than blocking probes, handshakes and keepalives;
+                                    // TCP will retransmit it and UDP is lossy already.
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    return Err(DiagnosticError::ServiceUnavailable);
                                 }
                             }
                             false

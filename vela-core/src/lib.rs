@@ -493,6 +493,7 @@ impl TokioDatagramSocket {
         let shutdown = Arc::new(Notify::new());
         let closed = Arc::new(AtomicBool::new(false));
         let failure_family = Arc::new(StdMutex::new(None));
+        let failed_families = Arc::new(AtomicU64::new(0));
         let (sender, receiver) = mpsc::channel(4096);
         let readers = vec![
             spawn_datagram_reader(
@@ -502,6 +503,7 @@ impl TokioDatagramSocket {
                 Arc::clone(&shutdown),
                 Arc::clone(&closed),
                 Arc::clone(&failure_family),
+                Arc::clone(&failed_families),
             ),
             spawn_datagram_reader(
                 AddressFamily::Ipv6,
@@ -510,6 +512,7 @@ impl TokioDatagramSocket {
                 Arc::clone(&shutdown),
                 Arc::clone(&closed),
                 Arc::clone(&failure_family),
+                Arc::clone(&failed_families),
             ),
         ];
         Self {
@@ -532,6 +535,7 @@ fn spawn_datagram_reader(
     shutdown: Arc<Notify>,
     closed: Arc<AtomicBool>,
     failure_family: Arc<StdMutex<Option<AddressFamily>>>,
+    failed_families: Arc<AtomicU64>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut buffer = vec![0u8; 65535];
@@ -554,9 +558,23 @@ fn spawn_datagram_reader(
                             error.kind(),
                             format!("{family} UDP receive failed: {error}"),
                         );
-                        tokio::select! {
-                            _ = shutdown.notified() => {}
-                            _ = sender.send(Err(error)) => {}
+                        let bit = match family {
+                            AddressFamily::Ipv4 => 1,
+                            AddressFamily::Ipv6 => 2,
+                        };
+                        let failed = failed_families.fetch_or(bit, Ordering::AcqRel) | bit;
+                        if failed == 3 {
+                            tokio::select! {
+                                _ = shutdown.notified() => {}
+                                _ = sender.send(Err(error)) => {}
+                            }
+                        } else {
+                            warn!(
+                                debug_marker = "vela-udp",
+                                %family,
+                                %error,
+                                "UDP address family reader stopped; keeping the other family alive"
+                            );
                         }
                     }
                     return;
@@ -1272,6 +1290,9 @@ impl VelaNode {
                 "outbound IP packet rejected by core"
             ),
         }
+        if matches!(&result, Err(SendError::Io(_))) {
+            self.inner.schedule_reconnect(peer.clone()).await;
+        }
         if result.is_ok() && should_connect {
             self.inner
                 .emit(VelaEvent::PeerConnectionRequested(peer_id))
@@ -1375,7 +1396,6 @@ impl VelaNode {
                 peer_id,
             });
         }
-        self.inner.emit(VelaEvent::PeerConnecting(peer_id)).await;
         let candidates = peer.info().candidates;
         if candidates.is_empty() {
             debug!(
@@ -1385,6 +1405,7 @@ impl VelaNode {
             );
             return Err(ConnectError::NoCandidates);
         }
+        self.inner.emit_peer_connecting(&peer).await;
         debug!(
             debug_marker = "vela-session",
             peer_id = %peer_id,
@@ -1494,6 +1515,7 @@ impl VelaNode {
                     return Err(ConnectError::Superseded);
                 }
                 peer.record_failure("connection attempt timed out");
+                peer.connecting.store(false, Ordering::Release);
                 self.inner.emit(VelaEvent::PeerUnreachable(peer_id)).await;
                 debug!(
                     debug_marker = "vela-session",
@@ -1546,6 +1568,7 @@ impl VelaNode {
                     return Err(ConnectError::Superseded);
                 }
                 peer.record_failure("connection attempt timed out");
+                peer.connecting.store(false, Ordering::Release);
                 self.inner.emit(VelaEvent::PeerUnreachable(peer_id)).await;
                 return Err(ConnectError::Timeout);
             }
@@ -1819,13 +1842,16 @@ impl Inner {
                             // decryption. Different sessions still run in parallel.
                             let worker = header.session_id as usize % self.data_senders.len();
                             let sender = &self.data_senders[worker];
-                            tokio::select! {
-                                _ = self.shutdown.notified() => break,
-                                result = sender.send((packet, source)) => {
-                                    if result.is_err() {
-                                        break;
-                                    }
+                            match sender.try_send((packet, source)) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    // Data is intentionally lossy at this boundary. A
+                                    // congested UDP transport must not prevent the read
+                                    // loop from dispatching STUN, probes, handshakes or
+                                    // keepalives; reliable upper-layer protocols will
+                                    // retransmit dropped data packets.
                                 }
+                                Err(mpsc::error::TrySendError::Closed(_)) => break,
                             }
                             continue;
                         }
@@ -1987,12 +2013,27 @@ impl Inner {
     }
 
     async fn invalidate_session(&self, peer: &Arc<PeerState>, request_reconnect: bool) {
-        let session_id = peer
-            .active
-            .lock()
-            .await
-            .take()
-            .map(|session| session.session_id);
+        self.invalidate_session_if(peer, None, request_reconnect)
+            .await;
+    }
+
+    async fn invalidate_session_if(
+        &self,
+        peer: &Arc<PeerState>,
+        expected_session_id: Option<u64>,
+        request_reconnect: bool,
+    ) {
+        let session_id = {
+            let mut active = peer.active.lock().await;
+            if expected_session_id.is_some_and(|expected| {
+                active
+                    .as_ref()
+                    .is_none_or(|session| session.session_id != expected)
+            }) {
+                return;
+            }
+            active.take().map(|session| session.session_id)
+        };
         if let Some(session_id) = session_id.as_ref() {
             self.remove_session(peer, *session_id);
         }
@@ -2004,6 +2045,7 @@ impl Inner {
             reconnect.requested = true;
             reconnect.attempts = 0;
         }
+        peer.connecting.store(false, Ordering::Release);
         peer.notify.notify_waiters();
         if disconnected {
             self.emit(VelaEvent::PeerDisconnected(peer.info().node_id))
@@ -2155,7 +2197,7 @@ impl Inner {
             &payload,
         )
         .await?;
-        self.emit(VelaEvent::PeerConnecting(probe.sender)).await;
+        self.emit_peer_connecting(&peer).await;
         if self.identity.public().node_id < probe.sender {
             let mut attempt = peer.attempt.lock().await;
             let can_replace = attempt
@@ -2354,8 +2396,7 @@ impl Inner {
             session_id,
             "Noise handshake sent; awaiting response or retry"
         );
-        self.emit(VelaEvent::PeerConnecting(peer_info.node_id))
-            .await;
+        self.emit_peer_connecting(peer).await;
         Ok(())
     }
 
@@ -2724,7 +2765,7 @@ impl Inner {
             session.path = source;
             if path_changed {
                 session.path_changed_at = Some(unix_time());
-                peer.record_path(source, &peer.info().candidates);
+                peer.record_path(source, &peer_info.candidates);
             }
             session
                 .rx_bytes
@@ -2791,6 +2832,7 @@ impl Inner {
             .insert(session_id, Arc::clone(peer));
         peer.record_path(path, &expected_peer.candidates);
         peer.clear_failure();
+        peer.connecting.store(false, Ordering::Release);
         *peer.attempt.lock().await = None;
         let mut reconnect = peer.reconnect.lock().await;
         reconnect.requested = false;
@@ -2888,10 +2930,14 @@ impl Inner {
         let session_id = session.session_id;
         let wire_len = wire_packet.len();
         drop(active);
-        self.socket
-            .send_to(&wire_packet, path)
-            .await
-            .map_err(SendError::Io)?;
+        if let Err(error) = self.socket.send_to(&wire_packet, path).await {
+            // A socket error means this direct session cannot be trusted for
+            // subsequent packets. Invalidate only the session; the peer route
+            // remains owned by the membership snapshot.
+            self.invalidate_session_if(peer, Some(session_id), true)
+                .await;
+            return Err(SendError::Io(error));
+        }
         debug!(
             debug_marker = "vela-data",
             peer_id = %peer.info().node_id,
@@ -3069,8 +3115,27 @@ impl Inner {
     }
 
     async fn emit(&self, event: VelaEvent) {
-        let _ = self.event_tx.send(event).await;
+        if matches!(&event, VelaEvent::IpPacket { .. }) {
+            // TUN/runtime backpressure must not stop the UDP dispatcher from
+            // servicing control packets. Dropping here is preferable to
+            // stalling the transport; TCP will retransmit and UDP is already
+            // lossy by contract.
+            let _ = self.event_tx.try_send(event);
+        } else {
+            let _ = self.event_tx.send(event).await;
+        }
     }
+
+    async fn emit_peer_connecting(&self, peer: &Arc<PeerState>) {
+        if peer.active.lock().await.is_some() {
+            return;
+        }
+        if !peer.connecting.swap(true, Ordering::AcqRel) {
+            self.emit(VelaEvent::PeerConnecting(peer.info().node_id))
+                .await;
+        }
+    }
+
     fn observe(&self, sample: TrafficSample) {
         if let Some(observer) = &self.observer {
             observer.record(sample);
@@ -3181,6 +3246,9 @@ impl PeerHandle {
         let should_connect =
             peer.active.lock().await.is_none() && peer.attempt.lock().await.is_none();
         let result = self.node.inner.send_payload(&peer, payload.into()).await;
+        if matches!(&result, Err(SendError::Io(_))) {
+            self.node.inner.schedule_reconnect(peer.clone()).await;
+        }
         if result.is_ok() && should_connect {
             self.node
                 .inner
@@ -3308,6 +3376,7 @@ struct PeerState {
     last_failure: StdMutex<Option<PeerFailureStatus>>,
     path_history: StdMutex<Vec<PeerPathChange>>,
     connect: Mutex<()>,
+    connecting: AtomicBool,
     attempt: Mutex<Option<Attempt>>,
     active: Mutex<Option<ActiveSession>>,
     reconnect: Mutex<ReconnectState>,
@@ -3327,6 +3396,7 @@ impl PeerState {
             last_failure: StdMutex::new(None),
             path_history: StdMutex::new(Vec::new()),
             connect: Mutex::new(()),
+            connecting: AtomicBool::new(false),
             attempt: Mutex::new(None),
             active: Mutex::new(None),
             reconnect: Mutex::new(ReconnectState::default()),
@@ -4208,6 +4278,7 @@ mod tests {
                 checksum = (checksum & u32::from(u16::MAX)) + (checksum >> 16);
             }
         }
+
         packet[10..12].copy_from_slice(&(!(checksum as u16)).to_be_bytes());
         handle_a.send_ip(packet).await.unwrap();
         let event = timeout(Duration::from_secs(1), async {
@@ -4224,6 +4295,59 @@ mod tests {
         );
         node_a.shutdown().await;
         node_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn repeated_connection_notifications_are_coalesced_until_retry() {
+        let identity = Identity::generate();
+        let remote = Identity::generate();
+        let node = VelaNode::builder()
+            .identity(identity)
+            .datagram_provider(Arc::new(TokioDatagramProvider::new(vec![Candidate::Host(
+                "127.0.0.1:45111".parse().unwrap(),
+            )])))
+            .config(NodeConfig {
+                bind: BindOptions { port: 0 },
+                virtual_ipv4: Some(Ipv4Addr::new(10, 254, 0, 41)),
+                ..NodeConfig::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        node.register_peer(peer_info(
+            &remote,
+            1,
+            "127.0.0.1:45111".parse().unwrap(),
+            Ipv4Addr::new(10, 254, 0, 42),
+        ))
+        .await
+        .unwrap();
+        let peer = node
+            .inner
+            .peers
+            .lock()
+            .await
+            .get(&remote.public().node_id)
+            .cloned()
+            .unwrap();
+
+        node.inner.emit_peer_connecting(&peer).await;
+        node.inner.emit_peer_connecting(&peer).await;
+        assert!(
+            matches!(node.next_event().await, Some(VelaEvent::PeerConnecting(id)) if id == remote.public().node_id)
+        );
+        assert!(
+            timeout(Duration::from_millis(20), node.next_event())
+                .await
+                .is_err()
+        );
+
+        node.inner.invalidate_session(&peer, false).await;
+        node.inner.emit_peer_connecting(&peer).await;
+        assert!(
+            matches!(node.next_event().await, Some(VelaEvent::PeerConnecting(id)) if id == remote.public().node_id)
+        );
+        node.shutdown().await;
     }
 
     #[tokio::test]

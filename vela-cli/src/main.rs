@@ -1,5 +1,12 @@
 use clap::{ArgAction, Args, Parser, Subcommand};
-use std::{io::Read, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    io::Read,
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 use vela_coord::CoordServer;
 use vela_crypto::Identity;
 use vela_diagnostic::{LocalControlClient, PeerState, RuntimeProcess};
@@ -479,7 +486,7 @@ async fn run_peer_up(args: PeerUpArgs) -> Result<(), Box<dyn std::error::Error>>
         stop_process(process).await;
         return Err(error.into());
     }
-    let mut leases = Vec::new();
+    let mut leases = HashMap::new();
     if let Err(error) =
         apply_tun_snapshot(process.handle.node_id(), &routes, &mut leases, &snapshot).await
     {
@@ -507,10 +514,10 @@ async fn stop_process(process: RuntimeProcess) {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-async fn release_route_leases(leases: &mut Vec<vela_tun::RouteLease>) {
+async fn release_route_leases(leases: &mut HashMap<IpAddr, vela_tun::RouteLease>) {
     let pending = std::mem::take(leases);
     if tokio::time::timeout(SHUTDOWN_TIMEOUT, async move {
-        for lease in pending {
+        for lease in pending.into_values() {
             let _ = lease.release().await;
         }
     })
@@ -528,7 +535,7 @@ async fn release_route_leases(leases: &mut Vec<vela_tun::RouteLease>) {
 async fn apply_tun_snapshot(
     node_id: NodeId,
     routes: &vela_tun::RouteManager,
-    leases: &mut Vec<vela_tun::RouteLease>,
+    leases: &mut HashMap<IpAddr, vela_tun::RouteLease>,
     snapshot: &vela_proto::NetworkSnapshot,
 ) -> Result<(), Box<dyn std::error::Error>> {
     snapshot
@@ -546,7 +553,6 @@ async fn apply_tun_snapshot(
         peer_count = snapshot.peers.len(),
         "applying network snapshot to TUN"
     );
-    release_route_leases(leases).await;
     if let (Some(address), Some(cidr)) = (local.virtual_ipv4, snapshot.virtual_ipv4) {
         routes
             .add_local_address(address.into(), cidr.prefix_len)
@@ -557,7 +563,32 @@ async fn apply_tun_snapshot(
             .add_local_address(address.into(), cidr.prefix_len)
             .await?;
     }
-    *leases = vela_tun::install_snapshot_routes(routes, snapshot, node_id).await?;
+
+    // Host routes belong to the signed server membership. `online_peers` only
+    // describes the current control-plane presence and must not create route
+    // churn when a peer disconnects or reconnects.
+    let desired = vela_tun::snapshot_route_addresses(snapshot, node_id)?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let missing = desired
+        .iter()
+        .copied()
+        .filter(|address| !leases.contains_key(address))
+        .collect::<Vec<_>>();
+    for address in missing {
+        let lease = routes.claim_host_route(address).await?;
+        leases.insert(address, lease);
+    }
+    let stale = leases
+        .keys()
+        .copied()
+        .filter(|address| !desired.contains(address))
+        .collect::<Vec<_>>();
+    for address in stale {
+        if let Some(lease) = leases.remove(&address) {
+            let _ = lease.release().await;
+        }
+    }
     Ok(())
 }
 
@@ -566,7 +597,7 @@ async fn run_tun_peer(
     process: RuntimeProcess,
     tun: vela_tun::TunDevice,
     routes: vela_tun::RouteManager,
-    mut leases: Vec<vela_tun::RouteLease>,
+    mut leases: HashMap<IpAddr, vela_tun::RouteLease>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let vela_diagnostic::RuntimeProcess {
         handle,
@@ -602,7 +633,12 @@ async fn run_tun_peer(
                     packet_len,
                     "network snapshot expired; waiting for runtime reconnect"
                 ),
-                Err(error) => return Err(error.to_string()),
+                Err(error) => tracing::debug!(
+                    debug_marker = "vela-tun",
+                    packet_len,
+                    error = %error,
+                    "dropping TUN packet after a transient Vela send failure"
+                ),
             }
         }
         #[allow(unreachable_code)]

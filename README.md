@@ -159,14 +159,17 @@ socket remains usable but no host candidate is published for that family; STUN
 can still discover a server-reflexive candidate.
 
 On Linux, macOS, and Windows, `peer up` creates a layer-3 TUN interface, assigns
-the stable virtual address from the signed network snapshot, installs only the
-current peers' host routes, and bridges complete IP packets to the encrypted
-direct data plane. Linux needs access to `/dev/net/tun` and `CAP_NET_ADMIN`;
+the stable virtual address from the signed network snapshot, installs one host
+route for every remote peer record in that snapshot (including offline peers),
+and bridges complete IP packets to the encrypted direct data plane. A peer's
+online status affects connection attempts only; it never removes its route.
+Routes are updated incrementally and are removed only when the server snapshot
+no longer contains that peer or when the local peer process shuts down. Linux
+needs access to `/dev/net/tun` and `CAP_NET_ADMIN`;
 macOS needs permission to create and configure `utun` interfaces; Windows uses
 Wintun and requires `wintun.dll` matching the binary architecture beside the
 executable, plus Administrator privileges. The default interface name is
-`vela0` on Linux/Windows and `utun0` on macOS. Routes are reference-counted and
-removed when the process replaces the snapshot or exits.
+`vela0` on Linux/Windows and `utun0` on macOS. Routes are reference-counted.
 
 For an embedded node, create a `TokioDatagramProvider` or implement
 `DatagramProvider` in the host. The host provider is the intended place for

@@ -703,6 +703,31 @@ pub use platform::RouteManager;
 pub use platform::TunDevice;
 
 /// Installs one `/32` or `/128` host route for each remote member in a signed
+/// snapshot. `online_peers` is deliberately ignored: a route belongs to a
+/// server membership record, not to the peer's current connection status.
+pub fn snapshot_route_addresses(
+    snapshot: &vela_proto::NetworkSnapshot,
+    local: vela_proto::NodeId,
+) -> Result<Vec<IpAddr>, TunError> {
+    snapshot
+        .validate()
+        .map_err(|error| TunError::Snapshot(error.to_string()))?;
+    let mut addresses = Vec::new();
+    for peer in &snapshot.peers {
+        if peer.node_id == local {
+            continue;
+        }
+        if let Some(address) = peer.virtual_ipv4 {
+            addresses.push(address.into());
+        }
+        if let Some(address) = peer.virtual_ipv6 {
+            addresses.push(address.into());
+        }
+    }
+    Ok(addresses)
+}
+
+/// Installs one `/32` or `/128` host route for each remote member in a signed
 /// snapshot. The returned leases must be released when the snapshot is
 /// replaced or the node shuts down.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -711,20 +736,9 @@ pub async fn install_snapshot_routes(
     snapshot: &vela_proto::NetworkSnapshot,
     local: vela_proto::NodeId,
 ) -> Result<Vec<RouteLease>, TunError> {
-    snapshot
-        .validate()
-        .map_err(|error| TunError::Snapshot(error.to_string()))?;
     let mut leases = Vec::new();
-    for peer in &snapshot.peers {
-        if peer.node_id == local {
-            continue;
-        }
-        if let Some(address) = peer.virtual_ipv4 {
-            leases.push(manager.claim_host_route(address.into()).await?);
-        }
-        if let Some(address) = peer.virtual_ipv6 {
-            leases.push(manager.claim_host_route(address.into()).await?);
-        }
+    for address in snapshot_route_addresses(snapshot, local)? {
+        leases.push(manager.claim_host_route(address).await?);
     }
     Ok(leases)
 }
@@ -746,7 +760,12 @@ pub async fn run_bridge(node: vela_core::VelaNode, tun: TunDevice) -> Result<(),
                 Err(vela_core::SendError::QueueFull) => {
                     tracing::debug!("dropping packet because the peer send queue is full");
                 }
-                Err(error) => return Err(TunError::Core(error.to_string())),
+                Err(error) => {
+                    tracing::debug!(
+                        error = %error,
+                        "dropping TUN packet after a transient Vela send failure"
+                    );
+                }
             }
         }
     });
@@ -802,6 +821,56 @@ pub enum TunError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_routes_include_offline_members_until_membership_removal() {
+        let local_signing = [1; 32];
+        let remote_signing = [2; 32];
+        let local = vela_proto::NodeId::new(*blake3::hash(&local_signing).as_bytes());
+        let remote = vela_proto::NodeId::new(*blake3::hash(&remote_signing).as_bytes());
+        let snapshot = vela_proto::NetworkSnapshot {
+            network_id: [0; 16],
+            generation: 1,
+            virtual_ipv4: Some(vela_proto::Ipv4Cidr {
+                address: "10.254.0.0".parse().unwrap(),
+                prefix_len: 16,
+            }),
+            virtual_ipv6: None,
+            doh_servers: Vec::new(),
+            stun_servers: Vec::new(),
+            peers: vec![
+                vela_proto::PeerInfo {
+                    node_id: local,
+                    incarnation: 1,
+                    signing_public: local_signing,
+                    noise_public: [3; 32],
+                    candidates: Vec::new(),
+                    virtual_ipv4: Some("10.254.0.1".parse().unwrap()),
+                    virtual_ipv6: None,
+                    credential: Vec::new(),
+                    capabilities: Vec::new(),
+                },
+                vela_proto::PeerInfo {
+                    node_id: remote,
+                    incarnation: 1,
+                    signing_public: remote_signing,
+                    noise_public: [4; 32],
+                    candidates: Vec::new(),
+                    virtual_ipv4: Some("10.254.0.2".parse().unwrap()),
+                    virtual_ipv6: None,
+                    credential: Vec::new(),
+                    capabilities: Vec::new(),
+                },
+            ],
+            online_peers: Vec::new(),
+            expires_at: u64::MAX,
+            signature: Vec::new(),
+        };
+        assert_eq!(
+            snapshot_route_addresses(&snapshot, local).unwrap(),
+            vec!["10.254.0.2".parse::<IpAddr>().unwrap()]
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

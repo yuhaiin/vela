@@ -14,6 +14,9 @@ tokio.workspace = true
 vela-core = { path = "../vela-core" }
 vela-proto = { path = "../vela-proto" }
 
+[dev-dependencies]
+blake3.workspace = true
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 rtnetlink.workspace = true
