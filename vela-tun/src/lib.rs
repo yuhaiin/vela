@@ -151,6 +151,49 @@ mod platform {
             }
         }
 
+        fn try_recv(&self) -> Result<Option<Bytes>, TunError> {
+            let mut buffer = vec![0; self.mtu];
+            let result = unsafe {
+                libc::read(
+                    self.fd.get_ref().as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    return Ok(None);
+                }
+                return Err(TunError::Io(error));
+            }
+            let length = result as usize;
+            if length == 0 {
+                return Err(TunError::Closed);
+            }
+            buffer.truncate(length);
+            Ok(Some(Bytes::from(buffer)))
+        }
+
+        pub async fn recv_many(
+            &self,
+            packets: &mut Vec<Bytes>,
+            limit: usize,
+        ) -> Result<usize, TunError> {
+            packets.clear();
+            if limit == 0 {
+                return Ok(0);
+            }
+            packets.push(self.recv().await?);
+            while packets.len() < limit {
+                let Some(packet) = self.try_recv()? else {
+                    break;
+                };
+                packets.push(packet);
+            }
+            Ok(packets.len())
+        }
+
         pub async fn send(&self, packet: &[u8]) -> Result<(), TunError> {
             if packet.is_empty() || packet.len() > self.mtu {
                 return Err(TunError::PacketTooLarge);
@@ -456,6 +499,40 @@ mod platform {
             Ok(Bytes::from(buffer))
         }
 
+        pub async fn recv_many(
+            &self,
+            packets: &mut Vec<Bytes>,
+            limit: usize,
+        ) -> Result<usize, TunError> {
+            packets.clear();
+            if limit == 0 {
+                return Ok(0);
+            }
+            packets.push(self.recv().await?);
+            #[cfg(target_os = "macos")]
+            for _ in 1..limit {
+                let mut buffer = vec![0; self.mtu];
+                match self.device.try_recv(&mut buffer) {
+                    Ok(length) => {
+                        if length == 0 {
+                            return Err(TunError::Closed);
+                        }
+                        if length > buffer.len() {
+                            return Err(TunError::Io(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "TUN returned a packet larger than the configured MTU",
+                            )));
+                        }
+                        buffer.truncate(length);
+                        packets.push(Bytes::from(buffer));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(TunError::Io(error)),
+                }
+            }
+            Ok(packets.len())
+        }
+
         pub async fn send(&self, packet: &[u8]) -> Result<(), TunError> {
             if packet.is_empty() || packet.len() > self.mtu {
                 return Err(TunError::PacketTooLarge);
@@ -681,6 +758,13 @@ mod platform {
         pub async fn recv(&self) -> Result<Bytes, TunError> {
             Err(TunError::Unsupported)
         }
+        pub async fn recv_many(
+            &self,
+            _packets: &mut Vec<Bytes>,
+            _limit: usize,
+        ) -> Result<usize, TunError> {
+            Err(TunError::Unsupported)
+        }
         pub async fn send(&self, _packet: &[u8]) -> Result<(), TunError> {
             Err(TunError::Unsupported)
         }
@@ -750,21 +834,24 @@ pub async fn run_bridge(node: vela_core::VelaNode, tun: TunDevice) -> Result<(),
     let reader_tun = Arc::clone(&tun);
     let reader_node = node.clone();
     let mut tun_to_vela = tokio::spawn(async move {
+        let mut packets = Vec::with_capacity(64);
         loop {
-            let packet = reader_tun.recv().await?;
-            match reader_node.send_ip(packet).await {
-                Ok(()) => {}
-                Err(vela_core::SendError::Ip(error)) => {
-                    tracing::debug!(error = %error, "dropping invalid or unrouted packet from TUN");
-                }
-                Err(vela_core::SendError::QueueFull) => {
-                    tracing::debug!("dropping packet because the peer send queue is full");
-                }
-                Err(error) => {
-                    tracing::debug!(
-                        error = %error,
-                        "dropping TUN packet after a transient Vela send failure"
-                    );
+            reader_tun.recv_many(&mut packets, 64).await?;
+            for result in reader_node.send_ip_batch(&packets).await {
+                match result {
+                    Ok(()) => {}
+                    Err(vela_core::SendError::Ip(error)) => {
+                        tracing::debug!(error = %error, "dropping invalid or unrouted packet from TUN");
+                    }
+                    Err(vela_core::SendError::QueueFull) => {
+                        tracing::debug!("dropping packet because the peer send queue is full");
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            error = %error,
+                            "dropping TUN packet after a transient Vela send failure"
+                        );
+                    }
                 }
             }
         }

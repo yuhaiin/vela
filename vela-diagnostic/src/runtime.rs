@@ -129,6 +129,27 @@ impl RuntimeHandle {
         result
     }
 
+    pub async fn send_ip_batch(&self, packets: &[Bytes]) -> Vec<Result<(), SendError>> {
+        let results = self.node.send_ip_batch(packets).await;
+        for result in &results {
+            if matches!(result, Err(SendError::SnapshotExpired)) {
+                if !self.snapshot_expired_notified.swap(true, Ordering::AcqRel)
+                    && self
+                        .commands
+                        .try_send(RuntimeCommand::SnapshotExpired)
+                        .is_err()
+                {
+                    self.snapshot_expired_notified
+                        .store(false, Ordering::Release);
+                }
+            } else if result.is_ok() {
+                self.snapshot_expired_notified
+                    .store(false, Ordering::Release);
+            }
+        }
+        results
+    }
+
     pub fn stop(&self) {
         self.stop.notify_one();
     }

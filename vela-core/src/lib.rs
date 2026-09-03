@@ -11,6 +11,8 @@ use if_addrs::get_if_addrs;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::fd::AsRawFd;
 use std::{
     collections::{HashMap, VecDeque},
     fmt, io,
@@ -23,6 +25,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{
+    io::Interest,
     net::UdpSocket,
     sync::{Mutex, Notify, RwLock, mpsc, oneshot},
     task::JoinHandle,
@@ -76,6 +79,18 @@ impl fmt::Display for AddressFamily {
 pub trait DatagramSocket: Send + Sync {
     async fn send_to(&self, bytes: &[u8], target: SocketAddr) -> io::Result<usize>;
     async fn recv_from(&self, buffer: &mut [u8]) -> io::Result<(usize, SocketAddr)>;
+
+    /// Sends a group of datagrams. Platform implementations may use a
+    /// batched syscall; the default preserves compatibility for custom
+    /// providers.
+    async fn send_batch(&self, packets: &[(&[u8], SocketAddr)]) -> io::Result<usize> {
+        let mut sent = 0;
+        for &(packet, target) in packets {
+            self.send_to(packet, target).await?;
+            sent += 1;
+        }
+        Ok(sent)
+    }
 
     async fn recv_packet(&self) -> io::Result<(Bytes, SocketAddr)> {
         let mut buffer = vec![0u8; 65535];
@@ -565,6 +580,416 @@ impl TokioDatagramSocket {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn socket_addr_storage(address: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    unsafe {
+        match address {
+            SocketAddr::V4(address) => {
+                let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+                let sockaddr = &mut storage as *mut _ as *mut libc::sockaddr_in;
+                #[cfg(target_os = "macos")]
+                {
+                    (*sockaddr).sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+                }
+                (*sockaddr).sin_family = libc::AF_INET as libc::sa_family_t;
+                (*sockaddr).sin_port = address.port().to_be();
+                (*sockaddr).sin_addr = libc::in_addr {
+                    s_addr: u32::from_ne_bytes(address.ip().octets()),
+                };
+                (
+                    storage,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+            SocketAddr::V6(address) => {
+                let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+                let sockaddr = &mut storage as *mut _ as *mut libc::sockaddr_in6;
+                #[cfg(target_os = "macos")]
+                {
+                    (*sockaddr).sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+                }
+                (*sockaddr).sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                (*sockaddr).sin6_port = address.port().to_be();
+                (*sockaddr).sin6_flowinfo = address.flowinfo();
+                (*sockaddr).sin6_scope_id = address.scope_id();
+                (*sockaddr).sin6_addr = libc::in6_addr {
+                    s6_addr: address.ip().octets(),
+                };
+                (
+                    storage,
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn send_mmsg(socket: &UdpSocket, packets: &[(&[u8], SocketAddr)]) -> io::Result<usize> {
+    if packets.is_empty() {
+        return Ok(0);
+    }
+    let mut addresses = Vec::with_capacity(packets.len());
+    let mut address_lengths = Vec::with_capacity(packets.len());
+    let mut iovecs = Vec::with_capacity(packets.len());
+    let mut messages = Vec::with_capacity(packets.len());
+    for &(packet, target) in packets {
+        let (address, address_length) = socket_addr_storage(target);
+        addresses.push(address);
+        address_lengths.push(address_length);
+        iovecs.push(libc::iovec {
+            iov_base: packet.as_ptr().cast_mut().cast(),
+            iov_len: packet.len(),
+        });
+        messages.push(unsafe { std::mem::zeroed::<libc::mmsghdr>() });
+    }
+    for index in 0..packets.len() {
+        let message = &mut messages[index].msg_hdr;
+        message.msg_name = (&mut addresses[index] as *mut libc::sockaddr_storage).cast();
+        message.msg_namelen = address_lengths[index];
+        message.msg_iov = &mut iovecs[index];
+        message.msg_iovlen = 1;
+    }
+    let result = unsafe {
+        libc::sendmmsg(
+            socket.as_raw_fd(),
+            messages.as_mut_ptr(),
+            messages.len() as libc::c_uint,
+            libc::MSG_DONTWAIT,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(result as usize)
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct AppleMsgHdrX {
+    msg_name: *mut libc::c_void,
+    msg_namelen: libc::socklen_t,
+    msg_iov: *mut libc::iovec,
+    msg_iovlen: libc::c_int,
+    msg_control: *mut libc::c_void,
+    msg_controllen: libc::socklen_t,
+    msg_flags: libc::c_int,
+    msg_datalen: usize,
+}
+
+#[cfg(target_os = "macos")]
+type AppleMsgXFn = unsafe extern "C" fn(
+    libc::c_int,
+    *mut AppleMsgHdrX,
+    libc::c_uint,
+    libc::c_int,
+) -> libc::ssize_t;
+
+#[cfg(target_os = "macos")]
+fn apple_msg_x_symbol(name: &'static [u8]) -> Option<AppleMsgXFn> {
+    let address = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr().cast()) };
+    if address.is_null() {
+        return None;
+    }
+    // Apple exposes these as private symbols rather than public libc bindings.
+    Some(unsafe { std::mem::transmute(address) })
+}
+
+#[cfg(target_os = "macos")]
+fn apple_sendmsg_x() -> Option<AppleMsgXFn> {
+    static SYMBOL: std::sync::OnceLock<Option<AppleMsgXFn>> = std::sync::OnceLock::new();
+    *SYMBOL.get_or_init(|| apple_msg_x_symbol(b"sendmsg_x\0"))
+}
+
+#[cfg(target_os = "macos")]
+fn apple_recvmsg_x() -> Option<AppleMsgXFn> {
+    static SYMBOL: std::sync::OnceLock<Option<AppleMsgXFn>> = std::sync::OnceLock::new();
+    *SYMBOL.get_or_init(|| apple_msg_x_symbol(b"recvmsg_x\0"))
+}
+
+#[cfg(target_os = "macos")]
+fn send_msg_x(socket: &UdpSocket, packets: &[(&[u8], SocketAddr)]) -> io::Result<usize> {
+    const BATCH_SIZE: usize = 64;
+    let sendmsg_x = apple_sendmsg_x().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::Unsupported, "macOS sendmsg_x is unavailable")
+    })?;
+    let count = packets.len().min(BATCH_SIZE);
+    let mut addresses = Vec::with_capacity(count);
+    let mut address_lengths = Vec::with_capacity(count);
+    let mut iovecs = Vec::with_capacity(count);
+    let mut messages = Vec::with_capacity(count);
+    for &(packet, target) in &packets[..count] {
+        let (address, address_length) = socket_addr_storage(target);
+        addresses.push(address);
+        address_lengths.push(address_length);
+        iovecs.push(libc::iovec {
+            iov_base: packet.as_ptr().cast_mut().cast(),
+            iov_len: packet.len(),
+        });
+        messages.push(AppleMsgHdrX {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: std::ptr::null_mut(),
+            msg_iovlen: 0,
+            msg_control: std::ptr::null_mut(),
+            msg_controllen: 0,
+            msg_flags: 0,
+            msg_datalen: 0,
+        });
+    }
+    for index in 0..count {
+        messages[index].msg_name = (&mut addresses[index] as *mut libc::sockaddr_storage).cast();
+        messages[index].msg_namelen = address_lengths[index];
+        messages[index].msg_iov = &mut iovecs[index];
+        messages[index].msg_iovlen = 1;
+        messages[index].msg_datalen = packets[index].0.len();
+    }
+    let result = unsafe {
+        sendmsg_x(
+            socket.as_raw_fd(),
+            messages.as_mut_ptr(),
+            count as libc::c_uint,
+            0,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(result as usize)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct RecvMmsgBatch {
+    buffers: Vec<Vec<u8>>,
+    addresses: Vec<libc::sockaddr_storage>,
+    iovecs: Vec<libc::iovec>,
+    messages: Vec<libc::mmsghdr>,
+}
+
+// The raw pointers are rebuilt before each syscall and point only into the
+// batch's own heap allocations, whose addresses remain stable when the
+// containing Vec fields move between tasks.
+#[cfg(target_os = "linux")]
+unsafe impl Send for RecvMmsgBatch {}
+
+#[cfg(target_os = "linux")]
+impl RecvMmsgBatch {
+    fn new(size: usize) -> Self {
+        let buffers = (0..size).map(|_| vec![0u8; 65535]).collect();
+        let addresses = (0..size).map(|_| unsafe { std::mem::zeroed() }).collect();
+        let iovecs = (0..size)
+            .map(|_| libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            })
+            .collect();
+        let messages = (0..size).map(|_| unsafe { std::mem::zeroed() }).collect();
+        Self {
+            buffers,
+            addresses,
+            iovecs,
+            messages,
+        }
+    }
+
+    fn recv(&mut self, socket: &UdpSocket) -> io::Result<usize> {
+        for index in 0..self.messages.len() {
+            self.addresses[index] = unsafe { std::mem::zeroed() };
+            self.iovecs[index] = libc::iovec {
+                iov_base: self.buffers[index].as_mut_ptr().cast(),
+                iov_len: self.buffers[index].len(),
+            };
+            self.messages[index] = unsafe { std::mem::zeroed() };
+            let message = &mut self.messages[index].msg_hdr;
+            message.msg_name = (&mut self.addresses[index] as *mut libc::sockaddr_storage).cast();
+            message.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            message.msg_iov = &mut self.iovecs[index];
+            message.msg_iovlen = 1;
+        }
+        let result = unsafe {
+            libc::recvmmsg(
+                socket.as_raw_fd(),
+                self.messages.as_mut_ptr(),
+                self.messages.len() as libc::c_uint,
+                libc::MSG_DONTWAIT,
+                std::ptr::null_mut(),
+            )
+        };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(result as usize)
+        }
+    }
+
+    fn take(&mut self, count: usize) -> io::Result<Vec<(Vec<u8>, SocketAddr)>> {
+        let mut packets = Vec::with_capacity(count);
+        for index in 0..count {
+            let length = self.messages[index].msg_len as usize;
+            let source = socket_addr_from_storage(&self.addresses[index])?;
+            packets.push((self.buffers[index][..length].to_vec(), source));
+        }
+        Ok(packets)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn socket_addr_from_storage(storage: &libc::sockaddr_storage) -> io::Result<SocketAddr> {
+    let family = storage.ss_family as libc::c_int;
+    unsafe {
+        match family {
+            libc::AF_INET => {
+                let address = &*(storage as *const _ as *const libc::sockaddr_in);
+                Ok(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::from(u32::from_be(address.sin_addr.s_addr))),
+                    u16::from_be(address.sin_port),
+                ))
+            }
+            libc::AF_INET6 => {
+                let address = &*(storage as *const _ as *const libc::sockaddr_in6);
+                Ok(SocketAddr::V6(std::net::SocketAddrV6::new(
+                    Ipv6Addr::from(address.sin6_addr.s6_addr),
+                    u16::from_be(address.sin6_port),
+                    address.sin6_flowinfo,
+                    address.sin6_scope_id,
+                )))
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "UDP datagram has an unsupported address family",
+            )),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct RecvMsgXBatch {
+    buffers: Vec<Vec<u8>>,
+    addresses: Vec<libc::sockaddr_storage>,
+    iovecs: Vec<libc::iovec>,
+    messages: Vec<AppleMsgHdrX>,
+    fallback_buffer: Vec<u8>,
+}
+
+#[cfg(target_os = "macos")]
+unsafe impl Send for RecvMsgXBatch {}
+
+#[cfg(target_os = "macos")]
+impl RecvMsgXBatch {
+    fn new(size: usize) -> Self {
+        let buffers = (0..size).map(|_| vec![0u8; 65535]).collect();
+        let addresses = (0..size).map(|_| unsafe { std::mem::zeroed() }).collect();
+        let iovecs = (0..size)
+            .map(|_| libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            })
+            .collect();
+        let messages = (0..size)
+            .map(|_| AppleMsgHdrX {
+                msg_name: std::ptr::null_mut(),
+                msg_namelen: 0,
+                msg_iov: std::ptr::null_mut(),
+                msg_iovlen: 0,
+                msg_control: std::ptr::null_mut(),
+                msg_controllen: 0,
+                msg_flags: 0,
+                msg_datalen: 0,
+            })
+            .collect();
+        Self {
+            buffers,
+            addresses,
+            iovecs,
+            messages,
+            fallback_buffer: vec![0u8; 65535],
+        }
+    }
+
+    fn recv(&mut self, socket: &UdpSocket) -> io::Result<usize> {
+        let recvmsg_x = apple_recvmsg_x().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "macOS recvmsg_x is unavailable")
+        })?;
+        for index in 0..self.messages.len() {
+            self.addresses[index] = unsafe { std::mem::zeroed() };
+            self.iovecs[index] = libc::iovec {
+                iov_base: self.buffers[index].as_mut_ptr().cast(),
+                iov_len: self.buffers[index].len(),
+            };
+            self.messages[index] = AppleMsgHdrX {
+                msg_name: (&mut self.addresses[index] as *mut libc::sockaddr_storage).cast(),
+                msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
+                msg_iov: &mut self.iovecs[index],
+                msg_iovlen: 1,
+                msg_control: std::ptr::null_mut(),
+                msg_controllen: 0,
+                msg_flags: 0,
+                msg_datalen: self.buffers[index].len(),
+            };
+        }
+        let result = unsafe {
+            recvmsg_x(
+                socket.as_raw_fd(),
+                self.messages.as_mut_ptr(),
+                self.messages.len() as libc::c_uint,
+                0,
+            )
+        };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(result as usize)
+        }
+    }
+
+    fn take(&mut self, count: usize) -> io::Result<Vec<(Vec<u8>, SocketAddr)>> {
+        let mut packets = Vec::with_capacity(count);
+        for index in 0..count {
+            let length = self.messages[index].msg_datalen;
+            let source = socket_addr_from_storage(&self.addresses[index])?;
+            packets.push((self.buffers[index][..length].to_vec(), source));
+        }
+        Ok(packets)
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn recv_datagram_batch(
+    socket: &UdpSocket,
+    batch: &mut RecvMmsgBatch,
+) -> io::Result<Vec<(Vec<u8>, SocketAddr)>> {
+    let count = socket
+        .async_io(Interest::READABLE, || batch.recv(socket))
+        .await?;
+    batch.take(count)
+}
+
+#[cfg(target_os = "macos")]
+async fn recv_datagram_batch(
+    socket: &UdpSocket,
+    batch: &mut RecvMsgXBatch,
+) -> io::Result<Vec<(Vec<u8>, SocketAddr)>> {
+    if apple_recvmsg_x().is_none() {
+        let (length, source) = socket.recv_from(&mut batch.fallback_buffer).await?;
+        return Ok(vec![(batch.fallback_buffer[..length].to_vec(), source)]);
+    }
+    let count = socket
+        .async_io(Interest::READABLE, || batch.recv(socket))
+        .await?;
+    batch.take(count)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+async fn recv_datagram_batch(
+    socket: &UdpSocket,
+    buffer: &mut Vec<u8>,
+) -> io::Result<Vec<(Vec<u8>, SocketAddr)>> {
+    let (length, source) = socket.recv_from(buffer).await?;
+    Ok(vec![(buffer[..length].to_vec(), source)])
+}
+
 fn spawn_datagram_reader(
     family: AddressFamily,
     socket: Arc<UdpSocket>,
@@ -575,16 +1000,31 @@ fn spawn_datagram_reader(
     failed_families: Arc<AtomicU64>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut buffer = vec![0u8; 65535];
+        #[cfg(target_os = "linux")]
+        let mut receive_batch = RecvMmsgBatch::new(64);
+        #[cfg(target_os = "macos")]
+        let mut receive_batch = RecvMsgXBatch::new(64);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let mut receive_buffer = vec![0u8; 65535];
         loop {
             if closed.load(Ordering::Acquire) {
                 return;
             }
             let result = tokio::select! {
                 _ = shutdown.notified() => return,
-                result = socket.recv_from(&mut buffer) => result,
+                result = recv_datagram_batch(
+                    &socket,
+                    {
+                        #[cfg(target_os = "linux")]
+                        { &mut receive_batch }
+                        #[cfg(target_os = "macos")]
+                        { &mut receive_batch }
+                        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                        { &mut receive_buffer }
+                    },
+                ) => result,
             };
-            let (length, source) = match result {
+            let packets = match result {
                 Ok(value) => value,
                 Err(error) => {
                     if !closed.load(Ordering::Acquire) {
@@ -617,12 +1057,14 @@ fn spawn_datagram_reader(
                     return;
                 }
             };
-            let packet = Ok((buffer[..length].to_vec(), source));
-            tokio::select! {
-                _ = shutdown.notified() => return,
-                result = sender.send(packet) => {
-                    if result.is_err() {
-                        return;
+            for (packet, source) in packets {
+                let packet = Ok((packet, source));
+                tokio::select! {
+                    _ = shutdown.notified() => return,
+                    result = sender.send(packet) => {
+                        if result.is_err() {
+                            return;
+                        }
                     }
                 }
             }
@@ -643,6 +1085,73 @@ impl DatagramSocket for TokioDatagramSocket {
             SocketAddr::V4(_) => self.ipv4.send_to(bytes, target).await,
             SocketAddr::V6(_) => self.ipv6.send_to(bytes, target).await,
         }
+    }
+
+    async fn send_batch(&self, packets: &[(&[u8], SocketAddr)]) -> io::Result<usize> {
+        if packets.is_empty() {
+            return Ok(0);
+        }
+        if self.closed.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "UDP socket is shut down",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let family = AddressFamily::of(packets[0].1);
+            if packets
+                .iter()
+                .all(|(_, target)| AddressFamily::of(*target) == family)
+            {
+                let socket = match family {
+                    AddressFamily::Ipv4 => &self.ipv4,
+                    AddressFamily::Ipv6 => &self.ipv6,
+                };
+                let mut sent = 0;
+                while sent < packets.len() {
+                    let count = socket
+                        .async_io(Interest::WRITABLE, || send_mmsg(socket, &packets[sent..]))
+                        .await?;
+                    if count == 0 {
+                        break;
+                    }
+                    sent += count;
+                }
+                return Ok(sent);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let family = AddressFamily::of(packets[0].1);
+            if packets
+                .iter()
+                .all(|(_, target)| AddressFamily::of(*target) == family)
+                && apple_sendmsg_x().is_some()
+            {
+                let socket = match family {
+                    AddressFamily::Ipv4 => &self.ipv4,
+                    AddressFamily::Ipv6 => &self.ipv6,
+                };
+                let mut sent = 0;
+                while sent < packets.len() {
+                    let count = socket
+                        .async_io(Interest::WRITABLE, || send_msg_x(socket, &packets[sent..]))
+                        .await?;
+                    if count == 0 {
+                        break;
+                    }
+                    sent += count;
+                }
+                return Ok(sent);
+            }
+        }
+        let mut sent = 0;
+        for &(packet, target) in packets {
+            self.send_to(packet, target).await?;
+            sent += 1;
+        }
+        Ok(sent)
     }
     async fn recv_from(&self, buffer: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let (packet, source) = self.recv_packet().await?;
@@ -798,16 +1307,43 @@ pub struct NodeConfig {
 
 const DATA_WORKER_QUEUE_LIMIT: usize = 2048;
 const DATA_WORKER_BATCH_SIZE: usize = 64;
+const DATA_DECRYPT_QUEUE_LIMIT: usize = 512;
 const CORE_EVENT_QUEUE_LIMIT: usize = 4096;
 
 struct DataPacket {
     header: Header,
+    encrypted_len: usize,
     payload: BytesMut,
     source: SocketAddr,
 }
 
 type DataSender = mpsc::Sender<DataPacket>;
 type DataReceiver = mpsc::Receiver<DataPacket>;
+
+struct DataDecryptJob {
+    cipher: SessionCipher,
+    packet: DataPacket,
+    response: oneshot::Sender<Result<DataPacket, CryptoError>>,
+}
+
+type DataDecryptSender = mpsc::Sender<DataDecryptJob>;
+type DataDecryptReceiver = mpsc::Receiver<DataDecryptJob>;
+
+struct PendingDataDecrypt {
+    peer: Arc<PeerState>,
+    source: SocketAddr,
+    response: oneshot::Receiver<Result<DataPacket, CryptoError>>,
+}
+
+struct PreparedDataPacket {
+    peer: Arc<PeerState>,
+    peer_id: NodeId,
+    session_id: u64,
+    sequence: u64,
+    path: SocketAddr,
+    packet_len: usize,
+    wire_packet: Bytes,
+}
 
 fn data_worker_count() -> usize {
     std::thread::available_parallelism().map_or(4, |parallelism| parallelism.get().max(4))
@@ -901,6 +1437,13 @@ impl VelaNodeBuilder {
             data_senders.push(sender);
             data_receivers.push(receiver);
         }
+        let mut data_decrypt_senders = Vec::with_capacity(data_worker_count);
+        let mut data_decrypt_receivers = Vec::with_capacity(data_worker_count);
+        for _ in 0..data_worker_count {
+            let (sender, receiver) = mpsc::channel(DATA_DECRYPT_QUEUE_LIMIT);
+            data_decrypt_senders.push(sender);
+            data_decrypt_receivers.push(receiver);
+        }
         let local_addresses = self
             .config
             .virtual_ipv4
@@ -939,6 +1482,9 @@ impl VelaNodeBuilder {
             snapshot_update: Mutex::new(()),
             data_senders,
             data_receivers: StdMutex::new(Some(data_receivers)),
+            data_decrypt_senders,
+            data_decrypt_receivers: StdMutex::new(Some(data_decrypt_receivers)),
+            next_data_decrypt_worker: AtomicU64::new(0),
             sessions: StdMutex::new(HashMap::new()),
             receive: TransportReceiveCounters::default(),
         });
@@ -1022,7 +1568,20 @@ impl VelaNode {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
             .unwrap_or_default();
+        let data_decrypt_receivers = self
+            .inner
+            .data_decrypt_receivers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_default();
         let mut new_tasks = vec![reader, maintenance];
+        for receiver in data_decrypt_receivers {
+            let worker = Arc::clone(&self.inner);
+            new_tasks.push(tokio::spawn(async move {
+                worker.data_decrypt_loop(receiver).await;
+            }));
+        }
         for receiver in data_receivers {
             let worker = Arc::clone(&self.inner);
             new_tasks.push(tokio::spawn(async move {
@@ -1378,6 +1937,85 @@ impl VelaNode {
             });
         }
         result
+    }
+
+    /// Sends a batch of IP packets while keeping each peer's wire order.
+    /// Linux and macOS providers can turn the final UDP stage into one batched
+    /// syscall; custom providers transparently use the sequential fallback.
+    pub async fn send_ip_batch(&self, packets: &[Bytes]) -> Vec<Result<(), SendError>> {
+        let mut results = (0..packets.len())
+            .map(|_| None)
+            .collect::<Vec<Option<Result<(), SendError>>>>();
+        let mut prepared = Vec::with_capacity(packets.len());
+        let mut prepared_indices = Vec::with_capacity(packets.len());
+        let mut connect_peers = Vec::new();
+        for (index, payload) in packets.iter().enumerate() {
+            let packet = match IpPacket::parse(payload.clone()) {
+                Ok(packet) => packet,
+                Err(error) => {
+                    results[index] = Some(Err(SendError::Ip(error)));
+                    continue;
+                }
+            };
+            let peer_id = match self.inner.routes.read().await.validate_outbound(&packet) {
+                Ok(peer_id) => peer_id,
+                Err(error) => {
+                    results[index] = Some(Err(SendError::Ip(error)));
+                    continue;
+                }
+            };
+            let peer = match self.inner.peers.lock().await.get(&peer_id).cloned() {
+                Some(peer) => peer,
+                None => {
+                    results[index] = Some(Err(SendError::UnknownPeer));
+                    continue;
+                }
+            };
+            let should_connect =
+                peer.active.lock().await.is_none() && peer.attempt.lock().await.is_none();
+            match self.inner.prepare_ip_packet(&peer, packet).await {
+                Ok(Some(packet)) => {
+                    prepared_indices.push(index);
+                    prepared.push(packet);
+                    if should_connect {
+                        connect_peers.push((peer_id, peer));
+                    }
+                }
+                Ok(None) => {
+                    results[index] = Some(Ok(()));
+                    if should_connect {
+                        connect_peers.push((peer_id, peer));
+                    }
+                }
+                Err(error) => results[index] = Some(Err(error)),
+            }
+        }
+        let send_results = self.inner.send_prepared_batch(&prepared).await;
+        for ((index, packet), result) in prepared_indices
+            .into_iter()
+            .zip(prepared.iter())
+            .zip(send_results)
+        {
+            if matches!(&result, Err(SendError::Io(_))) {
+                self.inner.schedule_reconnect(packet.peer.clone()).await;
+            }
+            results[index] = Some(result);
+        }
+        connect_peers.sort_by_key(|(peer_id, _)| *peer_id);
+        connect_peers.dedup_by_key(|(peer_id, _)| *peer_id);
+        for (peer_id, _peer) in connect_peers {
+            self.inner
+                .emit(VelaEvent::PeerConnectionRequested(peer_id))
+                .await;
+            let node = self.clone();
+            tokio::spawn(async move {
+                let _ = node.connect(peer_id).await;
+            });
+        }
+        results
+            .into_iter()
+            .map(|result| result.expect("every IP batch slot has a result"))
+            .collect()
     }
 
     pub async fn register_with_coordination(
@@ -1912,6 +2550,9 @@ struct Inner {
     stopping: AtomicBool,
     started: AtomicBool,
     tasks: StdMutex<Vec<JoinHandle<()>>>,
+    data_decrypt_senders: Vec<DataDecryptSender>,
+    data_decrypt_receivers: StdMutex<Option<Vec<DataDecryptReceiver>>>,
+    next_data_decrypt_worker: AtomicU64,
 }
 
 struct EventReceivers {
@@ -2080,6 +2721,142 @@ impl Inner {
         }
     }
 
+    async fn data_decrypt_loop(self: Arc<Self>, mut receiver: DataDecryptReceiver) {
+        loop {
+            if self.stopping.load(Ordering::Acquire) {
+                break;
+            }
+            let Some(job) = (tokio::select! {
+                _ = self.shutdown.notified() => None,
+                job = receiver.recv() => job,
+            }) else {
+                break;
+            };
+            let DataDecryptJob {
+                cipher,
+                mut packet,
+                response,
+            } = job;
+            let result = cipher
+                .decrypt_in_place(
+                    packet.header.sequence,
+                    &encoded_header(&packet.header),
+                    &mut packet.payload,
+                )
+                .map(|()| packet);
+            let _ = response.send(result);
+        }
+    }
+
+    async fn data_decrypt_context(
+        &self,
+        packet: &DataPacket,
+    ) -> Result<Option<(Arc<PeerState>, SessionCipher)>, CoreError> {
+        let Some(peer) = self.session_peer(packet.header.session_id) else {
+            self.receive
+                .unassociated_data_datagrams
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        };
+        if self.config.server_public_key.is_some() && peer.membership_expired() {
+            self.invalidate_session(&peer, true).await;
+            return Err(CoreError::PeerCredentialExpired);
+        }
+        peer.receive
+            .worker_data_packets
+            .fetch_add(1, Ordering::Relaxed);
+        let cipher = {
+            let active = peer.active.lock().await;
+            let Some(session) = active
+                .as_ref()
+                .filter(|session| session.session_id == packet.header.session_id)
+            else {
+                self.remove_session(&peer, packet.header.session_id);
+                return Ok(None);
+            };
+            session.cipher.clone()
+        };
+        Ok(Some((peer, cipher)))
+    }
+
+    async fn queue_data_decrypt(
+        &self,
+        packet: DataPacket,
+    ) -> Result<Option<PendingDataDecrypt>, CoreError> {
+        let source = packet.source;
+        let Some((peer, cipher)) = self.data_decrypt_context(&packet).await? else {
+            return Ok(None);
+        };
+        let (response, response_receiver) = oneshot::channel();
+        let worker = self
+            .next_data_decrypt_worker
+            .fetch_add(1, Ordering::Relaxed) as usize
+            % self.data_decrypt_senders.len();
+        let send = self.data_decrypt_senders[worker].send(DataDecryptJob {
+            cipher,
+            packet,
+            response,
+        });
+        let result = tokio::select! {
+            biased;
+            _ = self.shutdown.notified() => {
+                return Err(CoreError::Io(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "Vela data decrypt worker stopped",
+                )));
+            }
+            result = send => result,
+        };
+        result.map_err(|_| {
+            CoreError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Vela data decrypt worker stopped",
+            ))
+        })?;
+        Ok(Some(PendingDataDecrypt {
+            peer,
+            source,
+            response: response_receiver,
+        }))
+    }
+
+    async fn decrypt_data_inline(&self, mut packet: DataPacket) -> Result<(), CoreError> {
+        let Some((peer, cipher)) = self.data_decrypt_context(&packet).await? else {
+            return Ok(());
+        };
+        if let Err(error) = cipher.decrypt_in_place(
+            packet.header.sequence,
+            &encoded_header(&packet.header),
+            &mut packet.payload,
+        ) {
+            peer.receive
+                .decrypt_failures
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(error.into());
+        }
+        self.commit_ip_data(peer, packet).await
+    }
+
+    async fn finish_data_decrypt(&self, pending: PendingDataDecrypt) -> Result<(), CoreError> {
+        let PendingDataDecrypt { peer, response, .. } = pending;
+        let packet = match response.await {
+            Ok(Ok(packet)) => packet,
+            Ok(Err(error)) => {
+                peer.receive
+                    .decrypt_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(error.into());
+            }
+            Err(_) => {
+                return Err(CoreError::Io(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "Vela data decrypt worker stopped",
+                )));
+            }
+        };
+        self.commit_ip_data(peer, packet).await
+    }
+
     async fn data_loop(self: Arc<Self>, mut receiver: DataReceiver) {
         let mut batch = Vec::with_capacity(DATA_WORKER_BATCH_SIZE);
         loop {
@@ -2094,6 +2871,31 @@ impl Inner {
             if received == 0 {
                 break;
             }
+            if received == 1 {
+                let packet = batch.pop().expect("recv_many returned one packet");
+                let source = packet.source;
+                self.receive
+                    .worker_data_datagrams
+                    .fetch_add(1, Ordering::Relaxed);
+                if unix_time() >= self.snapshot_expires_at.load(Ordering::Acquire) {
+                    debug!(
+                        debug_marker = "vela-udp",
+                        %source,
+                        "dropping Vela data packet because the snapshot expired"
+                    );
+                    continue;
+                }
+                if let Err(error) = self.decrypt_data_inline(packet).await {
+                    debug!(
+                        debug_marker = "vela-udp",
+                        error = %error,
+                        %source,
+                        "dropping invalid Vela data packet"
+                    );
+                }
+                continue;
+            }
+            let mut pending = Vec::with_capacity(received);
             for packet in batch.drain(..) {
                 let source = packet.source;
                 self.receive
@@ -2107,7 +2909,24 @@ impl Inner {
                     );
                     continue;
                 }
-                if let Err(error) = self.handle_ip_data(packet).await {
+                match self.queue_data_decrypt(packet).await {
+                    Ok(Some(job)) => pending.push(job),
+                    Ok(None) => {}
+                    Err(error) => {
+                        debug!(
+                            debug_marker = "vela-udp",
+                            error = %error,
+                            %source,
+                            "dropping invalid Vela data packet"
+                        );
+                    }
+                }
+            }
+            // Decrypt jobs may finish out of order. Commit them in receive
+            // order so replay-window and IP/TCP processing stay ordered.
+            for pending in pending {
+                let source = pending.source;
+                if let Err(error) = self.finish_data_decrypt(pending).await {
                     debug!(
                         debug_marker = "vela-udp",
                         error = %error,
@@ -2920,44 +3739,19 @@ impl Inner {
         Ok(())
     }
 
-    async fn handle_ip_data(&self, mut packet: DataPacket) -> Result<(), CoreError> {
+    async fn handle_ip_data(&self, packet: DataPacket) -> Result<(), CoreError> {
+        self.decrypt_data_inline(packet).await
+    }
+
+    async fn commit_ip_data(
+        &self,
+        peer: Arc<PeerState>,
+        packet: DataPacket,
+    ) -> Result<(), CoreError> {
         let source = packet.source;
-        let encrypted_len = packet.payload.len();
+        let encrypted_len = packet.encrypted_len;
         let wire_len = vela_proto::HEADER_LEN + encrypted_len;
-        let Some(peer) = self.session_peer(packet.header.session_id) else {
-            self.receive
-                .unassociated_data_datagrams
-                .fetch_add(1, Ordering::Relaxed);
-            return Ok(());
-        };
         let peer_id = peer.node_id();
-        if self.config.server_public_key.is_some() && peer.membership_expired() {
-            self.invalidate_session(&peer, true).await;
-            return Err(CoreError::PeerCredentialExpired);
-        }
-        peer.receive
-            .worker_data_packets
-            .fetch_add(1, Ordering::Relaxed);
-        let cipher = {
-            let active = peer.active.lock().await;
-            let Some(session) = active
-                .as_ref()
-                .filter(|session| session.session_id == packet.header.session_id)
-            else {
-                self.remove_session(&peer, packet.header.session_id);
-                return Ok(());
-            };
-            session.cipher.clone()
-        };
-        let aad = encoded_header(&packet.header);
-        if let Err(error) =
-            cipher.decrypt_in_place(packet.header.sequence, &aad, &mut packet.payload)
-        {
-            peer.receive
-                .decrypt_failures
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(error.into());
-        }
         let ip_packet = match IpPacket::parse(packet.payload.freeze()) {
             Ok(packet) => packet,
             Err(error) => {
@@ -3108,11 +3902,11 @@ impl Inner {
         self.send_ip_packet(peer, packet).await
     }
 
-    async fn send_ip_packet(
+    async fn prepare_ip_packet(
         &self,
         peer: &Arc<PeerState>,
         packet: IpPacket,
-    ) -> Result<(), SendError> {
+    ) -> Result<Option<PreparedDataPacket>, SendError> {
         let peer_id = peer.node_id();
         if unix_time() >= self.snapshot_expires_at.load(Ordering::Acquire) {
             self.invalidate_session(peer, true).await;
@@ -3125,82 +3919,163 @@ impl Inner {
             return Err(SendError::PacketTooLarge);
         }
         let packet_len = packet.as_bytes().len();
-        let mut active = peer.active.lock().await;
-        let Some(session) = active.as_mut() else {
-            let mut queue = peer.queue.lock().await;
-            if queue.len() >= self.config.per_peer_queue_limit {
-                return Err(SendError::QueueFull);
-            }
-            queue.push_back(packet.into_bytes());
-            debug!(
-                debug_marker = "vela-data",
-                peer_id = %peer_id,
-                queued_packets = queue.len(),
-                "queued IP packet until peer session is established"
-            );
-            return Ok(());
+        let (session_id, sequence, path, cipher) = {
+            let mut active = peer.active.lock().await;
+            let Some(session) = active.as_mut() else {
+                let mut queue = peer.queue.lock().await;
+                if queue.len() >= self.config.per_peer_queue_limit {
+                    return Err(SendError::QueueFull);
+                }
+                queue.push_back(packet.into_bytes());
+                debug!(
+                    debug_marker = "vela-data",
+                    peer_id = %peer_id,
+                    queued_packets = queue.len(),
+                    "queued IP packet until peer session is established"
+                );
+                return Ok(None);
+            };
+            (
+                session.session_id,
+                session.tx_sequence.fetch_add(1, Ordering::Relaxed),
+                session.path,
+                session.cipher.clone(),
+            )
         };
-        let sequence = session.tx_sequence.fetch_add(1, Ordering::Relaxed);
         let encrypted_len = packet_len + 16;
-        let header = Header::new(
-            PacketType::Data,
-            session.session_id,
-            sequence,
-            encrypted_len,
-        )
-        .map_err(SendError::Protocol)?;
+        let header = Header::new(PacketType::Data, session_id, sequence, encrypted_len)
+            .map_err(SendError::Protocol)?;
         let aad = encoded_header(&header);
         let mut wire_packet = BytesMut::with_capacity(vela_proto::HEADER_LEN + encrypted_len);
         header.encode(&mut wire_packet);
         wire_packet.extend_from_slice(packet.as_bytes());
-        let tag = session
-            .cipher
+        let tag = cipher
             .encrypt_in_place_detached(sequence, &aad, &mut wire_packet[vela_proto::HEADER_LEN..])
             .map_err(SendError::Crypto)?;
         wire_packet.extend_from_slice(&tag);
         let wire_packet = wire_packet.freeze();
-        let path = session.path;
-        let session_id = session.session_id;
-        let wire_len = wire_packet.len();
-        drop(active);
-        if let Err(error) = self.socket.send_to(&wire_packet, path).await {
-            // A socket error means this direct session cannot be trusted for
-            // subsequent packets. Invalidate only the session; the peer route
-            // remains owned by the membership snapshot.
-            self.invalidate_session_if(peer, Some(session_id), true)
-                .await;
-            return Err(SendError::Io(error));
-        }
-        debug!(
-            debug_marker = "vela-data",
-            peer_id = %peer_id,
-            path = %path,
+        Ok(Some(PreparedDataPacket {
+            peer: Arc::clone(peer),
+            peer_id,
             session_id,
             sequence,
+            path,
             packet_len,
-            wire_len,
-            "sent encrypted IP packet"
-        );
-        if let Some(session) = peer
+            wire_packet,
+        }))
+    }
+
+    async fn record_sent_batch(&self, packets: &[PreparedDataPacket]) {
+        let Some(first) = packets.first() else { return };
+        if let Some(session) = first
+            .peer
             .active
             .lock()
             .await
             .as_ref()
-            .filter(|session| session.session_id == session_id)
+            .filter(|session| session.session_id == first.session_id)
         {
-            session
-                .tx_bytes
-                .fetch_add(packet_len as u64, Ordering::Relaxed);
+            for packet in packets {
+                session
+                    .tx_bytes
+                    .fetch_add(packet.packet_len as u64, Ordering::Relaxed);
+            }
         }
-        self.observe(TrafficSample {
-            peer: Some(peer_id),
-            direction: TrafficDirection::Sent,
-            path,
-            payload_bytes: packet_len,
-            encrypted_bytes: encrypted_len,
-            wire_bytes: wire_len,
-        });
+        for packet in packets {
+            let wire_len = packet.wire_packet.len();
+            debug!(
+                debug_marker = "vela-data",
+                peer_id = %packet.peer_id,
+                path = %packet.path,
+                session_id = packet.session_id,
+                sequence = packet.sequence,
+                packet_len = packet.packet_len,
+                wire_len,
+                "sent encrypted IP packet"
+            );
+            self.observe(TrafficSample {
+                peer: Some(packet.peer_id),
+                direction: TrafficDirection::Sent,
+                path: packet.path,
+                payload_bytes: packet.packet_len,
+                encrypted_bytes: packet.wire_packet.len() - vela_proto::HEADER_LEN,
+                wire_bytes: wire_len,
+            });
+        }
+    }
+
+    async fn send_ip_packet(
+        &self,
+        peer: &Arc<PeerState>,
+        packet: IpPacket,
+    ) -> Result<(), SendError> {
+        let Some(packet) = self.prepare_ip_packet(peer, packet).await? else {
+            return Ok(());
+        };
+        if let Err(error) = self.socket.send_to(&packet.wire_packet, packet.path).await {
+            // A socket error means this direct session cannot be trusted for
+            // subsequent packets. Invalidate only the session; the peer route
+            // remains owned by the membership snapshot.
+            self.invalidate_session_if(&packet.peer, Some(packet.session_id), true)
+                .await;
+            return Err(SendError::Io(error));
+        }
+        self.record_sent_batch(std::slice::from_ref(&packet)).await;
         Ok(())
+    }
+
+    async fn send_prepared_batch(
+        &self,
+        prepared: &[PreparedDataPacket],
+    ) -> Vec<Result<(), SendError>> {
+        let mut results = Vec::with_capacity(prepared.len());
+        let mut start = 0;
+        while start < prepared.len() {
+            let first = &prepared[start];
+            let mut end = start + 1;
+            while end < prepared.len()
+                && prepared[end].peer_id == first.peer_id
+                && prepared[end].session_id == first.session_id
+                && prepared[end].path == first.path
+            {
+                end += 1;
+            }
+            let group = &prepared[start..end];
+            let packets = group
+                .iter()
+                .map(|packet| (packet.wire_packet.as_ref(), packet.path))
+                .collect::<Vec<_>>();
+            match self.socket.send_batch(&packets).await {
+                Ok(sent) if sent == group.len() => {
+                    self.record_sent_batch(group).await;
+                    results.extend((0..group.len()).map(|_| Ok(())));
+                }
+                Ok(sent) => {
+                    let sent = sent.min(group.len());
+                    self.record_sent_batch(&group[..sent]).await;
+                    results.extend((0..sent).map(|_| Ok(())));
+                    self.invalidate_session_if(&first.peer, Some(first.session_id), true)
+                        .await;
+                    for _ in sent..group.len() {
+                        results.push(Err(SendError::Io(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "batched UDP send completed only partially",
+                        ))));
+                    }
+                }
+                Err(error) => {
+                    let kind = error.kind();
+                    let message = error.to_string();
+                    self.invalidate_session_if(&first.peer, Some(first.session_id), true)
+                        .await;
+                    for _ in group {
+                        results.push(Err(SendError::Io(io::Error::new(kind, message.clone()))));
+                    }
+                }
+            }
+            start = end;
+        }
+        results
     }
 
     async fn send_packet(
@@ -4198,6 +5073,7 @@ fn decode_data_packet(
     let payload = input.split_off(vela_proto::HEADER_LEN);
     Ok(DataPacket {
         header,
+        encrypted_len: payload.len(),
         payload,
         source,
     })
@@ -4707,24 +5583,11 @@ mod tests {
         assert_eq!(diagnostic_after_snapshot.peer, b_id);
         assert_eq!(diagnostic_after_snapshot.path, address_b);
 
-        let mut packet = vec![0u8; 20 + 12];
-        packet[0] = 0x45;
-        let packet_len = packet.len() as u16;
-        packet[2..4].copy_from_slice(&packet_len.to_be_bytes());
-        packet[8] = 64;
-        packet[9] = 17;
-        packet[12..16].copy_from_slice(&[10, 254, 0, 1]);
-        packet[16..20].copy_from_slice(&[10, 254, 0, 2]);
-        packet[20..].copy_from_slice(b"hello from A");
-        let mut checksum = 0u32;
-        for chunk in packet[..20].chunks(2) {
-            checksum = checksum.wrapping_add(u32::from(u16::from_be_bytes([chunk[0], chunk[1]])));
-            while checksum > u32::from(u16::MAX) {
-                checksum = (checksum & u32::from(u16::MAX)) + (checksum >> 16);
-            }
-        }
-
-        packet[10..12].copy_from_slice(&(!(checksum as u16)).to_be_bytes());
+        let packet = ipv4_test_packet_with_payload(
+            Ipv4Addr::new(10, 254, 0, 1),
+            Ipv4Addr::new(10, 254, 0, 2),
+            b"hello from A",
+        );
         handle_a.send_ip(packet).await.unwrap();
         let event = timeout(Duration::from_secs(1), async {
             loop {
@@ -4738,6 +5601,36 @@ mod tests {
         assert!(
             matches!(event, VelaEvent::IpPacket { peer, ref packet } if peer == a_id && packet.destination() == IpAddr::V4(Ipv4Addr::new(10, 254, 0, 2)))
         );
+
+        let packets = (0u8..128)
+            .map(|sequence| {
+                Bytes::from(ipv4_test_packet_with_payload(
+                    Ipv4Addr::new(10, 254, 0, 1),
+                    Ipv4Addr::new(10, 254, 0, 2),
+                    &[sequence],
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            node_a
+                .send_ip_batch(&packets)
+                .await
+                .into_iter()
+                .all(|result| result.is_ok())
+        );
+        let mut received = Vec::with_capacity(128);
+        timeout(Duration::from_secs(2), async {
+            while received.len() < 128 {
+                if let Some(VelaEvent::IpPacket { peer, packet }) = node_b.next_event().await {
+                    if peer == a_id {
+                        received.push(packet.as_bytes()[20]);
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(received, (0u8..128).collect::<Vec<_>>());
         node_a.shutdown().await;
         node_b.shutdown().await;
     }
@@ -5175,7 +6068,15 @@ mod tests {
     }
 
     fn ipv4_test_packet(source: Ipv4Addr, destination: Ipv4Addr) -> Vec<u8> {
-        let mut packet = vec![0; 20];
+        ipv4_test_packet_with_payload(source, destination, &[])
+    }
+
+    fn ipv4_test_packet_with_payload(
+        source: Ipv4Addr,
+        destination: Ipv4Addr,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut packet = vec![0; 20 + payload.len()];
         packet[0] = 0x45;
         let length = packet.len() as u16;
         packet[2..4].copy_from_slice(&length.to_be_bytes());
@@ -5183,6 +6084,7 @@ mod tests {
         packet[9] = 17;
         packet[12..16].copy_from_slice(&source.octets());
         packet[16..20].copy_from_slice(&destination.octets());
+        packet[20..].copy_from_slice(payload);
         let mut checksum = 0u32;
         for chunk in packet[..20].chunks_exact(2) {
             checksum = checksum.wrapping_add(u32::from(u16::from_be_bytes([chunk[0], chunk[1]])));

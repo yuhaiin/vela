@@ -25,6 +25,9 @@ vela-ip = { path = "../vela-ip" }
 vela-proto = { path = "../vela-proto" }
 vela-stun = { path = "../vela-stun" }
 
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 base64.workspace = true
 clap.workspace = true

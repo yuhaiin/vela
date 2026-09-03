@@ -734,37 +734,46 @@ async fn run_tun_peer_once(
     let tun_reader = Arc::clone(&tun);
     let reader_handle = handle.clone();
     let mut tun_to_vela = tokio::spawn(async move {
+        let mut packets = Vec::with_capacity(64);
         loop {
-            let packet = tun_reader.recv().await.map_err(|error| error.to_string())?;
-            let packet_len = packet.len();
-            match reader_handle.send_ip(packet).await {
-                Ok(()) => tracing::debug!(
-                    debug_marker = "vela-tun",
-                    packet_len,
-                    "handed TUN packet to Vela core"
-                ),
-                Err(vela_core::SendError::Ip(error)) => tracing::debug!(
-                    debug_marker = "vela-tun",
-                    packet_len,
-                    error = %error,
-                    "dropping invalid or unrouted packet from TUN"
-                ),
-                Err(vela_core::SendError::QueueFull) => tracing::debug!(
-                    debug_marker = "vela-tun",
-                    packet_len,
-                    "dropping packet because the peer send queue is full"
-                ),
-                Err(vela_core::SendError::SnapshotExpired) => tracing::warn!(
-                    debug_marker = "vela-control",
-                    packet_len,
-                    "network snapshot expired; waiting for runtime reconnect"
-                ),
-                Err(error) => tracing::debug!(
-                    debug_marker = "vela-tun",
-                    packet_len,
-                    error = %error,
-                    "dropping TUN packet after a transient Vela send failure"
-                ),
+            tun_reader
+                .recv_many(&mut packets, 64)
+                .await
+                .map_err(|error| error.to_string())?;
+            for (packet, result) in packets
+                .iter()
+                .zip(reader_handle.send_ip_batch(&packets).await)
+            {
+                let packet_len = packet.len();
+                match result {
+                    Ok(()) => tracing::debug!(
+                        debug_marker = "vela-tun",
+                        packet_len,
+                        "handed TUN packet to Vela core"
+                    ),
+                    Err(vela_core::SendError::Ip(error)) => tracing::debug!(
+                        debug_marker = "vela-tun",
+                        packet_len,
+                        error = %error,
+                        "dropping invalid or unrouted packet from TUN"
+                    ),
+                    Err(vela_core::SendError::QueueFull) => tracing::debug!(
+                        debug_marker = "vela-tun",
+                        packet_len,
+                        "dropping packet because the peer send queue is full"
+                    ),
+                    Err(vela_core::SendError::SnapshotExpired) => tracing::warn!(
+                        debug_marker = "vela-control",
+                        packet_len,
+                        "network snapshot expired; waiting for runtime reconnect"
+                    ),
+                    Err(error) => tracing::debug!(
+                        debug_marker = "vela-tun",
+                        packet_len,
+                        error = %error,
+                        "dropping TUN packet after a transient Vela send failure"
+                    ),
+                }
             }
         }
         #[allow(unreachable_code)]
