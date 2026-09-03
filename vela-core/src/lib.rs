@@ -624,6 +624,12 @@ fn socket_addr_storage(address: SocketAddr) -> (libc::sockaddr_storage, libc::so
     }
 }
 
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+const MMSG_FLAGS: libc::c_uint = libc::MSG_DONTWAIT as libc::c_uint;
+
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+const MMSG_FLAGS: libc::c_int = libc::MSG_DONTWAIT;
+
 #[cfg(target_os = "linux")]
 fn send_mmsg(socket: &UdpSocket, packets: &[(&[u8], SocketAddr)]) -> io::Result<usize> {
     if packets.is_empty() {
@@ -655,7 +661,7 @@ fn send_mmsg(socket: &UdpSocket, packets: &[(&[u8], SocketAddr)]) -> io::Result<
             socket.as_raw_fd(),
             messages.as_mut_ptr(),
             messages.len() as libc::c_uint,
-            libc::MSG_DONTWAIT,
+            MMSG_FLAGS,
         )
     };
     if result < 0 {
@@ -813,7 +819,7 @@ impl RecvMmsgBatch {
                 socket.as_raw_fd(),
                 self.messages.as_mut_ptr(),
                 self.messages.len() as libc::c_uint,
-                libc::MSG_DONTWAIT,
+                MMSG_FLAGS,
                 std::ptr::null_mut(),
             )
         };
