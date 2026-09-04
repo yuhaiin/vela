@@ -30,7 +30,7 @@ use std::{
 use thiserror::Error;
 use tokio::{
     net::TcpListener,
-    sync::{Mutex as AsyncMutex, Notify, mpsc},
+    sync::{Mutex as AsyncMutex, Notify, mpsc, watch},
 };
 use tracing::debug;
 use vela_crypto::{CryptoError, MembershipCredential, ServerSigner};
@@ -46,6 +46,10 @@ const VIRTUAL_IPV4_PREFIX_LEN: u8 = 16;
 const VIRTUAL_IPV4_USABLE_HOSTS: u32 = (1 << 16) - 2;
 const CONTROL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const CONTROL_HEARTBEAT_TIMEOUT_SECONDS: u64 = 45;
+// Coalesce bursts while still making progress when membership keeps
+// changing: the broadcaster emits at most once per interval, rather than
+// waiting for a permanently quiet period.
+const SNAPSHOT_BROADCAST_INTERVAL: Duration = Duration::from_millis(850);
 
 #[derive(Clone)]
 pub struct CoordServer {
@@ -56,10 +60,25 @@ struct ServerInner {
     pub(crate) tenant: String,
     pub(crate) signer: ServerSigner,
     pub(crate) database: Mutex<Connection>,
-    pub(crate) online: AsyncMutex<HashMap<NodeId, HashMap<u64, mpsc::Sender<ControlMessage>>>>,
+    pub(crate) online: AsyncMutex<HashMap<NodeId, HashMap<u64, ClientOutbound>>>,
     pub(crate) snapshot_generation: std::sync::atomic::AtomicU64,
+    snapshot_broadcast: AsyncMutex<SnapshotBroadcastState>,
     pub(crate) network_config: Mutex<ServerNetworkConfig>,
     pub(crate) admin: admin::AdminAuth,
+}
+
+#[derive(Clone)]
+struct ClientOutbound {
+    // Request responses and connection signals are ordered and reliable.
+    control: mpsc::Sender<ControlMessage>,
+    // Snapshots are state, so only the newest value needs to be retained.
+    snapshot: watch::Sender<Option<Arc<NetworkSnapshot>>>,
+}
+
+#[derive(Default)]
+struct SnapshotBroadcastState {
+    pending: bool,
+    running: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -236,6 +255,7 @@ impl CoordServer {
                 database: Mutex::new(connection),
                 online: AsyncMutex::new(HashMap::new()),
                 snapshot_generation: std::sync::atomic::AtomicU64::new(snapshot_generation),
+                snapshot_broadcast: AsyncMutex::new(SnapshotBroadcastState::default()),
                 network_config: Mutex::new(network_config),
                 admin,
             }),
@@ -335,14 +355,39 @@ async fn handle_socket(state: Arc<ServerInner>, socket: WebSocket) {
     let connection_id: u64 = rand::random();
     let (mut writer, mut reader) = socket.split();
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<ControlMessage>(64);
+    let (snapshot_tx, mut snapshot_rx) = watch::channel::<Option<Arc<NetworkSnapshot>>>(None);
     let writer_task = tokio::spawn(async move {
-        while let Some(message) = outbound_rx.recv().await {
-            let text = match serde_json::to_string(&message) {
-                Ok(text) => text,
-                Err(_) => break,
-            };
-            if writer.send(Message::Text(text.into())).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                biased;
+                message = outbound_rx.recv() => {
+                    let Some(message) = message else { break };
+                    let text = match serde_json::to_string(&message) {
+                        Ok(text) => text,
+                        Err(_) => break,
+                    };
+                    if writer.send(Message::Text(text.into())).await.is_err() {
+                        break;
+                    }
+                }
+                changed = snapshot_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let Some(snapshot) = snapshot_rx.borrow_and_update().clone() else {
+                        continue;
+                    };
+                    let message = ControlMessage::Snapshot {
+                        snapshot: snapshot.as_ref().clone(),
+                    };
+                    let text = match serde_json::to_string(&message) {
+                        Ok(text) => text,
+                        Err(_) => break,
+                    };
+                    if writer.send(Message::Text(text.into())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -400,7 +445,16 @@ async fn handle_socket(state: Arc<ServerInner>, socket: WebSocket) {
         if matches!(&request, ControlMessage::Pong { .. }) {
             last_pong_at.store(unix_time(), Ordering::Release);
         }
-        match handle_message(&state, &outbound_tx, connection_id, registered, request).await {
+        match handle_message(
+            &state,
+            &outbound_tx,
+            &snapshot_tx,
+            connection_id,
+            registered,
+            request,
+        )
+        .await
+        {
             Ok(next_registered) => registered = next_registered,
             Err(error) => {
                 let _ = outbound_tx.send(error.as_control()).await;
@@ -433,6 +487,7 @@ async fn handle_socket(state: Arc<ServerInner>, socket: WebSocket) {
 async fn handle_message(
     state: &Arc<ServerInner>,
     outbound: &mpsc::Sender<ControlMessage>,
+    snapshot_outbound: &watch::Sender<Option<Arc<NetworkSnapshot>>>,
     connection_id: u64,
     registered: Option<NodeId>,
     request: ControlMessage,
@@ -520,18 +575,17 @@ async fn handle_message(
             }
             touch_peer(state, node_id)?;
             bump_snapshot(state)?;
-            let (existing_senders, was_online) = {
+            let was_online = {
                 let mut online = state.online.lock().await;
                 let was_online = online.contains_key(&node_id);
-                let existing_senders = online
-                    .values()
-                    .flat_map(|sessions| sessions.values().cloned())
-                    .collect::<Vec<_>>();
-                online
-                    .entry(node_id)
-                    .or_default()
-                    .insert(connection_id, outbound.clone());
-                (existing_senders, was_online)
+                online.entry(node_id).or_default().insert(
+                    connection_id,
+                    ClientOutbound {
+                        control: outbound.clone(),
+                        snapshot: snapshot_outbound.clone(),
+                    },
+                );
+                was_online
             };
             let peers = load_peers(state)?
                 .into_iter()
@@ -548,13 +602,7 @@ async fn handle_message(
                 .await
                 .map_err(|_| CoordError::ConnectionClosed)?;
             if !was_online || peer_changed {
-                for sender in existing_senders {
-                    let _ = sender
-                        .send(ControlMessage::Snapshot {
-                            snapshot: snapshot.clone(),
-                        })
-                        .await;
-                }
+                broadcast_snapshot(state).await?;
             }
             debug!(node = %node_id, "peer registered");
             Ok(Some(node_id))
@@ -605,6 +653,7 @@ async fn handle_message(
                 let from = public_peer(&requester_info)?;
                 for target_sender in target_senders {
                     let _ = target_sender
+                        .control
                         .send(ControlMessage::ConnectSignal {
                             from: from.clone(),
                             to: node_id,
@@ -889,7 +938,10 @@ async fn disconnect_peer(state: &Arc<ServerInner>, node_id: NodeId) {
         .into_values()
         .collect::<Vec<_>>();
     for sender in senders {
-        let _ = sender.send(ControlMessage::Revoke { node_id }).await;
+        let _ = sender
+            .control
+            .send(ControlMessage::Revoke { node_id })
+            .await;
     }
 }
 
@@ -1172,6 +1224,70 @@ fn bump_snapshot(state: &Arc<ServerInner>) -> Result<(), CoordError> {
 }
 
 async fn broadcast_snapshot(state: &Arc<ServerInner>) -> Result<(), CoordError> {
+    // Schedule one latest-only broadcast. The caller never waits for a slow
+    // WebSocket writer, and a continuously changing membership still gets a
+    // broadcast on every interval instead of waiting for a quiet period.
+    let should_start = {
+        let mut broadcast = state.snapshot_broadcast.lock().await;
+        broadcast.pending = true;
+        if broadcast.running {
+            false
+        } else {
+            broadcast.running = true;
+            true
+        }
+    };
+    if should_start {
+        let state = Arc::clone(state);
+        tokio::spawn(async move {
+            snapshot_broadcast_loop(state).await;
+        });
+    }
+    Ok(())
+}
+
+async fn snapshot_broadcast_loop(state: Arc<ServerInner>) {
+    loop {
+        tokio::time::sleep(SNAPSHOT_BROADCAST_INTERVAL).await;
+        let should_broadcast = {
+            let mut broadcast = state.snapshot_broadcast.lock().await;
+            if !broadcast.pending {
+                broadcast.running = false;
+                false
+            } else {
+                broadcast.pending = false;
+                true
+            }
+        };
+        if !should_broadcast {
+            return;
+        }
+
+        if let Err(error) = broadcast_snapshot_now(&state).await {
+            debug!(
+                debug_marker = "vela-control",
+                error = %error,
+                "snapshot broadcast failed; retaining pending broadcast"
+            );
+            state.snapshot_broadcast.lock().await.pending = true;
+        }
+
+        let should_continue = {
+            let mut broadcast = state.snapshot_broadcast.lock().await;
+            if broadcast.pending {
+                true
+            } else {
+                broadcast.running = false;
+                false
+            }
+        };
+        if !should_continue {
+            return;
+        }
+    }
+}
+
+async fn broadcast_snapshot_now(state: &Arc<ServerInner>) -> Result<(), CoordError> {
     let (senders, online_peers) = {
         let online = state.online.lock().await;
         (
@@ -1182,14 +1298,9 @@ async fn broadcast_snapshot(state: &Arc<ServerInner>) -> Result<(), CoordError> 
             online.keys().copied().collect::<Vec<_>>(),
         )
     };
-    let snapshot = network_snapshot(state, online_peers)?;
+    let snapshot = Arc::new(network_snapshot(state, online_peers)?);
     for sender in senders {
-        sender
-            .send(ControlMessage::Snapshot {
-                snapshot: snapshot.clone(),
-            })
-            .await
-            .map_err(|_| CoordError::ConnectionClosed)?;
+        sender.snapshot.send_replace(Some(Arc::clone(&snapshot)));
     }
     Ok(())
 }
@@ -1385,6 +1496,59 @@ mod tests {
     };
     use std::net::SocketAddr;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn snapshot_broadcasts_coalesce_to_the_latest_generation() {
+        let base = std::env::temp_dir().join(format!(
+            "vela-coord-snapshot-broadcast-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = base.with_extension("db");
+        let signer_path = base.with_extension("key");
+        let server = CoordServer::open(&db, &signer_path, "test-tenant").unwrap();
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        control_tx
+            .try_send(ControlMessage::Ping { nonce: 1 })
+            .unwrap();
+        let (snapshot_tx, mut snapshot_rx) = watch::channel(None);
+        server.inner.online.lock().await.insert(
+            NodeId::new([1; 32]),
+            HashMap::from([(
+                1,
+                ClientOutbound {
+                    control: control_tx,
+                    snapshot: snapshot_tx,
+                },
+            )]),
+        );
+
+        bump_snapshot(&server.inner).unwrap();
+        broadcast_snapshot(&server.inner).await.unwrap();
+        bump_snapshot(&server.inner).unwrap();
+        broadcast_snapshot(&server.inner).await.unwrap();
+        let latest_generation = server.inner.snapshot_generation.load(Ordering::Acquire);
+
+        tokio::time::timeout(Duration::from_secs(1), snapshot_rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            snapshot_rx.borrow().as_ref().unwrap().generation,
+            latest_generation
+        );
+        assert!(
+            tokio::time::timeout(
+                SNAPSHOT_BROADCAST_INTERVAL.saturating_mul(2),
+                snapshot_rx.changed()
+            )
+            .await
+            .is_err()
+        );
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_file(signer_path);
+    }
 
     #[test]
     fn invite_registration_is_persisted_and_single_use() {
