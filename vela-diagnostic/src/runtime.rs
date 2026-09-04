@@ -330,11 +330,33 @@ impl DiagnosticRuntime {
                             if control_connected
                                 && self.snapshot_expired_notified.load(Ordering::Acquire)
                             {
-                                control_connected = false;
-                                dashboard_error = Some("network snapshot has expired".to_owned());
-                                reconnect_sleep.as_mut().reset(
-                                    tokio::time::Instant::now() + reconnect_backoff,
-                                );
+                                match self.peer.request_snapshot().await {
+                                    Ok((snapshot, config_changed)) => {
+                                        self.snapshot_tx.send_replace(Some(snapshot));
+                                        self.snapshot_expired_notified
+                                            .store(false, Ordering::Release);
+                                        dashboard_error = None;
+                                        if config_changed {
+                                            self.refresh_after_config_change(
+                                                &mut control_connected,
+                                                &mut dashboard_error,
+                                                &mut reconnect_sleep,
+                                                reconnect_backoff,
+                                            ).await?;
+                                        }
+                                    }
+                                    Err(error)
+                                        if DiagnosticPeer::is_retryable_control_error(&error)
+                                            || DiagnosticPeer::is_snapshot_request_unsupported(&error) =>
+                                    {
+                                        dashboard_error = Some(error.to_string());
+                                        control_connected = false;
+                                        reconnect_sleep.as_mut().reset(
+                                            tokio::time::Instant::now() + reconnect_backoff,
+                                        );
+                                    }
+                                    Err(error) => return Err(error),
+                                }
                             }
                         }
                         Some(RuntimeCommand::Ping { target, count, timeout, reply }) => {

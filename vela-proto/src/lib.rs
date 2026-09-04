@@ -671,6 +671,9 @@ pub enum ControlMessage {
     UpdateCandidates {
         candidates: Vec<Candidate>,
     },
+    /// Requests the current signed network snapshot without changing the
+    /// snapshot generation or broadcasting it to other peers.
+    RequestSnapshot,
     LookupPeer {
         node_id: NodeId,
     },
@@ -689,6 +692,9 @@ pub enum ControlMessage {
         node_id: NodeId,
     },
     Snapshot {
+        snapshot: NetworkSnapshot,
+    },
+    SnapshotResponse {
         snapshot: NetworkSnapshot,
     },
     Error {

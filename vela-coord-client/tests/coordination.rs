@@ -1,9 +1,9 @@
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 use tokio::net::TcpListener;
 use vela_coord::CoordServer;
 use vela_coord_client::CoordinationClient;
 use vela_crypto::Identity;
-use vela_proto::ControlMessage;
+use vela_proto::{Candidate, ControlMessage};
 
 #[tokio::test]
 async fn client_registers_with_invite_and_verifies_server_credential() {
@@ -101,13 +101,24 @@ async fn candidate_refresh_returns_a_fresh_network_snapshot() {
         .register(&Identity::generate(), Some(&token), None, Vec::new())
         .await
         .unwrap();
-    let refreshed = client
+    let refreshed = client.request_snapshot().await.unwrap();
+
+    assert_eq!(refreshed.generation, registration.snapshot.generation);
+    assert!(refreshed.expires_at >= registration.snapshot.expires_at);
+
+    let unchanged_update = client
         .update_candidates_and_get_snapshot(Vec::new())
         .await
         .unwrap();
+    assert_eq!(unchanged_update.generation, refreshed.generation);
 
-    assert!(refreshed.generation > registration.snapshot.generation);
-    assert!(refreshed.expires_at >= registration.snapshot.expires_at);
+    let updated = client
+        .update_candidates_and_get_snapshot(vec![Candidate::Host(
+            "127.0.0.1:10000".parse::<SocketAddr>().unwrap(),
+        )])
+        .await
+        .unwrap();
+    assert!(updated.generation > refreshed.generation);
 
     server_task.abort();
     let _ = std::fs::remove_file(db);
@@ -175,7 +186,12 @@ async fn clients_discover_online_peers_and_receive_connect_signal() {
             .contains(&identity_b.public().node_id)
     );
 
-    client_b.update_candidates(Vec::new()).await.unwrap();
+    client_b
+        .update_candidates(vec![Candidate::Host(
+            "127.0.0.1:10001".parse::<SocketAddr>().unwrap(),
+        )])
+        .await
+        .unwrap();
     let snapshot_a = tokio::time::timeout(Duration::from_secs(1), client_a.recv())
         .await
         .unwrap()

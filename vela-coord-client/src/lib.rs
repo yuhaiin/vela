@@ -303,6 +303,33 @@ impl CoordinationClient {
             .await
     }
 
+    /// Fetches the current signed network snapshot without publishing a
+    /// candidate update or changing the snapshot generation.
+    pub async fn request_snapshot(&mut self) -> Result<NetworkSnapshot, CoordClientError> {
+        timeout(CONTROL_REQUEST_TIMEOUT, self.request_snapshot_inner())
+            .await
+            .map_err(|_| CoordClientError::Timeout("request snapshot"))?
+    }
+
+    async fn request_snapshot_inner(&mut self) -> Result<NetworkSnapshot, CoordClientError> {
+        self.send(ControlMessage::RequestSnapshot).await?;
+        loop {
+            match self.recv_wire().await? {
+                ControlMessage::SnapshotResponse { snapshot } => return Ok(snapshot),
+                message @ ControlMessage::ConnectSignal { .. } => {
+                    self.enqueue_pending(message);
+                }
+                message @ ControlMessage::Snapshot { .. } => {
+                    self.enqueue_pending(message);
+                }
+                ControlMessage::Error { code, message } => {
+                    return Err(CoordClientError::Server { code, message });
+                }
+                _ => return Err(CoordClientError::UnexpectedMessage),
+            }
+        }
+    }
+
     /// Updates the published candidates and waits for the corresponding fresh
     /// network snapshot. This turns candidate refresh into a control-plane
     /// request/response instead of treating a successful local socket write as
@@ -355,7 +382,7 @@ impl CoordinationClient {
                     return Err(CoordClientError::Server { code, message });
                 }
                 ControlMessage::ConnectSignal { .. } => {}
-                message @ ControlMessage::Snapshot { .. } => self.pending.push_back(message),
+                message @ ControlMessage::Snapshot { .. } => self.enqueue_pending(message),
                 _ => return Err(CoordClientError::UnexpectedMessage),
             }
         }
@@ -376,7 +403,7 @@ impl CoordinationClient {
                     return Err(CoordClientError::Server { code, message });
                 }
                 ControlMessage::ConnectSignal { .. } => {}
-                message @ ControlMessage::Snapshot { .. } => self.pending.push_back(message),
+                message @ ControlMessage::Snapshot { .. } => self.enqueue_pending(message),
                 _ => return Err(CoordClientError::UnexpectedMessage),
             }
         }
@@ -401,6 +428,28 @@ impl CoordinationClient {
             return Ok(message);
         }
         self.recv_wire().await
+    }
+
+    fn enqueue_pending(&mut self, message: ControlMessage) {
+        if matches!(&message, ControlMessage::Snapshot { .. }) {
+            if let Some(index) = self
+                .pending
+                .iter()
+                .position(|pending| matches!(pending, ControlMessage::Snapshot { .. }))
+            {
+                self.pending[index] = message;
+                let mut next = index + 1;
+                while next < self.pending.len() {
+                    if matches!(self.pending[next], ControlMessage::Snapshot { .. }) {
+                        self.pending.remove(next);
+                    } else {
+                        next += 1;
+                    }
+                }
+                return;
+            }
+        }
+        self.pending.push_back(message);
     }
 
     async fn recv_wire(&mut self) -> Result<ControlMessage, CoordClientError> {

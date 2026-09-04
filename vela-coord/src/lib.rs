@@ -610,6 +610,7 @@ async fn handle_message(
         ControlMessage::UpdateCandidates { candidates } => {
             let node_id = registered.ok_or(CoordError::NotRegistered)?;
             let peer = load_peer(state, node_id)?.ok_or(CoordError::PeerNotRegistered)?;
+            let candidates_changed = peer.candidates != candidates;
             update_peer(
                 state,
                 &StoredPeer {
@@ -627,8 +628,27 @@ async fn handle_message(
                 },
             )?;
             touch_peer(state, node_id)?;
-            bump_snapshot(state)?;
-            broadcast_snapshot(state).await?;
+            if candidates_changed {
+                bump_snapshot(state)?;
+                broadcast_snapshot(state).await?;
+            } else {
+                // Keep the request/response API useful without turning an
+                // unchanged periodic refresh into a global broadcast.
+                let snapshot = network_snapshot(state, online_peer_ids(state).await)?;
+                outbound
+                    .send(ControlMessage::Snapshot { snapshot })
+                    .await
+                    .map_err(|_| CoordError::ConnectionClosed)?;
+            }
+            Ok(registered)
+        }
+        ControlMessage::RequestSnapshot => {
+            registered.ok_or(CoordError::NotRegistered)?;
+            let snapshot = network_snapshot(state, online_peer_ids(state).await)?;
+            outbound
+                .send(ControlMessage::SnapshotResponse { snapshot })
+                .await
+                .map_err(|_| CoordError::ConnectionClosed)?;
             Ok(registered)
         }
         ControlMessage::LookupPeer { node_id } => {

@@ -536,15 +536,32 @@ impl DiagnosticPeer {
             candidates = ?candidates,
             "uploading refreshed local candidates"
         );
-        let snapshot = self
-            .client
-            .update_candidates_and_get_snapshot(candidates.clone())
-            .await?;
+        let snapshot = if unchanged {
+            match self.client.request_snapshot().await {
+                Ok(snapshot) => snapshot,
+                Err(CoordClientError::Server { ref code, .. }) if code == "unsupported_message" => {
+                    self.client
+                        .update_candidates_and_get_snapshot(candidates.clone())
+                        .await?
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            self.client
+                .update_candidates_and_get_snapshot(candidates.clone())
+                .await?
+        };
         self.apply_snapshot(snapshot).await?;
         self.candidates = candidates.clone();
         self.state.candidates = candidates;
         self.state.save(&self.state_dir)?;
         Ok(())
+    }
+
+    pub async fn request_snapshot(&mut self) -> Result<(NetworkSnapshot, bool), DiagnosticError> {
+        let snapshot = self.client.request_snapshot().await?;
+        let config_changed = self.apply_snapshot(snapshot.clone()).await?;
+        Ok((snapshot, config_changed))
     }
 
     pub async fn reconnect(&mut self) -> Result<NetworkSnapshot, DiagnosticError> {
@@ -608,6 +625,14 @@ impl DiagnosticPeer {
                     | CoordClientError::Closed
                     | CoordClientError::Timeout(_)
             )
+        )
+    }
+
+    pub fn is_snapshot_request_unsupported(error: &DiagnosticError) -> bool {
+        matches!(
+            error,
+            DiagnosticError::Coordination(CoordClientError::Server { code, .. })
+                if code == "unsupported_message"
         )
     }
 
