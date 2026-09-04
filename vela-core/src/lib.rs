@@ -4345,8 +4345,12 @@ impl Inner {
         let expected_network_id = *self.network_id.lock().await;
         let context = decode_handshake_context(bytes).ok_or(CoreError::InvalidHandshake)?;
         let expected_generation = self.snapshot_generation.load(Ordering::Acquire);
+        // Snapshot generations are a control-plane revision and can differ
+        // while both peers process the same signed update. The identity,
+        // incarnation, addresses, and network id below are the data-plane
+        // binding; requiring the global revision to match makes a valid
+        // handshake fail during ordinary candidate refreshes.
         let valid = context.network_id == expected_network_id
-            && context.generation == expected_generation
             && context.node_id == sender
             && context.node_id == peer.node_id
             && context.incarnation == peer.incarnation

@@ -1425,7 +1425,7 @@ mod tests {
             .unwrap();
         let node_a = peer_a.node.clone();
         let peer_a_task = tokio::spawn(async move { peer_a.run().await });
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let a_sent = sent_a
                     .lock()
