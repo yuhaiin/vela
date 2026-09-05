@@ -292,7 +292,19 @@ impl DiagnosticRuntime {
     }
 
     async fn run(mut self) -> Result<(), DiagnosticError> {
-        let result = self.run_loop().await;
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        // Poll packet forwarding independently of control-plane requests. A slow
+        // coordinator reply must not hold IP packets (including TCP ACKs).
+        let forwarding = forward_runtime_events(
+            self.peer.node.clone(),
+            self.packet_tx.clone(),
+            Arc::clone(&self.tun_packet_queue_drops),
+            control_tx,
+        );
+        let result = tokio::select! {
+            result = forwarding => result,
+            result = self.run_loop(control_rx) => result,
+        };
         self.connections.shutdown().await;
         self.pings.shutdown().await;
         self.peer.node.shutdown().await;
@@ -302,7 +314,10 @@ impl DiagnosticRuntime {
         result
     }
 
-    async fn run_loop(&mut self) -> Result<(), DiagnosticError> {
+    async fn run_loop(
+        &mut self,
+        mut control_events: mpsc::UnboundedReceiver<VelaEvent>,
+    ) -> Result<(), DiagnosticError> {
         let mut refresh = interval(crate::CANDIDATE_REFRESH_INTERVAL);
         refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut dashboard_refresh = interval(Duration::from_secs(1));
@@ -490,7 +505,7 @@ impl DiagnosticRuntime {
                         Err(error) => return Err(error),
                     }
                 }
-                received = self.peer.node.next_event_batch(&mut event_batch, 64) => {
+                received = control_events.recv_many(&mut event_batch, 64) => {
                     if received == 0 {
                         return Err(DiagnosticError::TransportFailed {
                             family: None,
@@ -500,22 +515,8 @@ impl DiagnosticRuntime {
                     let mut publish_state = false;
                     for event in event_batch.drain(..) {
                         publish_state |= match event {
-                            VelaEvent::IpPacket { peer, packet } => {
-                                match self.packet_tx.try_send((peer, packet)) {
-                                    Ok(()) => {}
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        self.tun_packet_queue_drops
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        // Keep consuming core events when the TUN-facing
-                                        // queue is full. Dropping an IP packet is safer
-                                        // than blocking probes, handshakes and keepalives;
-                                        // TCP will retransmit it and UDP is lossy already.
-                                    }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                                        return Err(DiagnosticError::ServiceUnavailable);
-                                    }
-                                }
-                                false
+                            VelaEvent::IpPacket { .. } => {
+                                unreachable!("IP packets are handled by the forwarding loop")
                             }
                             VelaEvent::PeerConnectionRequested(peer_id)
                             | VelaEvent::PeerReconnectRequested(peer_id) => {
@@ -689,6 +690,44 @@ fn validate_ping(count: usize, timeout: Duration) -> Result<(), DiagnosticError>
         )));
     }
     Ok(())
+}
+
+/// Preserve IP packet order while forwarding independently of coordinator
+/// I/O. Only low-rate control events enter the unbounded control queue, matching
+/// the core's control queue; both packet queues remain bounded and lossy.
+async fn forward_runtime_events(
+    node: VelaNode,
+    packets: mpsc::Sender<(NodeId, vela_ip::IpPacket)>,
+    queue_drops: Arc<AtomicU64>,
+    control: mpsc::UnboundedSender<VelaEvent>,
+) -> Result<(), DiagnosticError> {
+    let mut batch = Vec::with_capacity(64);
+    loop {
+        if node.next_event_batch(&mut batch, 64).await == 0 {
+            return Err(DiagnosticError::TransportFailed {
+                family: None,
+                error: "Vela node stopped".to_owned(),
+            });
+        }
+        for event in batch.drain(..) {
+            match event {
+                VelaEvent::IpPacket { peer, packet } => match packets.try_send((peer, packet)) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        queue_drops.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        return Err(DiagnosticError::ServiceUnavailable);
+                    }
+                },
+                event => {
+                    if control.send(event).is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

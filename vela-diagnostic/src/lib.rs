@@ -1493,6 +1493,131 @@ mod tests {
         let _ = std::fs::remove_file(signer);
     }
 
+    // A pending coordinator reply must not delay an established peer's IP packets.
+    #[tokio::test]
+    async fn runtime_forwards_ip_while_coordinator_reply_is_blocked() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let base = std::env::temp_dir().join(format!(
+            "vela-runtime-forwarding-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let server = CoordServer::open(base.join("db"), base.join("key"), "integration").unwrap();
+        let invite_a = server.create_invite(60).unwrap();
+        let invite_b = server.create_invite(60).unwrap();
+        let server_key = server.server_public_key();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_address = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move { server.serve(listener).await.unwrap() });
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy.local_addr().unwrap();
+        let hold = Arc::new(AtomicBool::new(false));
+        let blocked = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let proxy_hold = Arc::clone(&hold);
+        let proxy_blocked = Arc::clone(&blocked);
+        let proxy_release = Arc::clone(&release);
+        let proxy_task = tokio::spawn(async move {
+            let (mut downstream, _) = proxy.accept().await.unwrap();
+            let mut upstream = tokio::net::TcpStream::connect(server_address)
+                .await
+                .unwrap();
+            let (mut client_read, mut client_write) = downstream.split();
+            let (mut server_read, mut server_write) = upstream.split();
+            let requests = tokio::io::copy(&mut client_read, &mut server_write);
+            let replies = async {
+                let mut buffer = [0; 8192];
+                loop {
+                    let length = server_read.read(&mut buffer).await?;
+                    if length == 0 {
+                        return Ok::<(), std::io::Error>(());
+                    }
+                    if proxy_hold.load(Ordering::SeqCst) {
+                        proxy_blocked.notify_one();
+                        proxy_release.notified().await;
+                    }
+                    client_write.write_all(&buffer[..length]).await?;
+                }
+            };
+            tokio::select! { _ = requests => {}, _ = replies => {} }
+        });
+        let address_a = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let address_b = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let peer_a = build_registered_peer(
+            &base.join("a"),
+            &format!("ws://{proxy_address}/ws"),
+            server_key,
+            &invite_a,
+            Identity::generate(),
+            address_a,
+            Arc::new(StdMutex::new(Vec::new())),
+        )
+        .await;
+        let peer_b = build_registered_peer(
+            &base.join("b"),
+            &format!("ws://{server_address}/ws"),
+            server_key,
+            &invite_b,
+            Identity::generate(),
+            address_b,
+            Arc::new(StdMutex::new(Vec::new())),
+        )
+        .await;
+        let snapshot = peer_b.state.snapshot.as_ref().unwrap();
+        let info_b = snapshot
+            .peers
+            .iter()
+            .find(|p| p.node_id == peer_b.node_id())
+            .unwrap()
+            .clone();
+        let info_a = snapshot
+            .peers
+            .iter()
+            .find(|p| p.node_id == peer_a.node_id())
+            .unwrap()
+            .clone();
+        peer_a.node.register_peer(info_b.clone()).await.unwrap();
+        peer_a.node.connect(peer_b.node_id()).await.unwrap();
+        let mut runtime = DiagnosticRuntime::start(peer_a, "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        hold.store(true, Ordering::SeqCst);
+        let stalled = tokio::time::timeout(Duration::from_secs(7), blocked.notified()).await;
+        let payload = ipv4_packet(info_b.virtual_ipv4.unwrap(), info_a.virtual_ipv4.unwrap());
+        peer_b.node.send_ip(payload.clone()).await.unwrap();
+        let received =
+            tokio::time::timeout(Duration::from_millis(500), runtime.io.packets.recv()).await;
+        hold.store(false, Ordering::SeqCst);
+        release.notify_one();
+        runtime.handle.stop();
+        tokio::time::timeout(Duration::from_secs(5), runtime.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        peer_b.node.shutdown().await;
+        proxy_task.abort();
+        server_task.abort();
+        let _ = std::fs::remove_dir_all(base);
+        assert!(stalled.is_ok(), "coordinator reply was not held");
+        let (_, packet) = received
+            .expect("IP forwarding stalled behind coordinator reply")
+            .unwrap();
+        assert_eq!(packet.as_bytes(), payload);
+    }
+
     #[test]
     fn legacy_bind_state_is_ignored_and_ports_start_empty() {
         let state: PeerState = serde_json::from_value(serde_json::json!({
