@@ -860,7 +860,7 @@ pub async fn run_bridge(node: vela_core::VelaNode, tun: TunDevice) -> Result<(),
     let mut vela_to_tun = tokio::spawn(async move {
         let mut events = Vec::with_capacity(64);
         loop {
-            if node.next_event_batch(&mut events, 64).await == 0 {
+            if node.next_data_event_batch(&mut events, 64).await == 0 {
                 return Err(TunError::Closed);
             }
             for event in events.drain(..) {

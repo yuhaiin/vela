@@ -701,9 +701,21 @@ async fn forward_runtime_events(
     queue_drops: Arc<AtomicU64>,
     control: mpsc::UnboundedSender<VelaEvent>,
 ) -> Result<(), DiagnosticError> {
+    tokio::try_join!(
+        forward_runtime_data_events(node.clone(), packets, queue_drops),
+        forward_runtime_control_events(node, control),
+    )?;
+    Ok(())
+}
+
+async fn forward_runtime_data_events(
+    node: VelaNode,
+    packets: mpsc::Sender<(NodeId, vela_ip::IpPacket)>,
+    queue_drops: Arc<AtomicU64>,
+) -> Result<(), DiagnosticError> {
     let mut batch = Vec::with_capacity(64);
     loop {
-        if node.next_event_batch(&mut batch, 64).await == 0 {
+        if node.next_data_event_batch(&mut batch, 64).await == 0 {
             return Err(DiagnosticError::TransportFailed {
                 family: None,
                 error: "Vela node stopped".to_owned(),
@@ -720,11 +732,30 @@ async fn forward_runtime_events(
                         return Err(DiagnosticError::ServiceUnavailable);
                     }
                 },
-                event => {
-                    if control.send(event).is_err() {
-                        return Ok(());
-                    }
-                }
+                _ => unreachable!("data event queue contains only IP packets"),
+            }
+        }
+    }
+}
+
+async fn forward_runtime_control_events(
+    node: VelaNode,
+    control: mpsc::UnboundedSender<VelaEvent>,
+) -> Result<(), DiagnosticError> {
+    let mut batch = Vec::with_capacity(16);
+    loop {
+        if node.next_control_event_batch(&mut batch, 16).await == 0 {
+            return Err(DiagnosticError::TransportFailed {
+                family: None,
+                error: "Vela node stopped".to_owned(),
+            });
+        }
+        for event in batch.drain(..) {
+            if matches!(event, VelaEvent::IpPacket { .. }) {
+                unreachable!("control event queue contains no IP packets");
+            }
+            if control.send(event).is_err() {
+                return Ok(());
             }
         }
     }

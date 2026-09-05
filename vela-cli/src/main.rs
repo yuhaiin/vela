@@ -144,7 +144,7 @@ struct PeerUpArgs {
     state: PathBuf,
     #[arg(long)]
     tun: Option<String>,
-    #[arg(long, default_value_t = 1200)]
+    #[arg(long, default_value_t = vela_core::DEFAULT_VIRTUAL_MTU)]
     mtu: usize,
     #[arg(long, default_value = "127.0.0.1:7001")]
     bind: SocketAddr,

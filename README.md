@@ -102,7 +102,7 @@ cargo run -p vela-cli -- peer register \
   --port 0
 
 # `peer up` starts the only peer runtime, the TUN adapter, and the dashboard.
-cargo run -p vela-cli -- peer up --state ./peer-a --mtu 1200
+cargo run -p vela-cli -- peer up --state ./peer-a --mtu 1190
 # The following commands connect to the already-running peer up service.
 cargo run -p vela-cli -- peer list --state ./peer-a --json
 cargo run -p vela-cli -- peer status --state ./peer-a --json

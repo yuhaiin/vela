@@ -310,7 +310,7 @@ async fn run_receiver(
             break;
         }
         let received =
-            tokio::time::timeout(remaining, node.next_event_batch(&mut events, 64)).await;
+            tokio::time::timeout(remaining, node.next_data_event_batch(&mut events, 64)).await;
         if received.ok().is_none_or(|count| count == 0) {
             break;
         }

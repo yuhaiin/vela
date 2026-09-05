@@ -4,7 +4,7 @@
 //! between application tasks; public handles send small commands to that
 //! owner, which keeps polling, socket state, and Vela packet I/O serialized.
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use smoltcp::{
     iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet},
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
@@ -16,16 +16,19 @@ use smoltcp::{
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::Arc,
     time::Duration,
 };
 use thiserror::Error;
-use tokio::sync::{Mutex, mpsc, oneshot};
-use vela_core::{CoreError, VelaEvent, VelaNode};
+use tokio::sync::{mpsc, oneshot};
+use vela_core::{CoreError, DEFAULT_VIRTUAL_MTU, VelaEvent, VelaNode};
 
-const DEFAULT_MTU: usize = 1200;
+const DEFAULT_MTU: usize = DEFAULT_VIRTUAL_MTU;
 const DEFAULT_SOCKET_BUFFER: usize = 64 * 1024;
 const DEVICE_QUEUE_LIMIT: usize = 256;
+const EPHEMERAL_PORT_START: u16 = 49152;
+const EPHEMERAL_PORT_END: u16 = 65535;
+const STACK_POLL_MIN_INTERVAL: Duration = Duration::from_millis(1);
+const STACK_POLL_IDLE_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug)]
 pub struct StackConfig {
@@ -58,7 +61,6 @@ impl StackConfig {
 #[derive(Clone)]
 pub struct VelaStack {
     commands: mpsc::Sender<Command>,
-    next_port: Arc<Mutex<u16>>,
 }
 
 impl VelaStack {
@@ -77,10 +79,7 @@ impl VelaStack {
             ));
         }
         let (commands, receiver) = mpsc::channel(256);
-        let stack = Self {
-            commands,
-            next_port: Arc::new(Mutex::new(49152)),
-        };
+        let stack = Self { commands };
         tokio::spawn(run_stack(node, config, stack.commands.clone(), receiver));
         Ok(stack)
     }
@@ -114,14 +113,9 @@ impl VelaStack {
     }
 
     pub async fn dial_tcp(&self, remote: SocketAddr) -> Result<VelaTcpStream, StackError> {
-        let local_port = self.allocate_port().await;
         let (response, receiver) = oneshot::channel();
         self.commands
-            .send(Command::DialTcp {
-                remote,
-                local_port,
-                response,
-            })
+            .send(Command::DialTcp { remote, response })
             .await
             .map_err(|_| StackError::Closed)?;
         receiver.await.map_err(|_| StackError::Closed)?
@@ -187,17 +181,6 @@ impl VelaStack {
             .await
             .map_err(|_| StackError::Closed)?;
         receiver.await.map_err(|_| StackError::Closed)?
-    }
-
-    async fn allocate_port(&self) -> u16 {
-        let mut port = self.next_port.lock().await;
-        let allocated = *port;
-        *port = if allocated == 65535 {
-            49152
-        } else {
-            allocated + 1
-        };
-        allocated
     }
 }
 
@@ -391,7 +374,6 @@ enum Command {
     },
     DialTcp {
         remote: SocketAddr,
-        local_port: u16,
         response: oneshot::Sender<Result<VelaTcpStream, StackError>>,
     },
     ListenTcp {
@@ -464,7 +446,7 @@ enum Command {
 }
 
 struct VirtualDevice {
-    rx: VecDeque<Vec<u8>>,
+    rx: VecDeque<Bytes>,
     tx: VecDeque<Vec<u8>>,
     mtu: usize,
 }
@@ -485,13 +467,13 @@ impl VirtualDevice {
         if self.rx.len() >= DEVICE_QUEUE_LIMIT {
             return Err(StackError::QueueFull);
         }
-        self.rx.push_back(packet.to_vec());
+        self.rx.push_back(packet);
         Ok(())
     }
 }
 
 struct VirtualRxToken {
-    packet: Vec<u8>,
+    packet: Bytes,
 }
 
 impl RxToken for VirtualRxToken {
@@ -568,7 +550,7 @@ struct StackRuntime {
     udp: HashMap<u64, UdpState>,
     raw: HashMap<u64, RawState>,
     icmp: HashMap<u64, IcmpState>,
-    next_poll: tokio::time::Interval,
+    next_port: u16,
     started: std::time::Instant,
     socket_buffer: usize,
 }
@@ -658,7 +640,7 @@ impl StackRuntime {
             udp: HashMap::new(),
             raw: HashMap::new(),
             icmp: HashMap::new(),
-            next_poll: tokio::time::interval(Duration::from_millis(1)),
+            next_port: EPHEMERAL_PORT_START,
             started: std::time::Instant::now(),
             socket_buffer: config.socket_buffer,
         })
@@ -666,6 +648,7 @@ impl StackRuntime {
 
     async fn run(mut self) {
         loop {
+            let poll_delay = self.poll_delay();
             tokio::select! {
                 command = self.commands.recv() => {
                     let Some(command) = command else { break };
@@ -691,7 +674,7 @@ impl StackRuntime {
                         None => break,
                     }
                 }
-                _ = self.next_poll.tick() => {
+                _ = tokio::time::sleep(poll_delay) => {
                     self.poll();
                 }
             }
@@ -711,12 +694,15 @@ impl StackRuntime {
                 let result = self.device.push_rx(packet);
                 let _ = response.send(result);
             }
-            Command::DialTcp {
-                remote,
-                local_port,
-                response,
-            } => {
+            Command::DialTcp { remote, response } => {
                 let id = self.next_id();
+                let local_port = match self.allocate_tcp_port() {
+                    Ok(port) => port,
+                    Err(error) => {
+                        let _ = response.send(Err(error));
+                        return false;
+                    }
+                };
                 let mut socket = tcp::Socket::new(
                     tcp::SocketBuffer::new(vec![0; self.socket_buffer]),
                     tcp::SocketBuffer::new(vec![0; self.socket_buffer]),
@@ -916,10 +902,13 @@ impl StackRuntime {
                 }
                 let socket = self.sockets.get_mut::<tcp::Socket>(state.handle);
                 if socket.can_recv() {
-                    let mut data = vec![0; max_len];
+                    let mut data = BytesMut::zeroed(max_len);
                     let result = socket
                         .recv_slice(&mut data)
-                        .map(|length| Bytes::copy_from_slice(&data[..length]))
+                        .map(|length| {
+                            data.truncate(length);
+                            data.freeze()
+                        })
                         .map_err(|error| StackError::Socket(error.to_string()));
                     let _ = response.send(result);
                 } else if !socket.may_recv() {
@@ -989,10 +978,13 @@ impl StackRuntime {
                 }
                 let socket = self.sockets.get_mut::<udp::Socket>(state.handle);
                 if socket.can_recv() {
-                    let mut data = vec![0; max_len];
+                    let mut data = BytesMut::zeroed(max_len);
                     let result = match socket.recv_slice(&mut data) {
                         Ok((length, meta)) => socket_addr(meta.endpoint)
-                            .map(|address| (Bytes::copy_from_slice(&data[..length]), address))
+                            .map(|address| {
+                                data.truncate(length);
+                                (data.freeze(), address)
+                            })
                             .ok_or_else(|| StackError::Socket("invalid UDP endpoint".into())),
                         Err(error) => Err(StackError::Socket(error.to_string())),
                     };
@@ -1031,10 +1023,13 @@ impl StackRuntime {
                 }
                 let socket = self.sockets.get_mut::<raw::Socket>(state.handle);
                 if socket.can_recv() {
-                    let mut data = vec![0; max_len];
+                    let mut data = BytesMut::zeroed(max_len);
                     let result = socket
                         .recv_slice(&mut data)
-                        .map(|length| Bytes::copy_from_slice(&data[..length]))
+                        .map(|length| {
+                            data.truncate(length);
+                            data.freeze()
+                        })
                         .map_err(|error| StackError::Socket(error.to_string()));
                     let _ = response.send(result);
                 } else {
@@ -1072,12 +1067,12 @@ impl StackRuntime {
                 }
                 let socket = self.sockets.get_mut::<icmp::Socket>(state.handle);
                 if socket.recv_queue() != 0 {
-                    let mut data = vec![0; max_len];
+                    let mut data = BytesMut::zeroed(max_len);
                     let result = match socket.recv_slice(&mut data) {
-                        Ok((length, source)) => Ok((
-                            Bytes::copy_from_slice(&data[..length]),
-                            std_ip_address(source),
-                        )),
+                        Ok((length, source)) => {
+                            data.truncate(length);
+                            Ok((data.freeze(), std_ip_address(source)))
+                        }
                         Err(error) => Err(StackError::Socket(error.to_string())),
                     };
                     let _ = response.send(result);
@@ -1094,6 +1089,46 @@ impl StackRuntime {
         let _ = self
             .interface
             .poll(now, &mut self.device, &mut self.sockets);
+    }
+
+    fn poll_delay(&mut self) -> Duration {
+        if !self.device.rx.is_empty() || !self.device.tx.is_empty() {
+            return STACK_POLL_MIN_INTERVAL;
+        }
+        let now = SmolInstant::from_millis(self.started.elapsed().as_millis() as i64);
+        let delay = self
+            .interface
+            .poll_delay(now, &self.sockets)
+            .map(|delay| Duration::from_millis(delay.total_millis()))
+            .unwrap_or(STACK_POLL_IDLE_INTERVAL);
+        delay.clamp(STACK_POLL_MIN_INTERVAL, STACK_POLL_IDLE_INTERVAL)
+    }
+
+    fn allocate_tcp_port(&mut self) -> Result<u16, StackError> {
+        let port_count = usize::from(EPHEMERAL_PORT_END - EPHEMERAL_PORT_START) + 1;
+        for _ in 0..port_count {
+            let candidate = self.next_port;
+            self.next_port = if candidate == EPHEMERAL_PORT_END {
+                EPHEMERAL_PORT_START
+            } else {
+                candidate + 1
+            };
+            let listener_uses_port = self
+                .listeners
+                .values()
+                .any(|state| state.local.port() == candidate);
+            let tcp_uses_port = self.tcp.values().any(|state| {
+                let socket = self.sockets.get::<tcp::Socket>(state.handle);
+                socket.state() != tcp::State::Closed
+                    && socket
+                        .local_endpoint()
+                        .is_some_and(|endpoint| endpoint.port == candidate)
+            });
+            if !listener_uses_port && !tcp_uses_port {
+                return Ok(candidate);
+            }
+        }
+        Err(StackError::NoEphemeralPort)
     }
 
     fn complete_pending(&mut self) {
@@ -1122,10 +1157,13 @@ impl StackRuntime {
             }
             if let Some((max_len, response)) = state.pending_recv.take() {
                 if socket.can_recv() {
-                    let mut data = vec![0; max_len];
+                    let mut data = BytesMut::zeroed(max_len);
                     let result = socket
                         .recv_slice(&mut data)
-                        .map(|length| Bytes::copy_from_slice(&data[..length]))
+                        .map(|length| {
+                            data.truncate(length);
+                            data.freeze()
+                        })
                         .map_err(|error| StackError::Socket(error.to_string()));
                     let _ = response.send(result);
                 } else if !socket.may_recv() {
@@ -1185,10 +1223,13 @@ impl StackRuntime {
             if let Some((max_len, response)) = state.pending_recv.take() {
                 let socket = self.sockets.get_mut::<udp::Socket>(state.handle);
                 if socket.can_recv() {
-                    let mut data = vec![0; max_len];
+                    let mut data = BytesMut::zeroed(max_len);
                     let result = match socket.recv_slice(&mut data) {
                         Ok((length, meta)) => socket_addr(meta.endpoint)
-                            .map(|address| (Bytes::copy_from_slice(&data[..length]), address))
+                            .map(|address| {
+                                data.truncate(length);
+                                (data.freeze(), address)
+                            })
                             .ok_or_else(|| StackError::Socket("invalid UDP endpoint".into())),
                         Err(error) => Err(StackError::Socket(error.to_string())),
                     };
@@ -1202,10 +1243,13 @@ impl StackRuntime {
             if let Some((max_len, response)) = state.pending_recv.take() {
                 let socket = self.sockets.get_mut::<raw::Socket>(state.handle);
                 if socket.can_recv() {
-                    let mut data = vec![0; max_len];
+                    let mut data = BytesMut::zeroed(max_len);
                     let result = socket
                         .recv_slice(&mut data)
-                        .map(|length| Bytes::copy_from_slice(&data[..length]))
+                        .map(|length| {
+                            data.truncate(length);
+                            data.freeze()
+                        })
                         .map_err(|error| StackError::Socket(error.to_string()));
                     let _ = response.send(result);
                 } else {
@@ -1217,12 +1261,12 @@ impl StackRuntime {
             if let Some((max_len, response)) = state.pending_recv.take() {
                 let socket = self.sockets.get_mut::<icmp::Socket>(state.handle);
                 if socket.recv_queue() != 0 {
-                    let mut data = vec![0; max_len];
+                    let mut data = BytesMut::zeroed(max_len);
                     let result = match socket.recv_slice(&mut data) {
-                        Ok((length, source)) => Ok((
-                            Bytes::copy_from_slice(&data[..length]),
-                            std_ip_address(source),
-                        )),
+                        Ok((length, source)) => {
+                            data.truncate(length);
+                            Ok((data.freeze(), std_ip_address(source)))
+                        }
                         Err(error) => Err(StackError::Socket(error.to_string())),
                     };
                     let _ = response.send(result);
@@ -1253,10 +1297,7 @@ impl StackRuntime {
 }
 
 fn raw_packet_buffer(size: usize) -> PacketBuffer<'static, ()> {
-    PacketBuffer::new(
-        vec![PacketMetadata::EMPTY; 64],
-        vec![0; size.saturating_mul(64)],
-    )
+    PacketBuffer::new(vec![PacketMetadata::EMPTY; 64], vec![0; size])
 }
 
 fn socket_addr(endpoint: smoltcp::wire::IpEndpoint) -> Option<SocketAddr> {
@@ -1294,6 +1335,8 @@ pub enum StackError {
     QueueFull,
     #[error("unknown userspace socket")]
     UnknownSocket,
+    #[error("no free ephemeral TCP port")]
+    NoEphemeralPort,
     #[error("another operation is already pending on this socket")]
     OperationPending,
     #[error("Vela core error: {0}")]
