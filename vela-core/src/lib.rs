@@ -1365,8 +1365,43 @@ struct PreparedDataPacket {
     wire_packet: Bytes,
 }
 
+const DATA_ENCRYPT_PARALLEL_THRESHOLD: usize = 16;
+const DATA_ENCRYPT_MAX_WORKERS: usize = 4;
+
 fn data_worker_count() -> usize {
     std::thread::available_parallelism().map_or(4, |parallelism| parallelism.get().max(4))
+}
+
+fn prepare_encrypted_data_packet(
+    peer: Arc<PeerState>,
+    peer_id: NodeId,
+    session_id: u64,
+    path: SocketAddr,
+    cipher: &SessionCipher,
+    sequence: u64,
+    packet: IpPacket,
+) -> Result<PreparedDataPacket, SendError> {
+    let packet_len = packet.as_bytes().len();
+    let encrypted_len = packet_len + 16;
+    let header = Header::new(PacketType::Data, session_id, sequence, encrypted_len)
+        .map_err(SendError::Protocol)?;
+    let aad = encoded_header(&header);
+    let mut wire_packet = BytesMut::with_capacity(vela_proto::HEADER_LEN + encrypted_len);
+    header.encode(&mut wire_packet);
+    wire_packet.extend_from_slice(packet.as_bytes());
+    let tag = cipher
+        .encrypt_in_place_detached(sequence, &aad, &mut wire_packet[vela_proto::HEADER_LEN..])
+        .map_err(SendError::Crypto)?;
+    wire_packet.extend_from_slice(&tag);
+    Ok(PreparedDataPacket {
+        peer,
+        peer_id,
+        session_id,
+        sequence,
+        path,
+        packet_len,
+        wire_packet: wire_packet.freeze(),
+    })
 }
 
 impl Default for NodeConfig {
@@ -1966,7 +2001,7 @@ impl VelaNode {
         let mut results = (0..packets.len())
             .map(|_| None)
             .collect::<Vec<Option<Result<(), SendError>>>>();
-        let mut routed = Vec::with_capacity(packets.len());
+        let mut parsed = Vec::with_capacity(packets.len());
         for (index, payload) in packets.iter().enumerate() {
             let packet = match IpPacket::parse(payload.clone()) {
                 Ok(packet) => packet,
@@ -1975,21 +2010,32 @@ impl VelaNode {
                     continue;
                 }
             };
-            let peer_id = match self.inner.routes.read().await.validate_outbound(&packet) {
-                Ok(peer_id) => peer_id,
-                Err(error) => {
-                    results[index] = Some(Err(SendError::Ip(error)));
-                    continue;
-                }
-            };
-            let peer = match self.inner.peers.lock().await.get(&peer_id).cloned() {
-                Some(peer) => peer,
-                None => {
-                    results[index] = Some(Err(SendError::UnknownPeer));
-                    continue;
-                }
-            };
-            routed.push((index, packet, peer));
+            parsed.push((index, packet));
+        }
+        let mut routed = Vec::with_capacity(parsed.len());
+        {
+            // Snapshot replacement takes these locks in the same order. Keep
+            // one consistent routing/peer view for the whole TUN batch instead
+            // of reacquiring two async locks for every packet.
+            let routes = self.inner.routes.read().await;
+            let peers = self.inner.peers.lock().await;
+            for (index, packet) in parsed {
+                let peer_id = match routes.validate_outbound(&packet) {
+                    Ok(peer_id) => peer_id,
+                    Err(error) => {
+                        results[index] = Some(Err(SendError::Ip(error)));
+                        continue;
+                    }
+                };
+                let peer = match peers.get(&peer_id).cloned() {
+                    Some(peer) => peer,
+                    None => {
+                        results[index] = Some(Err(SendError::UnknownPeer));
+                        continue;
+                    }
+                };
+                routed.push((index, packet, peer));
+            }
         }
         let mut prepared = Vec::with_capacity(packets.len());
         let mut prepared_indices = Vec::with_capacity(packets.len());
@@ -2788,23 +2834,18 @@ impl Inner {
         }
     }
 
-    async fn data_decrypt_context(
+    async fn data_decrypt_context_at(
         &self,
         packet: &DataPacket,
+        now: u64,
     ) -> Result<Option<(Arc<PeerState>, SessionCipher)>, CoreError> {
         let Some(peer) = self.session_peer(packet.header.session_id) else {
-            self.receive
-                .unassociated_data_datagrams
-                .fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         };
-        if self.config.server_public_key.is_some() && peer.membership_expired() {
+        if self.config.server_public_key.is_some() && peer.membership_expired_at(now) {
             self.invalidate_session(&peer, true).await;
             return Err(CoreError::PeerCredentialExpired);
         }
-        peer.receive
-            .worker_data_packets
-            .fetch_add(1, Ordering::Relaxed);
         let cipher = {
             let active = peer.active.lock().await;
             let Some(session) = active
@@ -2821,29 +2862,51 @@ impl Inner {
 
     async fn queue_data_decrypt_batch(
         &self,
-        packets: Vec<DataPacket>,
+        packets: &mut Vec<DataPacket>,
+        now: u64,
     ) -> Result<Option<PendingDataDecrypt>, CoreError> {
         let mut jobs = Vec::with_capacity(packets.len());
         let mut entries = Vec::with_capacity(packets.len());
-        for packet in packets {
+        let mut contexts: HashMap<u64, Option<(Arc<PeerState>, SessionCipher)>> = HashMap::new();
+        for packet in packets.drain(..) {
             let source = packet.source;
-            let context = match self.data_decrypt_context(&packet).await {
-                Ok(context) => context,
-                Err(error) => {
-                    debug!(
-                        debug_marker = "vela-udp",
-                        error = %error,
-                        %source,
-                        "dropping invalid Vela data packet"
-                    );
-                    continue;
-                }
-            };
-            let Some((peer, cipher)) = context else {
+            let session_id = packet.header.session_id;
+            // The context lookup is async, so HashMap::entry cannot be held
+            // across it. Cache each session explicitly for the batch.
+            #[allow(clippy::map_entry)]
+            if !contexts.contains_key(&session_id) {
+                let context = match self.data_decrypt_context_at(&packet, now).await {
+                    Ok(context) => context,
+                    Err(error) => {
+                        debug!(
+                            debug_marker = "vela-udp",
+                            error = %error,
+                            %source,
+                            session_id,
+                            "dropping invalid Vela data session"
+                        );
+                        None
+                    }
+                };
+                contexts.insert(session_id, context);
+            }
+            let Some((peer, cipher)) = contexts.get(&session_id).and_then(Option::as_ref) else {
+                self.receive
+                    .unassociated_data_datagrams
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             };
-            jobs.push(DataDecryptJob { cipher, packet });
-            entries.push(PendingDataDecryptEntry { peer, source });
+            peer.receive
+                .worker_data_packets
+                .fetch_add(1, Ordering::Relaxed);
+            jobs.push(DataDecryptJob {
+                cipher: cipher.clone(),
+                packet,
+            });
+            entries.push(PendingDataDecryptEntry {
+                peer: Arc::clone(peer),
+                source,
+            });
         }
         if jobs.is_empty() {
             return Ok(None);
@@ -2893,10 +2956,24 @@ impl Inner {
         Ok(Some(PendingDataDecrypt { parts }))
     }
 
-    async fn decrypt_data_inline(&self, mut packet: DataPacket) -> Result<(), CoreError> {
-        let Some((peer, cipher)) = self.data_decrypt_context(&packet).await? else {
+    async fn decrypt_data_inline(&self, packet: DataPacket) -> Result<(), CoreError> {
+        self.decrypt_data_inline_at(packet, unix_time()).await
+    }
+
+    async fn decrypt_data_inline_at(
+        &self,
+        mut packet: DataPacket,
+        now: u64,
+    ) -> Result<(), CoreError> {
+        let Some((peer, cipher)) = self.data_decrypt_context_at(&packet, now).await? else {
+            self.receive
+                .unassociated_data_datagrams
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(());
         };
+        peer.receive
+            .worker_data_packets
+            .fetch_add(1, Ordering::Relaxed);
         if let Err(error) = cipher.decrypt_in_place(
             packet.header.sequence,
             &encoded_header(&packet.header),
@@ -2911,6 +2988,7 @@ impl Inner {
     }
 
     async fn finish_data_decrypt(&self, pending: PendingDataDecrypt) -> Result<(), CoreError> {
+        let mut decrypted = Vec::new();
         for part in pending.parts {
             let PendingDataDecryptPart { entries, response } = part;
             let results = response.await.map_err(|_| {
@@ -2921,16 +2999,7 @@ impl Inner {
             })?;
             for (entry, result) in entries.into_iter().zip(results) {
                 match result {
-                    Ok(packet) => {
-                        if let Err(error) = self.commit_ip_data(entry.peer, packet).await {
-                            debug!(
-                                debug_marker = "vela-udp",
-                                error = %error,
-                                source = %entry.source,
-                                "dropping invalid Vela data packet"
-                            );
-                        }
-                    }
+                    Ok(packet) => decrypted.push((entry.peer, packet)),
                     Err(error) => {
                         entry
                             .peer
@@ -2947,7 +3016,7 @@ impl Inner {
                 }
             }
         }
-        Ok(())
+        self.commit_ip_data_batch(decrypted).await
     }
 
     async fn data_loop(self: Arc<Self>, mut receiver: DataReceiver) {
@@ -2964,13 +3033,15 @@ impl Inner {
             if received == 0 {
                 break;
             }
+            let now = unix_time();
+            let snapshot_expired = now >= self.snapshot_expires_at.load(Ordering::Acquire);
             if received == 1 {
                 let packet = batch.pop().expect("recv_many returned one packet");
                 let source = packet.source;
                 self.receive
                     .worker_data_datagrams
                     .fetch_add(1, Ordering::Relaxed);
-                if unix_time() >= self.snapshot_expires_at.load(Ordering::Acquire) {
+                if snapshot_expired {
                     debug!(
                         debug_marker = "vela-udp",
                         %source,
@@ -2978,7 +3049,7 @@ impl Inner {
                     );
                     continue;
                 }
-                if let Err(error) = self.decrypt_data_inline(packet).await {
+                if let Err(error) = self.decrypt_data_inline_at(packet, now).await {
                     debug!(
                         debug_marker = "vela-udp",
                         error = %error,
@@ -2988,23 +3059,16 @@ impl Inner {
                 }
                 continue;
             }
-            let mut decrypt_packets = Vec::with_capacity(received);
-            for packet in batch.drain(..) {
-                let source = packet.source;
+            if snapshot_expired {
                 self.receive
                     .worker_data_datagrams
-                    .fetch_add(1, Ordering::Relaxed);
-                if unix_time() >= self.snapshot_expires_at.load(Ordering::Acquire) {
-                    debug!(
-                        debug_marker = "vela-udp",
-                        %source,
-                        "dropping Vela data packet because the snapshot expired"
-                    );
-                    continue;
-                }
-                decrypt_packets.push(packet);
+                    .fetch_add(received as u64, Ordering::Relaxed);
+                continue;
             }
-            match self.queue_data_decrypt_batch(decrypt_packets).await {
+            self.receive
+                .worker_data_datagrams
+                .fetch_add(received as u64, Ordering::Relaxed);
+            match self.queue_data_decrypt_batch(&mut batch, now).await {
                 Ok(Some(pending)) => {
                     // Each decrypt part returns results in input order. Commit
                     // parts in dispatch order so replay-window and IP/TCP
@@ -3834,6 +3898,152 @@ impl Inner {
         self.decrypt_data_inline(packet).await
     }
 
+    async fn commit_ip_data_batch(
+        &self,
+        packets: Vec<(Arc<PeerState>, DataPacket)>,
+    ) -> Result<(), CoreError> {
+        if packets.is_empty() {
+            return Ok(());
+        }
+
+        let mut parsed = Vec::with_capacity(packets.len());
+        for (peer, packet) in packets {
+            let source = packet.source;
+            let encrypted_len = packet.encrypted_len;
+            let wire_len = vela_proto::HEADER_LEN + encrypted_len;
+            let ip_packet = match IpPacket::parse(packet.payload.freeze()) {
+                Ok(packet) => packet,
+                Err(error) => {
+                    peer.receive
+                        .ip_parse_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        debug_marker = "vela-udp",
+                        error = %error,
+                        %source,
+                        "dropping invalid decrypted IP packet"
+                    );
+                    continue;
+                }
+            };
+            parsed.push((
+                peer,
+                packet.header,
+                source,
+                encrypted_len,
+                wire_len,
+                ip_packet,
+            ));
+        }
+
+        // Data workers are sharded by session id, so packets from one session
+        // stay ordered here. Hold the active-session lock once for each
+        // consecutive session run instead of once per packet.
+        let mut committed = Vec::with_capacity(parsed.len());
+        let mut start = 0;
+        while start < parsed.len() {
+            let peer = Arc::clone(&parsed[start].0);
+            let session_id = parsed[start].1.session_id;
+            let mut end = start + 1;
+            while end < parsed.len()
+                && Arc::ptr_eq(&parsed[end].0, &peer)
+                && parsed[end].1.session_id == session_id
+            {
+                end += 1;
+            }
+            let candidates = peer.candidates();
+            let mut active = peer.active.lock().await;
+            let Some(session) = active
+                .as_mut()
+                .filter(|session| session.session_id == session_id)
+            else {
+                start = end;
+                continue;
+            };
+            for (_, header, source, encrypted_len, wire_len, ip_packet) in parsed[start..end].iter()
+            {
+                if !session.replay.accept(header.sequence) {
+                    peer.receive.replay_drops.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                session.last_rx = Instant::now();
+                let path_changed = session.path != *source;
+                session.path = *source;
+                if path_changed {
+                    session.path_changed_at = Some(unix_time());
+                    peer.record_path(*source, &candidates);
+                }
+                session
+                    .rx_bytes
+                    .fetch_add(*encrypted_len as u64, Ordering::Relaxed);
+                committed.push((
+                    Arc::clone(&peer),
+                    *source,
+                    *encrypted_len,
+                    *wire_len,
+                    ip_packet.clone(),
+                    path_changed,
+                ));
+            }
+            drop(active);
+            start = end;
+        }
+
+        // Local-address membership changes only with a snapshot. One route
+        // guard covers the whole receive batch and is released before events
+        // are delivered to the runtime.
+        let routes = self.routes.read().await;
+        let mut accepted = Vec::with_capacity(committed.len());
+        for (peer, source, encrypted_len, wire_len, ip_packet, path_changed) in committed {
+            let destination = ip_packet.destination();
+            if !routes.is_local(destination) {
+                peer.receive
+                    .invalid_destinations
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            accepted.push((
+                peer,
+                source,
+                encrypted_len,
+                wire_len,
+                ip_packet,
+                path_changed,
+            ));
+        }
+        drop(routes);
+
+        for (peer, source, encrypted_len, wire_len, ip_packet, path_changed) in accepted {
+            let peer_id = peer.node_id();
+            peer.receive
+                .accepted_ip_packets
+                .fetch_add(1, Ordering::Relaxed);
+            self.observe(TrafficSample {
+                peer: Some(peer_id),
+                direction: TrafficDirection::Received,
+                path: source,
+                payload_bytes: ip_packet.as_bytes().len(),
+                encrypted_bytes: encrypted_len,
+                wire_bytes: wire_len,
+            });
+            if path_changed {
+                self.emit(VelaEvent::PathChanged(peer_id, source)).await;
+            }
+            if !self
+                .emit(VelaEvent::IpPacket {
+                    peer: peer_id,
+                    packet: ip_packet,
+                })
+                .await
+            {
+                peer.receive
+                    .event_queue_drops
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+
     async fn commit_ip_data(
         &self,
         peer: Arc<PeerState>,
@@ -4078,37 +4288,68 @@ impl Inner {
             }
         };
         if let (Some(session_id), Some(path), Some(cipher)) = (session_id, path, cipher) {
-            for (index, sequence) in valid_indices.into_iter().zip(sequences) {
-                let packet = &packets[index];
-                let packet_len = packet.as_bytes().len();
-                let encrypted_len = packet_len + 16;
-                let prepared = Header::new(PacketType::Data, session_id, sequence, encrypted_len)
-                    .map_err(SendError::Protocol)
-                    .and_then(|header| {
-                        let aad = encoded_header(&header);
-                        let mut wire_packet =
-                            BytesMut::with_capacity(vela_proto::HEADER_LEN + encrypted_len);
-                        header.encode(&mut wire_packet);
-                        wire_packet.extend_from_slice(packet.as_bytes());
-                        let tag = cipher
-                            .encrypt_in_place_detached(
-                                sequence,
-                                &aad,
-                                &mut wire_packet[vela_proto::HEADER_LEN..],
-                            )
-                            .map_err(SendError::Crypto)?;
-                        wire_packet.extend_from_slice(&tag);
-                        Ok(PreparedDataPacket {
-                            peer: Arc::clone(peer),
-                            peer_id,
-                            session_id,
-                            sequence,
-                            path,
-                            packet_len,
-                            wire_packet: wire_packet.freeze(),
-                        })
-                    });
-                results[index] = Some(prepared.map(Some));
+            let work = valid_indices
+                .into_iter()
+                .zip(sequences)
+                .map(|(index, sequence)| (index, sequence, packets[index].clone()))
+                .collect::<Vec<_>>();
+            if work.len() >= DATA_ENCRYPT_PARALLEL_THRESHOLD && data_worker_count() > 1 {
+                let worker_count = DATA_ENCRYPT_MAX_WORKERS
+                    .min(data_worker_count())
+                    .min(work.len());
+                let chunk_size = work.len().div_ceil(worker_count);
+                let mut tasks = Vec::with_capacity(worker_count);
+                for chunk in work.chunks(chunk_size) {
+                    let chunk = chunk.to_vec();
+                    let peer = Arc::clone(peer);
+                    let cipher = cipher.clone();
+                    tasks.push(tokio::task::spawn_blocking(move || {
+                        chunk
+                            .into_iter()
+                            .map(|(index, sequence, packet)| {
+                                let prepared = prepare_encrypted_data_packet(
+                                    Arc::clone(&peer),
+                                    peer_id,
+                                    session_id,
+                                    path,
+                                    &cipher,
+                                    sequence,
+                                    packet,
+                                );
+                                (index, prepared)
+                            })
+                            .collect::<Vec<_>>()
+                    }));
+                }
+                for task in tasks {
+                    match task.await {
+                        Ok(prepared) => {
+                            for (index, prepared) in prepared {
+                                results[index] = Some(prepared.map(Some));
+                            }
+                        }
+                        Err(error) => {
+                            let message = format!("data encryption worker failed: {error}");
+                            for result in results.iter_mut().filter(|result| result.is_none()) {
+                                *result =
+                                    Some(Err(SendError::Io(io::Error::other(message.clone()))));
+                            }
+                        }
+                    }
+                }
+            } else {
+                for (index, sequence, packet) in work {
+                    let prepared = prepare_encrypted_data_packet(
+                        Arc::clone(peer),
+                        peer_id,
+                        session_id,
+                        path,
+                        &cipher,
+                        sequence,
+                        packet,
+                    );
+                    results[index] = Some(prepared.map(Some));
+                }
             }
         }
         results
@@ -4748,6 +4989,10 @@ impl PeerState {
 
     fn membership_expired(&self) -> bool {
         unix_time() >= self.membership_expires_at.load(Ordering::Acquire)
+    }
+
+    fn membership_expired_at(&self, now: u64) -> bool {
+        now >= self.membership_expires_at.load(Ordering::Acquire)
     }
 
     fn update_info(&self, info: PeerInfo, server_public_key: Option<[u8; 32]>) {
