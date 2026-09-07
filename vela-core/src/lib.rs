@@ -4160,8 +4160,14 @@ impl Inner {
                     return Err(CoreError::InvalidMtuProbe);
                 }
                 let nonce = &plaintext[..MTU_PROBE_NONCE_LEN];
+                let local_max_mtu = u16::try_from(self.config.virtual_mtu)
+                    .unwrap_or(u16::MAX)
+                    .to_be_bytes();
+                let mut ack = [0u8; MTU_PROBE_NONCE_LEN + 2];
+                ack[..MTU_PROBE_NONCE_LEN].copy_from_slice(nonce);
+                ack[MTU_PROBE_NONCE_LEN..].copy_from_slice(&local_max_mtu);
                 let sequence = session.tx_sequence.fetch_add(1, Ordering::Relaxed);
-                let encrypted = encrypt_payload(session, PacketType::MtuProbeAck, sequence, nonce)?;
+                let encrypted = encrypt_payload(session, PacketType::MtuProbeAck, sequence, &ack)?;
                 response = Some((
                     PacketType::MtuProbeAck,
                     session.path,
@@ -4171,10 +4177,18 @@ impl Inner {
                 ));
             }
             PacketType::MtuProbeAck => {
-                if plaintext.len() != MTU_PROBE_NONCE_LEN {
+                if plaintext.len() != MTU_PROBE_NONCE_LEN + 2 {
                     return Err(CoreError::InvalidMtuProbe);
                 }
-                if let Some(mtu) = session.path_mtu.acknowledge(&plaintext) {
+                let peer_max_mtu = usize::from(u16::from_be_bytes(
+                    plaintext[MTU_PROBE_NONCE_LEN..]
+                        .try_into()
+                        .expect("MTU ACK length checked"),
+                ));
+                if let Some(mtu) = session
+                    .path_mtu
+                    .acknowledge(&plaintext[..MTU_PROBE_NONCE_LEN], peer_max_mtu)
+                {
                     debug!(
                         debug_marker = "vela-mtu",
                         peer_id = %peer_info.node_id,
@@ -5523,19 +5537,30 @@ impl PathMtuState {
         Some((target, nonce))
     }
 
-    fn acknowledge(&mut self, nonce: &[u8]) -> Option<usize> {
+    fn acknowledge(&mut self, nonce: &[u8], peer_max_mtu: usize) -> Option<usize> {
         let pending = self.pending?;
         if nonce != pending.nonce {
             return None;
         }
         let previous = self.confirmed;
-        self.confirmed = self.confirmed.max(pending.target);
         self.pending = None;
-        self.next = if self.confirmed < self.upper {
-            Some((self.confirmed + MTU_PROBE_STEP).min(self.upper))
+
+        if peer_max_mtu < pending.target {
+            // The oversized probe itself reached the peer, so the network path
+            // can carry at least `pending.target`; the peer's configured MTU is
+            // therefore the limiting factor. Clamp exactly to that advertised
+            // ceiling instead of approximating it through probe timeouts.
+            self.upper = self.upper.min(peer_max_mtu);
+            self.confirmed = peer_max_mtu.min(self.upper);
+            self.next = None;
         } else {
-            None
-        };
+            self.confirmed = self.confirmed.max(pending.target);
+            self.next = if self.confirmed < self.upper {
+                Some((self.confirmed + MTU_PROBE_STEP).min(self.upper))
+            } else {
+                None
+            };
+        }
         (self.confirmed != previous).then_some(self.confirmed)
     }
 }
@@ -6500,6 +6525,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn path_mtu_respects_both_peers_configured_maximum() {
+        let identity_a = Identity::generate();
+        let identity_b = Identity::generate();
+        let address_a: SocketAddr = "127.0.0.1:45141".parse().unwrap();
+        let address_b: SocketAddr = "127.0.0.1:45142".parse().unwrap();
+        let virtual_a = Ipv4Addr::new(10, 254, 0, 41);
+        let virtual_b = Ipv4Addr::new(10, 254, 0, 42);
+
+        let node_a = VelaNode::builder()
+            .identity(identity_a.clone())
+            .incarnation(1)
+            .datagram_provider(Arc::new(TokioDatagramProvider::new(vec![Candidate::Host(
+                address_a,
+            )])))
+            .config(NodeConfig {
+                bind: BindOptions {
+                    port: address_a.port(),
+                },
+                connect_timeout: Duration::from_secs(2),
+                virtual_ipv4: Some(virtual_a),
+                virtual_mtu: DEFAULT_MAX_VIRTUAL_MTU,
+                max_payload_size: DEFAULT_MAX_VIRTUAL_MTU,
+                ..NodeConfig::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let node_b = VelaNode::builder()
+            .identity(identity_b.clone())
+            .incarnation(2)
+            .datagram_provider(Arc::new(TokioDatagramProvider::new(vec![Candidate::Host(
+                address_b,
+            )])))
+            .config(NodeConfig {
+                bind: BindOptions {
+                    port: address_b.port(),
+                },
+                connect_timeout: Duration::from_secs(2),
+                virtual_ipv4: Some(virtual_b),
+                virtual_mtu: 1200,
+                max_payload_size: 1200,
+                ..NodeConfig::default()
+            })
+            .build()
+            .await
+            .unwrap();
+
+        node_a
+            .register_peer(peer_info(&identity_b, 2, address_b, virtual_b))
+            .await
+            .unwrap();
+        node_b
+            .register_peer(peer_info(&identity_a, 1, address_a, virtual_a))
+            .await
+            .unwrap();
+        node_a.start().await.unwrap();
+        node_b.start().await.unwrap();
+
+        let (result_a, result_b) = tokio::join!(
+            node_a.connect(node_b.node_id()),
+            node_b.connect(node_a.node_id())
+        );
+        result_a.unwrap();
+        result_b.unwrap();
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let a_mtu = node_a
+                    .peer_statuses()
+                    .await
+                    .into_iter()
+                    .find(|status| status.node_id == node_b.node_id())
+                    .and_then(|status| status.path_mtu);
+                let b_mtu = node_b
+                    .peer_statuses()
+                    .await
+                    .into_iter()
+                    .find(|status| status.node_id == node_a.node_id())
+                    .and_then(|status| status.path_mtu);
+                if a_mtu == Some(1200) && b_mtu == Some(1200) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("path MTU discovery did not respect the lower peer maximum");
+
+        assert_eq!(node_a.effective_virtual_mtu().await, 1200);
+        assert_eq!(node_b.effective_virtual_mtu().await, 1200);
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn repeated_connection_notifications_are_coalesced_until_retry() {
         let identity = Identity::generate();
         let remote = Identity::generate();
@@ -6966,7 +7087,10 @@ mod tests {
         let started = Instant::now();
         let (first_target, first_nonce) = state.poll_probe(started).unwrap();
         assert_eq!(first_target, DEFAULT_VIRTUAL_MTU + MTU_PROBE_STEP);
-        assert_eq!(state.acknowledge(&first_nonce), Some(first_target));
+        assert_eq!(
+            state.acknowledge(&first_nonce, DEFAULT_MAX_VIRTUAL_MTU),
+            Some(first_target)
+        );
 
         let (failed_target, _) = state
             .poll_probe(started + Duration::from_millis(1))
