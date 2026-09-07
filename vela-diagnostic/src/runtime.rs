@@ -158,6 +158,7 @@ impl RuntimeHandle {
 pub struct RuntimeIo {
     pub packets: mpsc::Receiver<(NodeId, vela_ip::IpPacket)>,
     pub snapshots: watch::Receiver<Option<NetworkSnapshot>>,
+    pub mtu: watch::Receiver<usize>,
 }
 
 pub struct RuntimeProcess {
@@ -172,6 +173,7 @@ pub struct DiagnosticRuntime {
     commands: mpsc::Receiver<RuntimeCommand>,
     packet_tx: mpsc::Sender<(NodeId, vela_ip::IpPacket)>,
     snapshot_tx: watch::Sender<Option<NetworkSnapshot>>,
+    mtu_tx: watch::Sender<usize>,
     ping_limit: Arc<Semaphore>,
     connections: JoinSet<()>,
     pings: JoinSet<()>,
@@ -239,6 +241,8 @@ impl DiagnosticRuntime {
         let tun_packet_queue_drops = Arc::new(AtomicU64::new(0));
         let snapshot_expired_notified = Arc::new(AtomicBool::new(false));
         let (snapshot_tx, snapshot_rx) = watch::channel(peer.state.snapshot.clone());
+        let initial_mtu = peer.node.effective_virtual_mtu().await;
+        let (mtu_tx, mtu_rx) = watch::channel(initial_mtu);
         let stop = Arc::new(Notify::new());
         let control = match LocalControlServer::start_with_lock(
             &peer.state_dir,
@@ -272,6 +276,7 @@ impl DiagnosticRuntime {
             commands: command_rx,
             packet_tx,
             snapshot_tx,
+            mtu_tx,
             ping_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_PINGS)),
             connections: JoinSet::new(),
             pings: JoinSet::new(),
@@ -286,6 +291,7 @@ impl DiagnosticRuntime {
             io: RuntimeIo {
                 packets: packet_rx,
                 snapshots: snapshot_rx,
+                mtu: mtu_rx,
             },
             task,
         })
@@ -333,6 +339,9 @@ impl DiagnosticRuntime {
         let mut reconnect_backoff = Duration::from_secs(1);
         let mut reconnect_sleep = Box::pin(tokio::time::sleep(Duration::ZERO));
         let mut event_batch = Vec::with_capacity(64);
+        let initial_mtu = self.peer.node.effective_virtual_mtu().await;
+        self.peer.client.update_runtime_status(initial_mtu).await?;
+        let mut last_reported_mtu = Some(initial_mtu);
 
         loop {
             tokio::select! {
@@ -455,6 +464,9 @@ impl DiagnosticRuntime {
                             control_connected = true;
                             dashboard_error = None;
                             reconnect_backoff = Duration::from_secs(1);
+                            let mtu = self.peer.node.effective_virtual_mtu().await;
+                            self.peer.client.update_runtime_status(mtu).await?;
+                            last_reported_mtu = Some(mtu);
                             while let Some(peer_id) = pending_reconnects.iter().next().copied() {
                                 if let Err(error) = self.peer.request_peer_connection(peer_id).await {
                                     if !DiagnosticPeer::is_retryable_control_error(&error) {
@@ -560,12 +572,33 @@ impl DiagnosticRuntime {
                                 info!(peer_id = %peer_id, path = %path, "peer path changed");
                                 true
                             }
+                            VelaEvent::PathMtuChanged { peer, path, mtu } => {
+                                info!(peer_id = %peer, path = %path, mtu, "peer path MTU changed");
+                                true
+                            }
                             VelaEvent::TransportFailed { family, error } => {
                                 return Err(DiagnosticError::TransportFailed { family, error });
                             }
                         };
                     }
                     if publish_state {
+                        let mtu = self.peer.node.effective_virtual_mtu().await;
+                        self.mtu_tx.send_replace(mtu);
+                        if control_connected && last_reported_mtu != Some(mtu) {
+                            if let Err(error) = self.peer.client.update_runtime_status(mtu).await {
+                                let error = DiagnosticError::Coordination(error);
+                                if !DiagnosticPeer::is_retryable_control_error(&error) {
+                                    return Err(error);
+                                }
+                                dashboard_error = Some(error.to_string());
+                                control_connected = false;
+                                reconnect_sleep.as_mut().reset(
+                                    tokio::time::Instant::now() + reconnect_backoff,
+                                );
+                            } else {
+                                last_reported_mtu = Some(mtu);
+                            }
+                        }
                         self.publish_state(
                             control_connected,
                             &dashboard_peers,

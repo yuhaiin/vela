@@ -61,10 +61,16 @@ struct ServerInner {
     pub(crate) signer: ServerSigner,
     pub(crate) database: Mutex<Connection>,
     pub(crate) online: AsyncMutex<HashMap<NodeId, HashMap<u64, ClientOutbound>>>,
+    pub(crate) runtime_status: AsyncMutex<HashMap<NodeId, HashMap<u64, PeerRuntimeStatus>>>,
     pub(crate) snapshot_generation: std::sync::atomic::AtomicU64,
     snapshot_broadcast: AsyncMutex<SnapshotBroadcastState>,
     pub(crate) network_config: Mutex<ServerNetworkConfig>,
     pub(crate) admin: admin::AdminAuth,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PeerRuntimeStatus {
+    pub(crate) virtual_mtu: u16,
 }
 
 #[derive(Clone)]
@@ -254,6 +260,7 @@ impl CoordServer {
                 signer: ServerSigner::load_or_generate(signer_path)?,
                 database: Mutex::new(connection),
                 online: AsyncMutex::new(HashMap::new()),
+                runtime_status: AsyncMutex::new(HashMap::new()),
                 snapshot_generation: std::sync::atomic::AtomicU64::new(snapshot_generation),
                 snapshot_broadcast: AsyncMutex::new(SnapshotBroadcastState::default()),
                 network_config: Mutex::new(network_config),
@@ -476,6 +483,15 @@ async fn handle_socket(state: Arc<ServerInner>, socket: WebSocket) {
                 false
             }
         };
+        {
+            let mut runtime_status = state.runtime_status.lock().await;
+            if let Some(sessions) = runtime_status.get_mut(&node_id) {
+                sessions.remove(&connection_id);
+                if sessions.is_empty() {
+                    runtime_status.remove(&node_id);
+                }
+            }
+        }
         if became_offline && bump_snapshot(&state).is_ok() {
             let _ = broadcast_snapshot(&state).await;
         }
@@ -640,6 +656,17 @@ async fn handle_message(
                     .await
                     .map_err(|_| CoordError::ConnectionClosed)?;
             }
+            Ok(registered)
+        }
+        ControlMessage::RuntimeStatus { virtual_mtu } => {
+            let node_id = registered.ok_or(CoordError::NotRegistered)?;
+            state
+                .runtime_status
+                .lock()
+                .await
+                .entry(node_id)
+                .or_default()
+                .insert(connection_id, PeerRuntimeStatus { virtual_mtu });
             Ok(registered)
         }
         ControlMessage::RequestSnapshot => {

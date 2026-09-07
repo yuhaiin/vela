@@ -24,7 +24,8 @@ coord_bin="$target_dir/examples/e2e_bench"
 cli_bin="$target_dir/vela-cli"
 tcp_bin="$target_dir/examples/tun_tcp_bench"
 bench_bytes="${BENCH_BYTES:-1073741824}"
-tun_mtu="${TUN_MTU:-1200}"
+tun_mtu="${TUN_MTU:-1430}"
+network_mtu="${NETWORK_MTU:-1500}"
 server_name="${network}-server"
 peer_a_name="${network}-peer-a"
 peer_b_name="${network}-peer-b"
@@ -45,6 +46,10 @@ if [[ ! "$tun_mtu" =~ ^[0-9]+$ || "$tun_mtu" -lt 576 ]]; then
     echo "TUN_MTU must be an integer of at least 576" >&2
     exit 2
 fi
+if [[ ! "$network_mtu" =~ ^[0-9]+$ || "$network_mtu" -lt 576 ]]; then
+    echo "NETWORK_MTU must be an integer of at least 576" >&2
+    exit 2
+fi
 
 refresh_peer_logs() {
     podman logs "$peer_a_name" >"$run_dir/peer-a.log" 2>&1 || true
@@ -57,7 +62,7 @@ cargo build "${build_args[@]}" \
     -p vela-cli --example tun_tcp_bench
 fallocate -l "$bench_bytes" "$file_path"
 
-podman network create --subnet 10.253.0.0/24 --gateway 10.253.0.1 "$network" >/dev/null
+podman network create --subnet 10.253.0.0/24 --gateway 10.253.0.1 --opt "mtu=$network_mtu" "$network" >/dev/null
 
 podman run -d --name "$server_name" --network "$network" --ip 10.253.0.2 \
     -v "$run_dir:/bench" -v "$coord_bin:/usr/local/bin/vela-e2e:ro" "$image" \
@@ -151,7 +156,7 @@ read_tcp_retransmits() {
 
 tcp_retransmits_before=$(read_tcp_retransmits "$peer_a_name")
 tcp_retransmits_before_remote=$(read_tcp_retransmits "$peer_b_name")
-echo "tun_tcp_benchmark local_ip=$a_ip remote_ip=$b_ip mtu=$tun_mtu bytes=$bench_bytes"
+echo "tun_tcp_benchmark local_ip=$a_ip remote_ip=$b_ip max_mtu=$tun_mtu network_mtu=$network_mtu bytes=$bench_bytes"
 client_result=$(podman exec "$peer_a_name" /usr/local/bin/tun_tcp_bench client \
     --connect "$b_ip:41000" --bytes "$bench_bytes")
 printf '%s\n' "$client_result"

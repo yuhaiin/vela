@@ -180,6 +180,8 @@ pub enum PacketType {
     DiagnosticPing = 6,
     DiagnosticPong = 7,
     KeepAliveAck = 8,
+    MtuProbe = 9,
+    MtuProbeAck = 10,
 }
 
 impl TryFrom<u8> for PacketType {
@@ -195,6 +197,8 @@ impl TryFrom<u8> for PacketType {
             6 => Ok(Self::DiagnosticPing),
             7 => Ok(Self::DiagnosticPong),
             8 => Ok(Self::KeepAliveAck),
+            9 => Ok(Self::MtuProbe),
+            10 => Ok(Self::MtuProbeAck),
             _ => Err(ProtoError::UnknownPacketType(value)),
         }
     }
@@ -670,6 +674,11 @@ pub enum ControlMessage {
     },
     UpdateCandidates {
         candidates: Vec<Candidate>,
+    },
+    /// Ephemeral runtime state reported by an online peer. This is not part
+    /// of the signed network snapshot and is not persisted by the coordinator.
+    RuntimeStatus {
+        virtual_mtu: u16,
     },
     /// Requests the current signed network snapshot without changing the
     /// snapshot generation or broadcasting it to other peers.

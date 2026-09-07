@@ -102,8 +102,8 @@
           <span id="peer-count" class="text-sm text-slate-500"></span>
         </div>
         <div class="mt-4 overflow-x-auto">
-          <table class="w-full min-w-[62rem] text-left text-sm">
-            <thead class="border-b border-slate-800 text-xs uppercase text-slate-500"><tr><th class="px-2 py-2">Name</th><th class="px-2 py-2">Node ID</th><th class="px-2 py-2">Address</th><th class="px-2 py-2">Status</th><th class="px-2 py-2">Last seen</th><th class="px-2 py-2"></th></tr></thead>
+          <table class="w-full min-w-[66rem] text-left text-sm">
+            <thead class="border-b border-slate-800 text-xs uppercase text-slate-500"><tr><th class="px-2 py-2">Name</th><th class="px-2 py-2">Node ID</th><th class="px-2 py-2">Address</th><th class="px-2 py-2">Status</th><th class="px-2 py-2">MTU</th><th class="px-2 py-2">Last seen</th><th class="px-2 py-2"></th></tr></thead>
             <tbody id="peers" class="divide-y divide-slate-800"></tbody>
           </table>
         </div>
@@ -211,15 +211,17 @@
       <td class="break-all px-2 py-3 font-mono text-xs">${esc(peer.node_id)}</td>
       <td class="px-2 py-3 font-mono"><div>${esc(peer.virtual_ipv4 || '—')}</div><div class="break-all text-xs text-slate-500">${esc(peer.virtual_ipv6 || '')}</div></td>
       <td class="px-2 py-3"><span class="rounded-full px-2 py-1 text-xs ${peer.status === 'online' ? 'bg-emerald-950 text-emerald-300' : peer.status === 'revoked' ? 'bg-red-950 text-red-300' : 'bg-slate-800 text-slate-400'}">${esc(peer.status)}</span></td>
+      <td class="px-2 py-3 font-mono text-sm">${esc(peer.mtu ?? '—')}</td>
       <td class="px-2 py-3 text-xs text-slate-400">${esc(time(peer.last_seen))}</td>
       <td class="whitespace-nowrap px-2 py-3 text-right"><button data-action="details" data-node="${esc(peer.node_id)}" aria-expanded="${expanded}" class="mr-2 text-cyan-400 hover:text-cyan-300">${expanded ? 'Hide details' : 'Details'}</button><button data-action="edit" data-node="${esc(peer.node_id)}" data-name="${esc(peer.name)}" data-notes="${esc(peer.notes)}" class="mr-2 text-cyan-400 hover:text-cyan-300">Edit</button>${peer.status !== 'revoked' ? `<button data-action="revoke" data-node="${esc(peer.node_id)}" class="mr-2 text-amber-400 hover:text-amber-300">Revoke</button>` : ''}<button data-action="delete" data-node="${esc(peer.node_id)}" class="text-red-400 hover:text-red-300">Delete permanently</button></td>
     </tr>
     <tr data-details-for="${esc(peer.node_id)}" class="${expanded ? '' : 'hidden'} bg-slate-950/50">
-      <td colspan="6" class="px-4 py-4">
+      <td colspan="7" class="px-4 py-4">
         <dl class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           <div><dt class="text-xs uppercase text-slate-500">Virtual IPv4</dt><dd class="mt-1 font-mono text-sm text-slate-200">${esc(peer.virtual_ipv4 || '—')}</dd></div>
           <div><dt class="text-xs uppercase text-slate-500">Virtual IPv6</dt><dd class="mt-1 break-all font-mono text-sm text-slate-200">${esc(peer.virtual_ipv6 || '—')}</dd></div>
           <div><dt class="text-xs uppercase text-slate-500">Credential expires</dt><dd class="mt-1 text-sm text-slate-200">${esc(time(peer.credential_expires_at))}</dd></div>
+          <div><dt class="text-xs uppercase text-slate-500">Current MTU</dt><dd class="mt-1 font-mono text-sm text-slate-200">${esc(peer.mtu ?? '—')}</dd></div>
           <div class="sm:col-span-2 lg:col-span-3"><dt class="text-xs uppercase text-slate-500">Advertised candidates / local addresses</dt><dd class="mt-1">${candidateMarkup}</dd></div>
           <div><dt class="text-xs uppercase text-slate-500">Capabilities</dt><dd class="mt-1 text-sm text-slate-200">${esc(capabilities)}</dd></div>
           <div><dt class="text-xs uppercase text-slate-500">Last seen</dt><dd class="mt-1 text-sm text-slate-200">${esc(time(peer.last_seen))}</dd></div>

@@ -327,6 +327,49 @@ fn bind_socket_to_interface(
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn set_udp_dont_fragment(socket: &Socket, family: AddressFamily) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let value: libc::c_int = 1;
+    #[cfg(target_os = "linux")]
+    let (level, option, option_value) = match family {
+        AddressFamily::Ipv4 => (
+            libc::IPPROTO_IP,
+            libc::IP_MTU_DISCOVER,
+            libc::IP_PMTUDISC_DO,
+        ),
+        AddressFamily::Ipv6 => (
+            libc::IPPROTO_IPV6,
+            libc::IPV6_MTU_DISCOVER,
+            libc::IPV6_PMTUDISC_DO,
+        ),
+    };
+    #[cfg(target_os = "macos")]
+    let (level, option, option_value) = match family {
+        AddressFamily::Ipv4 => (libc::IPPROTO_IP, libc::IP_DONTFRAG, value),
+        AddressFamily::Ipv6 => (libc::IPPROTO_IPV6, libc::IPV6_DONTFRAG, value),
+    };
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            level,
+            option,
+            (&option_value as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn set_udp_dont_fragment(_socket: &Socket, _family: AddressFamily) -> io::Result<()> {
+    Ok(())
+}
+
 fn bind_udp_socket(
     family: AddressFamily,
     port: u16,
@@ -341,6 +384,11 @@ fn bind_udp_socket(
         Some(Protocol::UDP),
     )
     .map_err(|source| CoreError::DatagramBind {
+        family,
+        port,
+        source,
+    })?;
+    set_udp_dont_fragment(&socket, family).map_err(|source| CoreError::DatagramBind {
         family,
         port,
         source,
@@ -1377,8 +1425,15 @@ const DATA_DECRYPT_BATCH_SIZE: usize = 16;
 const DATA_DECRYPT_BATCH_QUEUE_LIMIT: usize = DATA_DECRYPT_QUEUE_LIMIT / DATA_DECRYPT_BATCH_SIZE;
 const CORE_EVENT_QUEUE_LIMIT: usize = 4096;
 pub const DEFAULT_VIRTUAL_MTU: usize = 1190;
+pub const DEFAULT_MAX_VIRTUAL_MTU: usize = 1430;
 const DATA_WORKER_MIN: usize = 4;
 const DATA_WORKER_MAX: usize = 16;
+const MTU_PROBE_NONCE_LEN: usize = 16;
+const MTU_PROBE_INTERVAL: Duration = Duration::from_millis(200);
+const MTU_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+const MTU_PROBE_STEP: usize = 64;
+const MTU_PROBE_MAX_FAILURES: u8 = 3;
+const MTU_PROBE_MIN_GAIN: usize = 8;
 
 struct DataPacket {
     header: Header,
@@ -1472,7 +1527,7 @@ impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             bind: BindOptions::default(),
-            max_payload_size: DEFAULT_VIRTUAL_MTU,
+            max_payload_size: DEFAULT_MAX_VIRTUAL_MTU,
             per_peer_queue_limit: 256,
             keepalive_interval: Duration::from_secs(20),
             connect_timeout: Duration::from_secs(8),
@@ -1482,7 +1537,7 @@ impl Default for NodeConfig {
             network_id: [0; 16],
             virtual_ipv4: None,
             virtual_ipv6: None,
-            virtual_mtu: DEFAULT_VIRTUAL_MTU,
+            virtual_mtu: DEFAULT_MAX_VIRTUAL_MTU,
         }
     }
 }
@@ -1678,6 +1733,10 @@ impl VelaNode {
         let maintenance = tokio::spawn(async move {
             maintenance.keepalive_loop().await;
         });
+        let mtu = Arc::clone(&self.inner);
+        let mtu = tokio::spawn(async move {
+            mtu.mtu_loop().await;
+        });
         let data_receivers = self
             .inner
             .data_receivers
@@ -1692,7 +1751,7 @@ impl VelaNode {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
             .unwrap_or_default();
-        let mut new_tasks = vec![reader, maintenance];
+        let mut new_tasks = vec![reader, maintenance, mtu];
         for receiver in data_decrypt_receivers {
             let worker = Arc::clone(&self.inner);
             new_tasks.push(tokio::spawn(async move {
@@ -2550,6 +2609,30 @@ impl VelaNode {
         events.len()
     }
 
+    pub async fn effective_virtual_mtu(&self) -> usize {
+        let peers = self
+            .inner
+            .peers
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut effective = None;
+        for peer in peers {
+            if let Some(session) = peer.active.lock().await.as_ref() {
+                effective = Some(effective.map_or(session.path_mtu.confirmed, |mtu: usize| {
+                    mtu.min(session.path_mtu.confirmed)
+                }));
+            }
+        }
+        effective.unwrap_or_else(|| self.inner.safe_virtual_mtu())
+    }
+
+    pub fn maximum_virtual_mtu(&self) -> usize {
+        self.inner.config.virtual_mtu
+    }
+
     /// Returns counters for the receive pipeline. These counters are
     /// intentionally separate from per-peer payload bytes so a dashboard can
     /// tell whether loss happened before or after the data worker.
@@ -3226,6 +3309,47 @@ impl Inner {
         }
     }
 
+    fn safe_virtual_mtu(&self) -> usize {
+        self.config.virtual_mtu.min(DEFAULT_VIRTUAL_MTU)
+    }
+
+    async fn mtu_loop(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(MTU_PROBE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = self.shutdown.notified() => break,
+                _ = interval.tick() => {
+                    if self.stopping.load(Ordering::Acquire) { break; }
+                    let peers = self.peers.lock().await.values().cloned().collect::<Vec<_>>();
+                    let mut probes = Vec::new();
+                    for peer in peers {
+                        let peer_id = peer.node_id();
+                        let mut active = peer.active.lock().await;
+                        let Some(session) = active.as_mut() else { continue; };
+                        let now = Instant::now();
+                        let probe = session.path_mtu.poll_probe(now);
+                        let Some((target_mtu, nonce)) = probe else { continue; };
+                        if target_mtu < MTU_PROBE_NONCE_LEN { continue; }
+                        let mut plaintext = vec![0u8; target_mtu];
+                        plaintext[..MTU_PROBE_NONCE_LEN].copy_from_slice(&nonce);
+                        let sequence = session.tx_sequence.fetch_add(1, Ordering::Relaxed);
+                        match encrypt_payload(session, PacketType::MtuProbe, sequence, &plaintext) {
+                            Ok(payload) => probes.push((peer_id, session.path, session.session_id, sequence, target_mtu, payload)),
+                            Err(error) => debug!(debug_marker = "vela-mtu", peer_id = %peer_id, error = %error, "failed to build MTU probe"),
+                        }
+                    }
+                    for (peer_id, path, session_id, sequence, target_mtu, payload) in probes {
+                        match self.send_packet(path, PacketType::MtuProbe, session_id, sequence, &payload).await {
+                            Ok(()) => debug!(debug_marker = "vela-mtu", peer_id = %peer_id, path = %path, target_mtu, "sent path MTU probe"),
+                            Err(error) => debug!(debug_marker = "vela-mtu", peer_id = %peer_id, path = %path, target_mtu, error = %error, "path MTU probe send failed"),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     async fn keepalive_loop(self: Arc<Self>) {
         let mut interval = tokio::time::interval(self.config.keepalive_interval);
         let dead_after = self
@@ -3477,7 +3601,9 @@ impl Inner {
             | PacketType::KeepAlive
             | PacketType::KeepAliveAck
             | PacketType::DiagnosticPing
-            | PacketType::DiagnosticPong => self.handle_data(packet, source).await,
+            | PacketType::DiagnosticPong
+            | PacketType::MtuProbe
+            | PacketType::MtuProbeAck => self.handle_data(packet, source).await,
         }
     }
 
@@ -3909,16 +4035,28 @@ impl Inner {
         session.last_rx = Instant::now();
         let path_changed = session.path != source;
         session.path = source;
-        if path_changed {
+        let mtu_reset = if path_changed {
             session.path_changed_at = Some(unix_time());
             peer.record_path(source, &peer_info.candidates);
-        }
+            session
+                .path_mtu
+                .reset(self.safe_virtual_mtu(), self.config.virtual_mtu)
+        } else {
+            false
+        };
         session
             .rx_bytes
             .fetch_add(encrypted_len as u64, Ordering::Relaxed);
         let mut events = Vec::new();
         if path_changed {
             events.push(VelaEvent::PathChanged(peer_info.node_id, source));
+        }
+        if mtu_reset {
+            events.push(VelaEvent::PathMtuChanged {
+                peer: peer_info.node_id,
+                path: source,
+                mtu: self.safe_virtual_mtu(),
+            });
         }
         let mut response: Option<(PacketType, SocketAddr, u64, u64, Vec<u8>)> = None;
         match packet.header.packet_type {
@@ -4007,6 +4145,40 @@ impl Inner {
                     .expect("diagnostic nonce length checked");
                 if let Some(waiter) = session.ping_waiters.remove(&nonce) {
                     let _ = waiter.send(source);
+                }
+            }
+            PacketType::MtuProbe => {
+                if plaintext.len() < MTU_PROBE_NONCE_LEN {
+                    return Err(CoreError::InvalidMtuProbe);
+                }
+                let nonce = &plaintext[..MTU_PROBE_NONCE_LEN];
+                let sequence = session.tx_sequence.fetch_add(1, Ordering::Relaxed);
+                let encrypted = encrypt_payload(session, PacketType::MtuProbeAck, sequence, nonce)?;
+                response = Some((
+                    PacketType::MtuProbeAck,
+                    session.path,
+                    session.session_id,
+                    sequence,
+                    encrypted,
+                ));
+            }
+            PacketType::MtuProbeAck => {
+                if plaintext.len() != MTU_PROBE_NONCE_LEN {
+                    return Err(CoreError::InvalidMtuProbe);
+                }
+                if let Some(mtu) = session.path_mtu.acknowledge(&plaintext) {
+                    debug!(
+                        debug_marker = "vela-mtu",
+                        peer_id = %peer_info.node_id,
+                        path = %session.path,
+                        mtu,
+                        "path MTU probe acknowledged"
+                    );
+                    events.push(VelaEvent::PathMtuChanged {
+                        peer: peer_info.node_id,
+                        path: session.path,
+                        mtu,
+                    });
                 }
             }
             PacketType::Probe | PacketType::ProbeResponse | PacketType::Handshake => {
@@ -4099,10 +4271,15 @@ impl Inner {
                 session.last_rx = Instant::now();
                 let path_changed = session.path != *source;
                 session.path = *source;
-                if path_changed {
+                let mtu_reset = if path_changed {
                     session.path_changed_at = Some(unix_time());
                     peer.record_path(*source, &candidates);
-                }
+                    session
+                        .path_mtu
+                        .reset(self.safe_virtual_mtu(), self.config.virtual_mtu)
+                } else {
+                    false
+                };
                 session
                     .rx_bytes
                     .fetch_add(*encrypted_len as u64, Ordering::Relaxed);
@@ -4113,6 +4290,7 @@ impl Inner {
                     *wire_len,
                     ip_packet.clone(),
                     path_changed,
+                    mtu_reset,
                 ));
             }
             drop(active);
@@ -4124,7 +4302,8 @@ impl Inner {
         // are delivered to the runtime.
         let routes = self.routes.read().await;
         let mut accepted = Vec::with_capacity(committed.len());
-        for (peer, source, encrypted_len, wire_len, ip_packet, path_changed) in committed {
+        for (peer, source, encrypted_len, wire_len, ip_packet, path_changed, mtu_reset) in committed
+        {
             let destination = ip_packet.destination();
             if !routes.is_local(destination) {
                 peer.receive
@@ -4139,11 +4318,13 @@ impl Inner {
                 wire_len,
                 ip_packet,
                 path_changed,
+                mtu_reset,
             ));
         }
         drop(routes);
 
-        for (peer, source, encrypted_len, wire_len, ip_packet, path_changed) in accepted {
+        for (peer, source, encrypted_len, wire_len, ip_packet, path_changed, mtu_reset) in accepted
+        {
             let peer_id = peer.node_id();
             peer.receive
                 .accepted_ip_packets
@@ -4158,6 +4339,14 @@ impl Inner {
             });
             if path_changed {
                 self.emit(VelaEvent::PathChanged(peer_id, source)).await;
+            }
+            if mtu_reset {
+                self.emit(VelaEvent::PathMtuChanged {
+                    peer: peer_id,
+                    path: source,
+                    mtu: self.safe_virtual_mtu(),
+                })
+                .await;
             }
             if !self
                 .emit(VelaEvent::IpPacket {
@@ -4193,7 +4382,7 @@ impl Inner {
             }
         };
         let destination = ip_packet.destination();
-        let path_changed = {
+        let (path_changed, mtu_reset) = {
             let mut active = peer.active.lock().await;
             let Some(session) = active
                 .as_mut()
@@ -4208,15 +4397,20 @@ impl Inner {
             session.last_rx = Instant::now();
             let path_changed = session.path != source;
             session.path = source;
-            if path_changed {
+            let mtu_reset = if path_changed {
                 session.path_changed_at = Some(unix_time());
                 let candidates = peer.candidates();
                 peer.record_path(source, &candidates);
-            }
+                session
+                    .path_mtu
+                    .reset(self.safe_virtual_mtu(), self.config.virtual_mtu)
+            } else {
+                false
+            };
             session
                 .rx_bytes
                 .fetch_add(encrypted_len as u64, Ordering::Relaxed);
-            path_changed
+            (path_changed, mtu_reset)
         };
         if !self.routes.read().await.is_local(destination) {
             peer.receive
@@ -4239,6 +4433,14 @@ impl Inner {
         });
         if path_changed {
             self.emit(VelaEvent::PathChanged(peer_id, source)).await;
+        }
+        if mtu_reset {
+            self.emit(VelaEvent::PathMtuChanged {
+                peer: peer_id,
+                path: source,
+                mtu: self.safe_virtual_mtu(),
+            })
+            .await;
         }
         if !self
             .emit(VelaEvent::IpPacket {
@@ -4281,6 +4483,7 @@ impl Inner {
             last_rtt_ms: None,
             tx_bytes: AtomicU64::new(0),
             rx_bytes: AtomicU64::new(0),
+            path_mtu: PathMtuState::new(self.safe_virtual_mtu(), self.config.virtual_mtu),
         });
         drop(active);
         self.sessions
@@ -4386,6 +4589,15 @@ impl Inner {
         let (session_id, path, cipher, sequences) = {
             let mut active = peer.active.lock().await;
             if let Some(session) = active.as_mut() {
+                let mut session_indices = Vec::with_capacity(valid_indices.len());
+                for index in valid_indices {
+                    if packets[index].as_bytes().len() > session.path_mtu.confirmed {
+                        results[index] = Some(Err(SendError::PacketTooLarge));
+                    } else {
+                        session_indices.push(index);
+                    }
+                }
+                valid_indices = session_indices;
                 let sequences = valid_indices
                     .iter()
                     .map(|_| session.tx_sequence.fetch_add(1, Ordering::Relaxed))
@@ -5024,6 +5236,11 @@ pub enum VelaEvent {
     PeerReconnectRequested(NodeId),
     PeerUnreachable(NodeId),
     PathChanged(NodeId, SocketAddr),
+    PathMtuChanged {
+        peer: NodeId,
+        path: SocketAddr,
+        mtu: usize,
+    },
     TransportFailed {
         family: Option<AddressFamily>,
         error: String,
@@ -5232,6 +5449,92 @@ struct ActiveSession {
     last_rtt_ms: Option<u64>,
     tx_bytes: AtomicU64,
     rx_bytes: AtomicU64,
+    path_mtu: PathMtuState,
+}
+
+#[derive(Clone, Copy)]
+struct PendingMtuProbe {
+    target: usize,
+    nonce: [u8; MTU_PROBE_NONCE_LEN],
+    sent_at: Instant,
+    failures: u8,
+}
+
+struct PathMtuState {
+    confirmed: usize,
+    upper: usize,
+    next: Option<usize>,
+    pending: Option<PendingMtuProbe>,
+}
+
+impl PathMtuState {
+    fn new(base: usize, maximum: usize) -> Self {
+        let base = base.min(maximum);
+        let next = (base < maximum).then_some((base + MTU_PROBE_STEP).min(maximum));
+        Self {
+            confirmed: base,
+            upper: maximum,
+            next,
+            pending: None,
+        }
+    }
+
+    fn reset(&mut self, base: usize, maximum: usize) -> bool {
+        let previous = self.confirmed;
+        *self = Self::new(base, maximum);
+        self.confirmed != previous
+    }
+
+    fn poll_probe(&mut self, now: Instant) -> Option<(usize, [u8; MTU_PROBE_NONCE_LEN])> {
+        if let Some(mut pending) = self.pending {
+            if now.duration_since(pending.sent_at) < MTU_PROBE_TIMEOUT {
+                return None;
+            }
+            if pending.failures + 1 < MTU_PROBE_MAX_FAILURES {
+                pending.failures += 1;
+                pending.sent_at = now;
+                self.pending = Some(pending);
+                return Some((pending.target, pending.nonce));
+            }
+            self.upper = self.upper.min(pending.target.saturating_sub(1));
+            self.pending = None;
+            self.next = next_mtu_probe(self.confirmed, self.upper);
+        }
+        let target = self.next.take()?;
+        let mut nonce = [0u8; MTU_PROBE_NONCE_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        self.pending = Some(PendingMtuProbe {
+            target,
+            nonce,
+            sent_at: now,
+            failures: 0,
+        });
+        Some((target, nonce))
+    }
+
+    fn acknowledge(&mut self, nonce: &[u8]) -> Option<usize> {
+        let pending = self.pending?;
+        if nonce != pending.nonce {
+            return None;
+        }
+        let previous = self.confirmed;
+        self.confirmed = self.confirmed.max(pending.target);
+        self.pending = None;
+        self.next = if self.confirmed < self.upper {
+            Some((self.confirmed + MTU_PROBE_STEP).min(self.upper))
+        } else {
+            None
+        };
+        (self.confirmed != previous).then_some(self.confirmed)
+    }
+}
+
+fn next_mtu_probe(confirmed: usize, upper: usize) -> Option<usize> {
+    if upper <= confirmed + MTU_PROBE_MIN_GAIN {
+        return None;
+    }
+    let midpoint = confirmed + (upper - confirmed) / 2;
+    (midpoint > confirmed).then_some(midpoint)
 }
 
 const KEEPALIVE_NONCE_LEN: usize = 16;
@@ -5647,6 +5950,8 @@ pub enum CoreError {
     InvalidDiagnosticPing,
     #[error("invalid keepalive payload")]
     InvalidKeepAlive,
+    #[error("invalid path MTU probe payload")]
+    InvalidMtuProbe,
     #[error("network snapshot has expired")]
     SnapshotExpired,
     #[error("network snapshot belongs to a different network")]
@@ -6059,6 +6364,16 @@ mod tests {
         let (result_a, result_b) = tokio::join!(node_a.connect(b_id), node_b.connect(a_id));
         let handle_a = result_a.unwrap();
         result_b.unwrap();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if node_a.effective_virtual_mtu().await == DEFAULT_MAX_VIRTUAL_MTU {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("path MTU discovery did not reach the configured maximum");
         let diagnostic = handle_a
             .diagnostic_ping(3, Duration::from_secs(1))
             .await
@@ -6625,6 +6940,37 @@ mod tests {
         }
         packet[10..12].copy_from_slice(&(!(checksum as u16)).to_be_bytes());
         packet
+    }
+
+    #[test]
+    fn path_mtu_probe_grows_and_backs_off_after_repeated_loss() {
+        let mut state = PathMtuState::new(DEFAULT_VIRTUAL_MTU, DEFAULT_MAX_VIRTUAL_MTU);
+        let started = Instant::now();
+        let (first_target, first_nonce) = state.poll_probe(started).unwrap();
+        assert_eq!(first_target, DEFAULT_VIRTUAL_MTU + MTU_PROBE_STEP);
+        assert_eq!(state.acknowledge(&first_nonce), Some(first_target));
+
+        let (failed_target, _) = state
+            .poll_probe(started + Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(failed_target, first_target + MTU_PROBE_STEP);
+        assert!(
+            state
+                .poll_probe(started + MTU_PROBE_TIMEOUT + Duration::from_millis(1))
+                .is_some()
+        );
+        assert!(
+            state
+                .poll_probe(started + MTU_PROBE_TIMEOUT * 2 + Duration::from_millis(1))
+                .is_some()
+        );
+        let (backoff_target, _) = state
+            .poll_probe(started + MTU_PROBE_TIMEOUT * 3 + Duration::from_millis(1))
+            .unwrap();
+        assert!(backoff_target > first_target);
+        assert!(backoff_target < failed_target);
+        assert_eq!(state.confirmed, first_target);
+        assert!(state.upper < failed_target);
     }
 
     #[test]

@@ -102,7 +102,7 @@ cargo run -p vela-cli -- peer register \
   --port 0
 
 # `peer up` starts the only peer runtime, the TUN adapter, and the dashboard.
-cargo run -p vela-cli -- peer up --state ./peer-a --mtu 1190
+cargo run -p vela-cli -- peer up --state ./peer-a
 # The following commands connect to the already-running peer up service.
 cargo run -p vela-cli -- peer list --state ./peer-a --json
 cargo run -p vela-cli -- peer status --state ./peer-a --json
@@ -123,6 +123,12 @@ Creating an invite in the admin page produces a one-time download command for
 the same `vela-cli` executable, a peer registration command, and a TUN startup
 command. The CLI download is protected by its own `X-Vela-Download-Token` and
 does not expose the admin session token.
+
+`peer up` starts the TUN at a conservative MTU and automatically probes the
+encrypted peer path after a session is established. The default maximum virtual
+MTU is 1430; `--mtu` overrides that upper bound rather than forcing a fixed MTU.
+When the active path changes, Vela falls back to the conservative MTU and probes
+the new path again.
 
 `peer up` is a diagnostic peer process, not a server or relay. The
 coordination server only exchanges registration and candidate information;

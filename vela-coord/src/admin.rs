@@ -402,6 +402,7 @@ struct PeerView {
     capabilities: Vec<PeerCapability>,
     last_seen: Option<u64>,
     credential_expires_at: Option<u64>,
+    mtu: Option<u16>,
 }
 
 async fn list_peers(State(state): State<Arc<ServerInner>>, headers: HeaderMap) -> Response {
@@ -442,7 +443,14 @@ async fn admin_peers(state: &Arc<ServerInner>) -> Result<Vec<PeerView>, CoordErr
             })?
             .collect::<Result<Vec<_>, _>>()?
     };
-    let online = state.online.lock().await;
+    let online = state
+        .online
+        .lock()
+        .await
+        .keys()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let runtime_status = state.runtime_status.lock().await;
     rows.into_iter()
         .map(
             |(
@@ -485,7 +493,7 @@ async fn admin_peers(state: &Arc<ServerInner>) -> Result<Vec<PeerView>, CoordErr
                     notes,
                     status: if revoked != 0 {
                         "revoked"
-                    } else if online.contains_key(&node_id) {
+                    } else if online.contains(&node_id) {
                         "online"
                     } else {
                         "offline"
@@ -496,6 +504,9 @@ async fn admin_peers(state: &Arc<ServerInner>) -> Result<Vec<PeerView>, CoordErr
                     capabilities,
                     last_seen: (last_seen > 0).then_some(last_seen as u64),
                     credential_expires_at,
+                    mtu: runtime_status.get(&node_id).and_then(|sessions| {
+                        sessions.values().map(|status| status.virtual_mtu).min()
+                    }),
                 })
             },
         )

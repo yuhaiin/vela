@@ -144,7 +144,11 @@ struct PeerUpArgs {
     state: PathBuf,
     #[arg(long)]
     tun: Option<String>,
-    #[arg(long, default_value_t = vela_core::DEFAULT_VIRTUAL_MTU)]
+    #[arg(
+        long,
+        default_value_t = vela_core::DEFAULT_MAX_VIRTUAL_MTU,
+        help = "Maximum virtual MTU; Vela starts conservatively and discovers the usable path MTU automatically"
+    )]
     mtu: usize,
     #[arg(long, default_value = "127.0.0.1:7001")]
     bind: SocketAddr,
@@ -503,7 +507,8 @@ async fn run_peer_up(args: PeerUpArgs) -> Result<(), Box<dyn std::error::Error>>
             return Err(error.into());
         }
     };
-    if let Err(error) = routes.set_mtu(args.mtu).await {
+    let initial_mtu = args.mtu.min(vela_core::DEFAULT_VIRTUAL_MTU);
+    if let Err(error) = routes.set_mtu(initial_mtu).await {
         stop_process(process).await;
         return Err(error.into());
     }
@@ -731,6 +736,8 @@ async fn run_tun_peer_once(
         io,
         mut task,
     } = process;
+    let mut mtu_updates = io.mtu;
+    routes.set_mtu(*mtu_updates.borrow()).await?;
     let tun_reader = Arc::clone(&tun);
     let reader_handle = handle.clone();
     let mut tun_to_vela = tokio::spawn(async move {
@@ -844,6 +851,16 @@ async fn run_tun_peer_once(
                         break Err(error);
                     }
                 }
+            }
+            changed = mtu_updates.changed() => {
+                if changed.is_err() {
+                    break Ok(());
+                }
+                let mtu = *mtu_updates.borrow_and_update();
+                if let Err(error) = routes.set_mtu(mtu).await {
+                    break Err(error.into());
+                }
+                tracing::info!(debug_marker = "vela-mtu", mtu, "updated TUN MTU from path discovery");
             }
             _ = &mut ctrl_c => {
                 tracing::info!(debug_marker = "vela-lifecycle", "shutdown requested");

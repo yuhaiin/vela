@@ -303,6 +303,16 @@ impl CoordinationClient {
             .await
     }
 
+    pub async fn update_runtime_status(
+        &mut self,
+        virtual_mtu: usize,
+    ) -> Result<(), CoordClientError> {
+        let virtual_mtu =
+            u16::try_from(virtual_mtu).map_err(|_| CoordClientError::InvalidRuntimeStatus)?;
+        self.send(ControlMessage::RuntimeStatus { virtual_mtu })
+            .await
+    }
+
     /// Fetches the current signed network snapshot without publishing a
     /// candidate update or changing the snapshot generation.
     pub async fn request_snapshot(&mut self) -> Result<NetworkSnapshot, CoordClientError> {
@@ -538,6 +548,8 @@ pub enum CoordClientError {
     Server { code: String, message: String },
     #[error("unexpected control message")]
     UnexpectedMessage,
+    #[error("invalid runtime status")]
+    InvalidRuntimeStatus,
     #[error("coordination connection closed")]
     Closed,
     #[error("coordination request timed out: {0}")]
