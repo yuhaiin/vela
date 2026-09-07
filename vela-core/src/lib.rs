@@ -1434,6 +1434,8 @@ const MTU_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const MTU_PROBE_STEP: usize = 64;
 const MTU_PROBE_MAX_FAILURES: u8 = 3;
 const MTU_PROBE_MIN_GAIN: usize = 8;
+const PATH_MIGRATION_CONFIRMATIONS: u8 = 3;
+const PATH_MIGRATION_WINDOW: Duration = Duration::from_secs(2);
 
 struct DataPacket {
     header: Header,
@@ -4041,31 +4043,10 @@ impl Inner {
             return Ok(());
         }
         session.last_rx = Instant::now();
-        let path_changed = session.path != source;
-        session.path = source;
-        let mtu_reset = if path_changed {
-            session.path_changed_at = Some(unix_time());
-            peer.record_path(source, &peer_info.candidates);
-            session
-                .path_mtu
-                .reset(self.safe_virtual_mtu(), self.config.virtual_mtu)
-        } else {
-            false
-        };
         session
             .rx_bytes
             .fetch_add(encrypted_len as u64, Ordering::Relaxed);
         let mut events = Vec::new();
-        if path_changed {
-            events.push(VelaEvent::PathChanged(peer_info.node_id, source));
-        }
-        if mtu_reset {
-            events.push(VelaEvent::PathMtuChanged {
-                peer: peer_info.node_id,
-                path: source,
-                mtu: self.safe_virtual_mtu(),
-            });
-        }
         let mut response: Option<(PacketType, SocketAddr, u64, u64, Vec<u8>)> = None;
         match packet.header.packet_type {
             PacketType::Data => {
@@ -4106,7 +4087,7 @@ impl Inner {
                     encrypt_payload(session, PacketType::KeepAliveAck, sequence, &plaintext)?;
                 response = Some((
                     PacketType::KeepAliveAck,
-                    session.path,
+                    source,
                     session.session_id,
                     sequence,
                     encrypted,
@@ -4137,7 +4118,7 @@ impl Inner {
                     encrypt_payload(session, PacketType::DiagnosticPong, sequence, &plaintext)?;
                 response = Some((
                     PacketType::DiagnosticPong,
-                    session.path,
+                    source,
                     session.session_id,
                     sequence,
                     encrypted,
@@ -4170,7 +4151,7 @@ impl Inner {
                 let encrypted = encrypt_payload(session, PacketType::MtuProbeAck, sequence, &ack)?;
                 response = Some((
                     PacketType::MtuProbeAck,
-                    session.path,
+                    source,
                     session.session_id,
                     sequence,
                     encrypted,
@@ -4179,6 +4160,16 @@ impl Inner {
             PacketType::MtuProbeAck => {
                 if plaintext.len() != MTU_PROBE_NONCE_LEN + 2 {
                     return Err(CoreError::InvalidMtuProbe);
+                }
+                if source != session.path {
+                    debug!(
+                        debug_marker = "vela-mtu",
+                        peer_id = %peer_info.node_id,
+                        source = %source,
+                        active_path = %session.path,
+                        "ignored path MTU acknowledgement from a non-active path"
+                    );
+                    return Ok(());
                 }
                 let peer_max_mtu = usize::from(u16::from_be_bytes(
                     plaintext[MTU_PROBE_NONCE_LEN..]
@@ -4291,8 +4282,7 @@ impl Inner {
                     continue;
                 }
                 session.last_rx = Instant::now();
-                let path_changed = session.path != *source;
-                session.path = *source;
+                let path_changed = session.observe_data_source(*source);
                 let mtu_reset = if path_changed {
                     session.path_changed_at = Some(unix_time());
                     peer.record_path(*source, &candidates);
@@ -4417,8 +4407,7 @@ impl Inner {
                 return Ok(());
             }
             session.last_rx = Instant::now();
-            let path_changed = session.path != source;
-            session.path = source;
+            let path_changed = session.observe_data_source(source);
             let mtu_reset = if path_changed {
                 session.path_changed_at = Some(unix_time());
                 let candidates = peer.candidates();
@@ -4493,6 +4482,7 @@ impl Inner {
         *active = Some(ActiveSession {
             session_id,
             path,
+            pending_path: None,
             cipher,
             tx_sequence: AtomicU64::new(1),
             replay: ReplayWindow::default(),
@@ -5462,6 +5452,7 @@ const HANDSHAKE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 struct ActiveSession {
     session_id: u64,
     path: SocketAddr,
+    pending_path: Option<PendingPathMigration>,
     cipher: SessionCipher,
     tx_sequence: AtomicU64,
     replay: ReplayWindow,
@@ -5475,6 +5466,12 @@ struct ActiveSession {
     tx_bytes: AtomicU64,
     rx_bytes: AtomicU64,
     path_mtu: PathMtuState,
+}
+
+struct PendingPathMigration {
+    path: SocketAddr,
+    confirmations: u8,
+    last_seen: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -5576,7 +5573,49 @@ fn next_mtu_probe(confirmed: usize, upper: usize) -> Option<usize> {
 const KEEPALIVE_NONCE_LEN: usize = 16;
 const MAX_RECONNECT_ATTEMPTS: u8 = 5;
 
+fn confirm_path_migration(
+    current_path: SocketAddr,
+    pending_path: &mut Option<PendingPathMigration>,
+    source: SocketAddr,
+    now: Instant,
+) -> bool {
+    if source == current_path {
+        return false;
+    }
+    let confirmations = match pending_path.as_mut() {
+        Some(pending)
+            if pending.path == source
+                && now.duration_since(pending.last_seen) <= PATH_MIGRATION_WINDOW =>
+        {
+            pending.confirmations = pending.confirmations.saturating_add(1);
+            pending.last_seen = now;
+            pending.confirmations
+        }
+        _ => {
+            *pending_path = Some(PendingPathMigration {
+                path: source,
+                confirmations: 1,
+                last_seen: now,
+            });
+            1
+        }
+    };
+    if confirmations < PATH_MIGRATION_CONFIRMATIONS {
+        return false;
+    }
+    *pending_path = None;
+    true
+}
+
 impl ActiveSession {
+    fn observe_data_source(&mut self, source: SocketAddr) -> bool {
+        if !confirm_path_migration(self.path, &mut self.pending_path, source, Instant::now()) {
+            return false;
+        }
+        self.path = source;
+        true
+    }
+
     fn needs_rekey(&self) -> bool {
         self.created_at.elapsed() >= Duration::from_secs(3600)
             || self.tx_bytes.load(Ordering::Relaxed) >= 1 << 30
@@ -7113,6 +7152,49 @@ mod tests {
         assert!(backoff_target < failed_target);
         assert_eq!(state.confirmed, first_target);
         assert!(state.upper < failed_target);
+    }
+
+    #[test]
+    fn path_migration_requires_repeated_data_from_the_same_new_source() {
+        let current: SocketAddr = "192.0.2.10:40000".parse().unwrap();
+        let candidate: SocketAddr = "198.51.100.20:40000".parse().unwrap();
+        let other: SocketAddr = "203.0.113.30:40000".parse().unwrap();
+        let started = Instant::now();
+        let mut pending = None;
+
+        assert!(!confirm_path_migration(
+            current,
+            &mut pending,
+            candidate,
+            started
+        ));
+        assert!(!confirm_path_migration(
+            current,
+            &mut pending,
+            candidate,
+            started + Duration::from_millis(100),
+        ));
+        assert!(confirm_path_migration(
+            current,
+            &mut pending,
+            candidate,
+            started + Duration::from_millis(200),
+        ));
+        assert!(pending.is_none());
+
+        assert!(!confirm_path_migration(
+            current,
+            &mut pending,
+            other,
+            started + Duration::from_secs(3),
+        ));
+        assert!(!confirm_path_migration(
+            current,
+            &mut pending,
+            other,
+            started + Duration::from_secs(6),
+        ));
+        assert_eq!(pending.as_ref().map(|value| value.confirmations), Some(1));
     }
 
     #[test]
