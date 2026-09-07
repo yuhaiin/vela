@@ -138,6 +138,7 @@
         <div class="fact"><dt>Local UDP addresses</dt><dd id="local-addrs" class="stack">—</dd></div>
         <div class="fact"><dt>Published candidates</dt><dd id="published-candidates" class="stack">—</dd></div>
         <div class="fact"><dt>UDP data / queue drops</dt><dd id="transport-receive" class="mono">—</dd></div>
+        <div class="fact"><dt>Effective TUN MTU</dt><dd id="effective-tun-mtu" class="mono">—</dd></div>
         <div class="fact"><dt>TUN queue drops</dt><dd id="tun-queue-drops" class="mono">—</dd></div>
       </dl>
     </article>
@@ -223,6 +224,7 @@
     const transport = data.transport_receive || {};
     $('transport-receive').textContent = `${transport.data_datagrams || 0} / ${transport.data_queue_drops || 0} dropped / ${transport.worker_data_datagrams || 0} worker`;
     $('tun-queue-drops').textContent = String(data.tun_packet_queue_drops || 0);
+    $('effective-tun-mtu').textContent = data.effective_tun_mtu ?? '—';
     $('snapshot-generation').textContent = data.snapshot_generation ?? '—';
     $('snapshot-expires').textContent = date(data.snapshot_expires_at);
     $('credential-expires').textContent = date(data.credential_expires_at);
@@ -244,6 +246,7 @@
         <div class="peer-meta">
           <div><div class="meta-label">Active path</div><div class="meta-value mono">${esc(direct.active_path || '—')}</div></div>
           <div><div class="meta-label">Address type</div><div class="meta-value">${esc(label(direct.active_path_type))}</div></div>
+          <div><div class="meta-label">Path MTU</div><div class="meta-value mono">${direct.path_mtu ?? '—'}</div></div>
           <div><div class="meta-label">Connected at</div><div class="meta-value">${esc(date(direct.connected_at))}</div></div>
           <div><div class="meta-label">Last path change</div><div class="meta-value">${esc(date(direct.path_changed_at))}</div></div>
           <div><div class="meta-label">Last RTT</div><div class="meta-value">${direct.last_rtt_ms == null ? '—' : `${esc(direct.last_rtt_ms)} ms`}</div></div>
@@ -303,7 +306,7 @@
     empty.hidden = true; content.hidden = false;
     const allCandidates = (direct.candidates || []).map((item) => { const c = candidate(item); return `<div class="path-row"><span class="mono">${esc(c.address)}</span><span class="muted">${esc(label(c.type))}</span></div>`; }).join('');
     const history = (direct.path_history || []).slice().reverse().map((item) => `<div class="path-row"><span><span class="mono">${esc(item.path)}</span><br><span class="muted">${esc(label(item.candidate_type))}</span></span><span class="muted">${esc(date(item.changed_at))}</span></div>`).join('');
-    content.innerHTML = `<div class="detail-block"><div class="peer-card-top"><div><h3>${esc(peerTitle(peer))}</h3><div class="peer-id mono">${esc(peer.node_id)}</div></div>${statusBadge(direct.state || 'idle')}</div><div class="facts" style="margin-top:14px"><div class="fact"><dt>Coordinator</dt><dd>${peer.coordinator_online ? 'Online' : 'Offline'} · ${esc(peer.coordinator_last_seen_at ? age(peer.coordinator_last_seen_at, now) : 'No record')}</dd></div><div class="fact"><dt>Virtual IP</dt><dd>${chips(virtualIp(peer))}</dd></div><div class="fact"><dt>Active path</dt><dd class="mono">${esc(direct.active_path || '—')} · ${esc(label(direct.active_path_type))}</dd></div><div class="fact"><dt>Latest RTT</dt><dd>${direct.last_rtt_ms == null ? '—' : `${esc(direct.last_rtt_ms)} ms`}</dd></div></div></div>
+    content.innerHTML = `<div class="detail-block"><div class="peer-card-top"><div><h3>${esc(peerTitle(peer))}</h3><div class="peer-id mono">${esc(peer.node_id)}</div></div>${statusBadge(direct.state || 'idle')}</div><div class="facts" style="margin-top:14px"><div class="fact"><dt>Coordinator</dt><dd>${peer.coordinator_online ? 'Online' : 'Offline'} · ${esc(peer.coordinator_last_seen_at ? age(peer.coordinator_last_seen_at, now) : 'No record')}</dd></div><div class="fact"><dt>Virtual IP</dt><dd>${chips(virtualIp(peer))}</dd></div><div class="fact"><dt>Active path</dt><dd class="mono">${esc(direct.active_path || '—')} · ${esc(label(direct.active_path_type))}</dd></div><div class="fact"><dt>Path MTU</dt><dd class="mono">${direct.path_mtu ?? '—'}</dd></div><div class="fact"><dt>Latest RTT</dt><dd>${direct.last_rtt_ms == null ? '—' : `${esc(direct.last_rtt_ms)} ms`}</dd></div></div></div>
       <div class="detail-block"><h3>All candidates</h3>${allCandidates || '<span class="muted">No candidates</span>'}</div>
       <div class="detail-block"><h3>Path history</h3>${history || '<span class="muted">No path history</span>'}</div>
       <div class="detail-block"><h3>Recent connection failure</h3>${direct.last_failure ? `<div class="error">${esc(direct.last_failure.reason)}<br><span class="muted">${esc(date(direct.last_failure.occurred_at))}</span></div>` : '<span class="muted">No failures recorded</span>'}</div>

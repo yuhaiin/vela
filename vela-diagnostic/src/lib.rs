@@ -46,6 +46,10 @@ fn unix_time() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
+fn default_effective_tun_mtu() -> usize {
+    vela_core::DEFAULT_VIRTUAL_MTU
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DashboardCoordinatorStatus {
     pub connected: bool,
@@ -79,6 +83,9 @@ pub struct DashboardSnapshot {
     pub credential_expires_at: Option<u64>,
     pub transport_receive: TransportReceiveStats,
     pub tun_packet_queue_drops: u64,
+    /// Local TUN MTU after taking the minimum of all active path MTUs.
+    #[serde(default = "default_effective_tun_mtu")]
+    pub effective_tun_mtu: usize,
     pub peers: Vec<DashboardPeer>,
 }
 
@@ -812,6 +819,7 @@ impl DiagnosticPeer {
                 .map(|credential| credential.expires_at),
             transport_receive: self.node.transport_receive_stats(),
             tun_packet_queue_drops: 0,
+            effective_tun_mtu: self.node.effective_virtual_mtu().await,
             peers,
         }
     }

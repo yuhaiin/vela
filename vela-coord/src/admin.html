@@ -103,7 +103,7 @@
         </div>
         <div class="mt-4 overflow-x-auto">
           <table class="w-full min-w-[66rem] text-left text-sm">
-            <thead class="border-b border-slate-800 text-xs uppercase text-slate-500"><tr><th class="px-2 py-2">Name</th><th class="px-2 py-2">Node ID</th><th class="px-2 py-2">Address</th><th class="px-2 py-2">Status</th><th class="px-2 py-2">MTU</th><th class="px-2 py-2">Last seen</th><th class="px-2 py-2"></th></tr></thead>
+            <thead class="border-b border-slate-800 text-xs uppercase text-slate-500"><tr><th class="px-2 py-2">Name</th><th class="px-2 py-2">Node ID</th><th class="px-2 py-2">Address</th><th class="px-2 py-2">Status</th><th class="px-2 py-2">Effective MTU</th><th class="px-2 py-2">Last seen</th><th class="px-2 py-2"></th></tr></thead>
             <tbody id="peers" class="divide-y divide-slate-800"></tbody>
           </table>
         </div>
@@ -221,7 +221,7 @@
           <div><dt class="text-xs uppercase text-slate-500">Virtual IPv4</dt><dd class="mt-1 font-mono text-sm text-slate-200">${esc(peer.virtual_ipv4 || '—')}</dd></div>
           <div><dt class="text-xs uppercase text-slate-500">Virtual IPv6</dt><dd class="mt-1 break-all font-mono text-sm text-slate-200">${esc(peer.virtual_ipv6 || '—')}</dd></div>
           <div><dt class="text-xs uppercase text-slate-500">Credential expires</dt><dd class="mt-1 text-sm text-slate-200">${esc(time(peer.credential_expires_at))}</dd></div>
-          <div><dt class="text-xs uppercase text-slate-500">Current MTU</dt><dd class="mt-1 font-mono text-sm text-slate-200">${esc(peer.mtu ?? '—')}</dd></div>
+          <div><dt class="text-xs uppercase text-slate-500">Effective MTU</dt><dd class="mt-1 font-mono text-sm text-slate-200">${esc(peer.mtu ?? '—')}</dd></div>
           <div class="sm:col-span-2 lg:col-span-3"><dt class="text-xs uppercase text-slate-500">Advertised candidates / local addresses</dt><dd class="mt-1">${candidateMarkup}</dd></div>
           <div><dt class="text-xs uppercase text-slate-500">Capabilities</dt><dd class="mt-1 text-sm text-slate-200">${esc(capabilities)}</dd></div>
           <div><dt class="text-xs uppercase text-slate-500">Last seen</dt><dd class="mt-1 text-sm text-slate-200">${esc(time(peer.last_seen))}</dd></div>

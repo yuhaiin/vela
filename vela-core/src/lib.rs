@@ -2661,6 +2661,7 @@ impl VelaNode {
                 active.as_ref().map(|session| {
                     (
                         session.path,
+                        session.path_mtu.confirmed,
                         session.created_at_unix,
                         session.path_changed_at,
                         now.saturating_sub(session.last_rx.elapsed().as_secs()),
@@ -2703,6 +2704,7 @@ impl VelaNode {
                 state,
                 active_path,
                 active_path_type,
+                path_mtu,
                 connected_at,
                 path_changed_at,
                 last_rx_at,
@@ -2711,6 +2713,7 @@ impl VelaNode {
                 rx_bytes,
             ) = if let Some((
                 path,
+                session_path_mtu,
                 created_at_unix,
                 session_path_changed_at,
                 session_last_rx_at,
@@ -2723,6 +2726,7 @@ impl VelaNode {
                     PeerRuntimeState::Connected,
                     Some(path),
                     Some(candidate_type(&info.candidates, path).to_owned()),
+                    Some(session_path_mtu),
                     Some(created_at_unix),
                     session_path_changed_at,
                     Some(session_last_rx_at),
@@ -2733,6 +2737,7 @@ impl VelaNode {
             } else if attempt.is_some() || reconnect_requested || reconnect_running {
                 (
                     PeerRuntimeState::Connecting,
+                    None,
                     None,
                     None,
                     None,
@@ -2751,12 +2756,14 @@ impl VelaNode {
                     None,
                     None,
                     None,
+                    None,
                     0,
                     0,
                 )
             } else {
                 (
                     PeerRuntimeState::Idle,
+                    None,
                     None,
                     None,
                     None,
@@ -2808,6 +2815,7 @@ impl VelaNode {
                 capabilities: info.capabilities,
                 active_path,
                 active_path_type,
+                path_mtu,
                 connected_at,
                 path_changed_at,
                 path_history,
@@ -5009,6 +5017,9 @@ pub struct PeerRuntimeStatus {
     pub capabilities: Vec<PeerCapability>,
     pub active_path: Option<SocketAddr>,
     pub active_path_type: Option<String>,
+    /// Current discovered inner IP MTU for this direct session/path.
+    #[serde(default)]
+    pub path_mtu: Option<usize>,
     pub connected_at: Option<u64>,
     pub path_changed_at: Option<u64>,
     pub path_history: Vec<PeerPathChange>,
@@ -6374,6 +6385,13 @@ mod tests {
         })
         .await
         .expect("path MTU discovery did not reach the configured maximum");
+        let peer_status = node_a
+            .peer_statuses()
+            .await
+            .into_iter()
+            .find(|status| status.node_id == b_id)
+            .expect("connected peer status must be available");
+        assert_eq!(peer_status.path_mtu, Some(DEFAULT_MAX_VIRTUAL_MTU));
         let diagnostic = handle_a
             .diagnostic_ping(3, Duration::from_secs(1))
             .await
