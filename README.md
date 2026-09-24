@@ -86,6 +86,56 @@ consume `node.next_event()` concurrently with the attached stack. Use
 `VelaNode::send_ip` and `VelaEvent::IpPacket` when integrating a custom L3
 adapter instead.
 
+## Installation
+
+### Prebuilt binaries
+
+Download the `vela` CLI from [GitHub Releases](https://github.com/yuhaiin/vela/releases).
+The rolling [`main` build](https://github.com/yuhaiin/vela/releases/tag/main) is a
+pre-release and is updated after successful builds from `main`; version tags
+publish versioned releases. Each release includes the binary for each supported
+platform and `checksums.txt`.
+
+| Platform | Architecture | Release asset |
+| --- | --- | --- |
+| Linux (musl) | x86_64 | [`vela-linux-amd64`](https://github.com/yuhaiin/vela/releases/download/main/vela-linux-amd64) |
+| Linux (musl) | ARM64 | [`vela-linux-arm64`](https://github.com/yuhaiin/vela/releases/download/main/vela-linux-arm64) |
+| macOS | Intel | [`vela-darwin-amd64`](https://github.com/yuhaiin/vela/releases/download/main/vela-darwin-amd64) |
+| macOS | Apple Silicon | [`vela-darwin-arm64`](https://github.com/yuhaiin/vela/releases/download/main/vela-darwin-arm64) |
+| Windows | x86_64 | [`vela-windows-amd64.exe`](https://github.com/yuhaiin/vela/releases/download/main/vela-windows-amd64.exe) |
+| Windows | ARM64 | [`vela-windows-arm64.exe`](https://github.com/yuhaiin/vela/releases/download/main/vela-windows-arm64.exe) |
+
+For example, download and verify the Linux x86_64 `main` build, then install it
+in `/usr/local/bin`:
+
+```sh
+curl -fL https://github.com/yuhaiin/vela/releases/download/main/vela-linux-amd64 -o vela
+curl -fL https://github.com/yuhaiin/vela/releases/download/main/checksums.txt -o checksums.txt
+grep '  vela-linux-amd64$' checksums.txt | sha256sum --check -
+chmod +x vela
+sudo install -m 0755 vela /usr/local/bin/vela
+vela --help
+```
+
+Choose the asset matching both your operating system and CPU architecture on
+other platforms. Windows TUN peers also need a `wintun.dll` matching the binary
+architecture beside the executable, and `peer up` requires Administrator
+privileges. On Linux, `peer up` needs access to `/dev/net/tun` and
+`CAP_NET_ADMIN`; on macOS, allow Vela to create and configure a `utun`
+interface.
+
+### Build from source
+
+Install a stable Rust toolchain, then build the CLI with Cargo:
+
+```sh
+cargo build --locked --release -p vela-cli
+```
+
+The executable is written to `target/release/vela-cli` (or
+`target/release/vela-cli.exe` on Windows). The commands below use `cargo run`
+so you can also follow them without installing the executable.
+
 ## Quick start
 
 ```text
