@@ -6,24 +6,24 @@
   <title>Vela Peer Dashboard</title>
   <style>
     :root {
-      color-scheme: dark;
-      --bg: #07111f;
-      --panel: #0d1b2d;
-      --panel-strong: #12243a;
-      --line: #20344d;
-      --text: #edf5ff;
-      --muted: #8da3bc;
-      --cyan: #56d9ee;
-      --green: #56d39b;
-      --amber: #f6c76f;
-      --red: #f47f8b;
-      --shadow: 0 18px 60px rgb(0 0 0 / 20%);
+      color-scheme: light;
+      --bg: #f3f9f5;
+      --panel: #fffefa;
+      --panel-strong: #f7fbf8;
+      --line: #deebe2;
+      --text: #344e42;
+      --muted: #6d8175;
+      --cyan: #4d8875;
+      --green: #4d8464;
+      --amber: #a8752d;
+      --red: #b85e63;
+      --shadow: 0 14px 42px rgb(66 105 78 / 9%);
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       min-height: 100vh;
-      background: radial-gradient(circle at 10% 0%, #143457 0, transparent 34rem), var(--bg);
+      background: radial-gradient(circle at 8% 0%, #e2f3e9 0, transparent 34rem), radial-gradient(circle at 96% 12%, #edf3fc 0, transparent 28rem), var(--bg);
       color: var(--text);
       font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
@@ -32,6 +32,11 @@
     h1, h2, h3, p { margin: 0; }
     h1 { font-size: clamp(24px, 4vw, 38px); letter-spacing: -.04em; }
     h2 { font-size: 17px; letter-spacing: -.01em; }
+    .icon-defs { position: absolute; width: 0; height: 0; overflow: hidden; }
+    .brand-line { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+    .brand-icon { width: 30px; height: 30px; flex: 0 0 auto; }
+    .section-heading { display: flex; align-items: center; gap: 8px; }
+    .section-icon { width: 28px; height: 28px; flex: 0 0 auto; }
     h3 { font-size: 15px; }
     .eyebrow { color: var(--cyan); font-size: 11px; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; }
     .subtle, .muted { color: var(--muted); }
@@ -40,8 +45,12 @@
     .refresh strong { color: var(--green); font-weight: 600; }
     .grid { display: grid; gap: 16px; }
     .metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 16px; }
-    .metric, .panel { background: color-mix(in srgb, var(--panel) 94%, transparent); border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow); }
+    .metric, .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 18px; box-shadow: var(--shadow); }
     .metric { padding: 18px; min-height: 108px; }
+    .metrics .metric:nth-child(1) { border-top: 3px solid #8abfa9; }
+    .metrics .metric:nth-child(2) { border-top: 3px solid #8fc79b; }
+    .metrics .metric:nth-child(3) { border-top: 3px solid #e2c07d; }
+    .metrics .metric:nth-child(4) { border-top: 3px solid #a9c7dc; }
     .metric-label { color: var(--muted); font-size: 12px; }
     .metric-value { display: block; margin-top: 10px; font-size: 29px; font-weight: 700; letter-spacing: -.05em; }
     .metric-value.green { color: var(--green); }
@@ -57,15 +66,16 @@
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
     .stack { display: flex; flex-wrap: wrap; gap: 7px; }
     .chip, .badge { display: inline-flex; align-items: center; border-radius: 999px; white-space: nowrap; }
-    .chip { padding: 4px 8px; background: #13273e; color: #c5d8ed; font-size: 12px; }
+    .chip { padding: 4px 8px; background: #edf6f0; color: #4c6b5b; font-size: 12px; }
     .badge { gap: 5px; padding: 4px 8px; font-size: 11px; font-weight: 650; }
     .badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
-    .badge.green { background: #103328; color: var(--green); }
-    .badge.amber { background: #3b2e16; color: var(--amber); }
-    .badge.red { background: #3b1d28; color: var(--red); }
-    .badge.gray { background: #1c2b3d; color: var(--muted); }
-    .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-bottom: 16px; }
-    .peer-card { border: 1px solid var(--line); border-radius: 13px; padding: 15px; background: rgb(18 36 58 / 55%); }
+    .badge.green { background: #e5f3e9; color: var(--green); }
+    .badge.amber { background: #fff3df; color: var(--amber); }
+    .badge.red { background: #fae8e6; color: var(--red); }
+    .badge.gray { background: #edf2ee; color: var(--muted); }
+    .cards { display: flex; flex-wrap: wrap; align-items: stretch; gap: 16px; margin-bottom: 16px; }
+    .peer-card { flex: 1 1 30rem; max-width: 44rem; border: 1px solid var(--line); border-radius: 15px; padding: 16px; background: var(--panel-strong); }
+    .cards .empty { width: 100%; }
     .peer-card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
     .peer-name { font-weight: 700; }
     .peer-id { margin-top: 2px; color: var(--muted); overflow-wrap: anywhere; }
@@ -73,7 +83,7 @@
     .meta-label { color: var(--muted); font-size: 11px; }
     .meta-value { margin-top: 2px; overflow-wrap: anywhere; }
     .candidate-list { display: grid; gap: 7px; margin-top: 12px; }
-    .candidate-row { display: flex; align-items: center; justify-content: space-between; gap: 9px; border-top: 1px solid rgb(32 52 77 / 65%); padding-top: 7px; }
+    .candidate-row { display: flex; align-items: center; justify-content: space-between; gap: 9px; border-top: 1px solid #e4eee7; padding-top: 7px; }
     .candidate-row:first-child { border-top: 0; padding-top: 0; }
     .candidate-state { color: var(--muted); font-size: 11px; }
     .candidate-state.responded { color: var(--green); }
@@ -82,17 +92,17 @@
     .table-wrap { overflow-x: auto; }
     table { width: 100%; border-collapse: collapse; min-width: 850px; }
     th { color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .06em; text-align: left; text-transform: uppercase; }
-    th, td { border-bottom: 1px solid rgb(32 52 77 / 75%); padding: 12px 10px; vertical-align: top; }
+    th, td { border-bottom: 1px solid #e2ece5; padding: 12px 10px; vertical-align: top; }
     tbody tr { cursor: pointer; transition: background .15s ease; }
-    tbody tr:hover, tbody tr.selected { background: rgb(30 58 90 / 38%); }
+    tbody tr:hover, tbody tr.selected { background: #f0f7f2; }
     .status-pair { display: grid; gap: 5px; }
     .status-line { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
     .status-line b { color: var(--text); font-weight: 600; }
     .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
-    .dot.green { background: var(--green); box-shadow: 0 0 0 4px rgb(86 211 155 / 10%); }
+    .dot.green { background: var(--green); box-shadow: 0 0 0 4px #e5f3e9; }
     .dot.amber { background: var(--amber); }
     .dot.red { background: var(--red); }
-    .dot.gray { background: #60758e; }
+    .dot.gray { background: #9aaea1; }
     .empty { padding: 24px 10px 5px; color: var(--muted); text-align: center; }
     .detail { position: sticky; top: 16px; }
     .detail-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, .42fr); gap: 16px; align-items: start; }
@@ -103,17 +113,18 @@
     .path-row { display: grid; grid-template-columns: 1fr auto; gap: 9px; border-bottom: 1px solid rgb(32 52 77 / 65%); padding: 8px 0; }
     .path-row:last-child { border-bottom: 0; }
     .error { color: var(--red); overflow-wrap: anywhere; }
-    .error-banner { display: none; margin-bottom: 16px; border: 1px solid #6b2b3a; border-radius: 12px; background: #321925; color: #ffb2bb; padding: 12px 15px; }
+    .error-banner { display: none; margin-bottom: 16px; border: 1px solid #edc9c7; border-radius: 12px; background: #fff1ef; color: #a74f53; padding: 12px 15px; }
     .error-banner.visible { display: block; }
     @media (max-width: 980px) { .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } .overview, .detail-layout { grid-template-columns: 1fr; } .detail { position: static; } }
-    @media (max-width: 640px) { main { width: min(100% - 24px, 1440px); padding-top: 22px; } header { align-items: flex-start; flex-direction: column; } .refresh { text-align: left; } .metrics, .cards, .facts { grid-template-columns: 1fr; } .panel { padding: 16px; } }
+    @media (max-width: 640px) { main { width: min(100% - 24px, 1440px); padding-top: 22px; } header { align-items: flex-start; flex-direction: column; } .refresh { text-align: left; } .metrics, .facts { grid-template-columns: 1fr; } .panel { padding: 16px; } .panel-head { flex-wrap: wrap; } .panel-head > div { width: 100%; } }
   </style>
 </head>
 <body>
+<!-- VELA_ICON_SPRITE -->
 <main>
   <header>
     <div>
-      <div class="eyebrow">Vela / Peer Dashboard</div>
+      <div class="brand-line"><svg class="brand-icon" viewBox="0 0 64 64" aria-hidden="true" focusable="false"><use href="#vela-mark"/></svg><div class="eyebrow">Vela / Peer Dashboard</div></div>
       <h1>Direct connectivity at a glance</h1>
       <p class="subtle">Coordinator online status and direct UDP connection status are shown separately.</p>
     </div>
@@ -131,7 +142,7 @@
 
   <section class="grid overview">
     <article class="panel">
-      <div class="panel-head"><div><h2>Local peer & coordinator</h2><p>Published candidates are not the same as the current active path.</p></div><span id="coordinator-badge" class="badge gray">Unknown</span></div>
+      <div class="panel-head"><div><h2 class="section-heading"><svg class="section-icon" viewBox="0 0 64 64" aria-hidden="true" focusable="false"><use href="#coordination"/></svg>Local peer & coordinator</h2><p>Published candidates are not the same as the current active path.</p></div><span id="coordinator-badge" class="badge gray">Unknown</span></div>
       <dl class="facts">
         <div class="fact"><dt>Node ID</dt><dd id="node-id" class="mono">—</dd></div>
         <div class="fact"><dt>Coordinator</dt><dd id="server" class="mono">—</dd></div>
@@ -143,7 +154,7 @@
       </dl>
     </article>
     <article class="panel">
-      <div class="panel-head"><div><h2>Snapshot & credential</h2><p>Values from the current registration.</p></div></div>
+      <div class="panel-head"><div><h2 class="section-heading"><svg class="section-icon" viewBox="0 0 64 64" aria-hidden="true" focusable="false"><use href="#encrypted-path"/></svg>Snapshot & credential</h2><p>Values from the current registration.</p></div></div>
       <dl class="facts">
         <div class="fact"><dt>Snapshot generation</dt><dd id="snapshot-generation">—</dd></div>
         <div class="fact"><dt>Snapshot expires</dt><dd id="snapshot-expires">—</dd></div>
@@ -154,22 +165,22 @@
   </section>
 
   <section class="panel section">
-    <div class="panel-head"><div><h2>Current direct connections</h2><p>Active path is the address currently used by the session.</p></div></div>
+    <div class="panel-head"><div><h2 class="section-heading"><svg class="section-icon" viewBox="0 0 64 64" aria-hidden="true" focusable="false"><use href="#mesh-network"/></svg>Current direct connections</h2><p>Active path is the address currently used by the session.</p></div></div>
     <div id="connected" class="grid cards"></div>
   </section>
 
   <section class="panel section">
-    <div class="panel-head"><div><h2>Connection attempts</h2><p>Probes, handshakes, automatic retries, and candidate responses.</p></div></div>
+    <div class="panel-head"><div><h2 class="section-heading"><svg class="section-icon" viewBox="0 0 64 64" aria-hidden="true" focusable="false"><use href="#encrypted-path"/></svg>Connection attempts</h2><p>Probes, handshakes, automatic retries, and candidate responses.</p></div></div>
     <div id="trying" class="grid cards"></div>
   </section>
 
   <section class="panel section">
-    <div class="panel-head"><div><h2>All peer status</h2><p>Coordinator online ≠ direct connected.</p></div></div>
+    <div class="panel-head"><div><h2 class="section-heading"><svg class="section-icon" viewBox="0 0 64 64" aria-hidden="true" focusable="false"><use href="#peer-dashboard"/></svg>All peer status</h2><p>Coordinator online ≠ direct connected.</p></div></div>
     <div class="table-wrap"><table><thead><tr><th>Peer</th><th>Coordinator</th><th>Direct UDP</th><th>Virtual IP</th><th>Candidates</th><th>Last status</th></tr></thead><tbody id="all-peers"></tbody></table></div>
   </section>
 
   <section class="panel detail" id="detail-panel">
-    <div class="panel-head"><div><h2>Peer details</h2><p>Select any peer above to view candidates, paths, and failures.</p></div></div>
+    <div class="panel-head"><div><h2 class="section-heading"><svg class="section-icon" viewBox="0 0 64 64" aria-hidden="true" focusable="false"><use href="#tun-interface"/></svg>Peer details</h2><p>Select any peer above to view candidates, paths, and failures.</p></div></div>
     <div id="detail-empty" class="empty">No peer selected.</div>
     <div id="detail-content" class="detail-grid" hidden></div>
   </section>

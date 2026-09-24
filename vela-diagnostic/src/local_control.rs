@@ -419,7 +419,12 @@ async fn dispatch(request: HttpRequest, state: &LocalControlState, tcp: bool) ->
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/") => HttpResponse {
             status: 200,
-            body: include_bytes!("dashboard.html").to_vec(),
+            body: include_str!("dashboard.html")
+                .replace(
+                    "<!-- VELA_ICON_SPRITE -->",
+                    include_str!("../../assets/icons/sprite.svg"),
+                )
+                .into_bytes(),
             content_type: "text/html; charset=utf-8",
         },
         ("GET", "/api/v1/dashboard") | ("GET", "/local/v1/runtime") => {

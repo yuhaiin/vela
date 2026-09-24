@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">Vela</title>
+  <desc id="desc">Vela brand mark</desc>
+  <rect x="3" y="3" width="58" height="58" rx="19" fill="#F2FAF7" />
+  <path d="M30 12 15 43h15V12Z" fill="#BDEBDD" />
+  <path d="m35 17 15 26H35V17Z" fill="#CDE7F8" />
+  <path d="M13 47c4-3 8-3 12 0s8 3 12 0 8-3 12 0" fill="none" stroke="#548E85" stroke-linecap="round" stroke-width="2.4" />
+  <circle cx="49" cy="13" r="2.3" fill="#E5B96D" />
+</svg>

@@ -119,8 +119,11 @@ impl DashboardHandle {
     }
 }
 
-async fn dashboard_page() -> Html<&'static str> {
-    Html(include_str!("dashboard.html"))
+async fn dashboard_page() -> Html<String> {
+    Html(include_str!("dashboard.html").replace(
+        "<!-- VELA_ICON_SPRITE -->",
+        include_str!("../../assets/icons/sprite.svg"),
+    ))
 }
 
 async fn dashboard_data(State(state): State<Arc<DashboardStore>>) -> Json<DashboardSnapshot> {

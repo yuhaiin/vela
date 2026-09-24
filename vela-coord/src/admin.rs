@@ -219,8 +219,11 @@ pub(crate) fn router() -> Router<Arc<ServerInner>> {
         .route("/download/vela-cli", get(download_cli))
 }
 
-async fn admin_page() -> Html<&'static str> {
-    Html(include_str!("admin.html"))
+async fn admin_page() -> Html<String> {
+    Html(include_str!("admin.html").replace(
+        "<!-- VELA_ICON_SPRITE -->",
+        include_str!("../../assets/icons/sprite.svg"),
+    ))
 }
 
 #[derive(Deserialize)]

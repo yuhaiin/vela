@@ -1,9 +1,20 @@
 # Vela
 
-Vela is an embeddable, relay-free, encrypted layer-3 peer network for Rust.
-It forwards complete IPv4/IPv6 packets directly between authenticated peers.
-Linux, macOS, and Windows can expose the network through a TUN device; library
-users can instead use the userspace stack without changing kernel routes.
+<p align="center"><img src="assets/icons/vela-mark.svg" width="76" alt="Vela sail and network mark"></p>
+
+<p align="center"><strong>An embeddable, relay-free, encrypted layer-3 peer network for Rust.</strong><br>
+Vela forwards complete IPv4/IPv6 packets directly between authenticated peers.<br>
+Use a TUN device on Linux, macOS, or Windows, or attach the userspace stack without changing kernel routes.</p>
+
+<table align="center">
+  <tr>
+    <td align="center"><img src="assets/icons/mesh-network.svg" width="52" alt=""><br>Direct peers</td>
+    <td align="center"><img src="assets/icons/encrypted-path.svg" width="52" alt=""><br>Encrypted paths</td>
+    <td align="center"><img src="assets/icons/tun-interface.svg" width="52" alt=""><br>Virtual L3</td>
+    <td align="center"><img src="assets/icons/coordination.svg" width="52" alt=""><br>Coordination</td>
+    <td align="center"><img src="assets/icons/peer-dashboard.svg" width="52" alt=""><br>Peer dashboard</td>
+  </tr>
+</table>
 
 ## Current implementation
 

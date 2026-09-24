@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">Encrypted direct path</title>
+  <desc id="desc">Encrypted direct peer path</desc>
+  <rect x="3" y="3" width="58" height="58" rx="19" fill="#F2FAF7" />
+  <path d="M15 32h34" fill="none" stroke="#76AAA0" stroke-linecap="round" stroke-width="2.6" />
+  <path d="m42 27 6 5-6 5" fill="none" stroke="#76AAA0" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.6" />
+  <circle cx="14" cy="32" r="5" fill="#D5F0E8" stroke="#548E85" stroke-width="2" />
+  <circle cx="50" cy="32" r="5" fill="#D8ECFA" stroke="#648FAE" stroke-width="2" />
+  <rect x="25" y="28" width="14" height="13" rx="3.5" fill="#FFF0D1" stroke="#B38B4A" stroke-width="2" />
+  <path d="M28.5 28v-2.5a3.5 3.5 0 0 1 7 0V28" fill="none" stroke="#B38B4A" stroke-linecap="round" stroke-width="2" />
+  <circle cx="32" cy="34" r="1.4" fill="#8D6C38" />
+  <path d="M32 35.5v2" stroke="#8D6C38" stroke-linecap="round" stroke-width="1.5" />
+</svg>

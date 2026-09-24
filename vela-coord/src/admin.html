@@ -5,11 +5,82 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Vela Coordination</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .icon-defs { position: absolute; width: 0; height: 0; overflow: hidden; }
+    .icon-heading { display: flex; align-items: center; gap: .55rem; }
+    .brand-icon { width: 38px; height: 38px; flex: 0 0 auto; }
+    .section-icon { width: 28px; height: 28px; flex: 0 0 auto; }
+    :root { color-scheme: light; }
+    body {
+      background-color: #f3f9f5 !important;
+      background-image: radial-gradient(circle at 8% 0%, #e2f3e9 0, transparent 34rem), radial-gradient(circle at 96% 12%, #edf3fc 0, transparent 28rem) !important;
+      color: #344e42 !important;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    body.bg-slate-950 { background-color: #f3f9f5 !important; }
+    main { padding-bottom: 3.5rem; }
+    [class~="bg-slate-900"] {
+      background-color: #fffefa !important;
+      border: 1px solid #deebe2;
+      box-shadow: 0 14px 42px rgb(66 105 78 / 9%);
+    }
+    [class~="bg-slate-800"] { background-color: #f1f7f2 !important; }
+    [class~="bg-slate-950/50"] { background-color: #f3f8f4 !important; }
+    pre.bg-slate-950 { background-color: #eef6f0 !important; }
+    [class~="bg-emerald-950"] { background-color: #e5f3e9 !important; }
+    [class~="bg-red-950"] { background-color: #fae8e6 !important; }
+    [class~="text-slate-100"] { color: #344e42 !important; }
+    [class~="text-slate-200"] { color: #435e50 !important; }
+    [class~="text-slate-300"] { color: #536c5d !important; }
+    [class~="text-slate-400"] { color: #657c6f !important; }
+    [class~="text-slate-500"] { color: #6d8275 !important; }
+    [class~="text-slate-950"] { color: #29483a !important; }
+    [class~="text-cyan-300"], [class~="text-cyan-400"] { color: #477d66 !important; }
+    [class~="text-emerald-300"] { color: #477a59 !important; }
+    [class~="text-amber-300"], [class~="text-amber-400"] { color: #99703a !important; }
+    [class~="text-red-300"], [class~="text-red-400"] { color: #ad5d60 !important; }
+    [class~="border-slate-800"], [class~="border-slate-700"] { border-color: #deebe2 !important; }
+    [class~="divide-slate-800"] > :not([hidden]) ~ :not([hidden]) { border-color: #e4eee7 !important; }
+    [class~="ring-slate-500"] { --tw-ring-color: #8abf9e !important; }
+    [class~="ring-1"] { box-shadow: 0 0 0 1px #deebe2, 0 14px 42px rgb(66 105 78 / 8%) !important; }
+    [class~="shadow-2xl"] { box-shadow: 0 18px 48px rgb(66 105 78 / 12%) !important; }
+    [class~="bg-cyan-500"] {
+      background-color: #91caaa !important;
+      box-shadow: 0 5px 14px rgb(91 153 116 / 18%);
+      transition: background-color .16s ease, transform .16s ease, box-shadow .16s ease;
+    }
+    [class~="hover:bg-cyan-400"]:hover { background-color: #7fbd99 !important; }
+    [class~="hover:bg-slate-900"]:hover { background-color: #f1f7f2 !important; }
+    [class~="hover:text-cyan-300"]:hover { color: #386d53 !important; }
+    [class~="hover:text-amber-300"]:hover { color: #815c2d !important; }
+    [class~="hover:text-red-300"]:hover { color: #914a4e !important; }
+    [class~="hover:text-white"]:hover { color: #344e42 !important; }
+    button { cursor: pointer; transition: color .16s ease, background-color .16s ease, border-color .16s ease, transform .16s ease; }
+    button:active { transform: translateY(1px); }
+    input, textarea {
+      color: #344e42 !important;
+      border: 1px solid #d8e7dc;
+      transition: border-color .16s ease, box-shadow .16s ease, background-color .16s ease;
+    }
+    input::placeholder, textarea::placeholder { color: #93a59a; }
+    input:focus, textarea:focus { border-color: #8abf9e !important; box-shadow: 0 0 0 3px rgb(129 189 151 / 20%); outline: none; }
+    table { border-collapse: separate; border-spacing: 0; }
+    thead { background: #f2f8f3; }
+    tbody tr { transition: background-color .14s ease; }
+    tbody tr:hover { background-color: #f5faf6; }
+    #server-info { overflow-wrap: anywhere; }
+    #peer-tools { grid-template-columns: minmax(0, 44rem); justify-content: center; }
+    #peer-tools.invite-open { grid-template-columns: minmax(22rem, .75fr) minmax(0, 1.25fr); justify-content: stretch; }
+    @media (max-width: 1023px) {
+      #peer-tools, #peer-tools.invite-open { grid-template-columns: minmax(0, 1fr); }
+    }
+  </style>
 </head>
 <body class="min-h-screen bg-slate-950 text-slate-100">
+  <!-- VELA_ICON_SPRITE -->
   <main class="mx-auto max-w-7xl px-4 py-8 sm:px-6">
     <section id="login-panel" class="mx-auto mt-16 max-w-md rounded-2xl bg-slate-900 p-8 shadow-2xl ring-1 ring-slate-800">
-      <h1 class="text-2xl font-semibold">Vela Admin</h1>
+      <h1 class="icon-heading text-2xl font-semibold"><svg class="brand-icon" viewBox="0 0 64 64" aria-hidden="true" focusable="false"><use href="#vela-mark"/></svg>Vela Admin</h1>
       <p class="mt-2 text-sm text-slate-400">Sign in with the administrator account printed when the server started.</p>
       <form id="login-form" class="mt-6 space-y-4">
         <label class="block text-sm text-slate-300">Username
@@ -26,15 +97,15 @@
     <section id="app-panel" class="hidden">
       <header class="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800 pb-6">
         <div>
-          <h1 class="text-2xl font-semibold">Vela Admin</h1>
+          <h1 class="icon-heading text-2xl font-semibold"><svg class="brand-icon" viewBox="0 0 64 64" aria-hidden="true" focusable="false"><use href="#vela-mark"/></svg>Vela Admin</h1>
           <p id="server-info" class="mt-1 text-sm text-slate-400"></p>
         </div>
         <button id="logout" class="rounded-lg border border-slate-700 px-3 py-2 text-sm hover:bg-slate-900">Sign out</button>
       </header>
 
-      <section class="mt-6 grid gap-6 lg:grid-cols-[22rem_minmax(0,1fr)]">
+      <section id="peer-tools" class="mt-6 grid gap-6 lg:grid-cols-[22rem_minmax(0,1fr)]">
         <div class="rounded-2xl bg-slate-900 p-5 ring-1 ring-slate-800">
-          <h2 class="text-lg font-medium">Add peer</h2>
+          <h2 class="icon-heading text-lg font-medium"><svg class="section-icon" viewBox="0 0 64 64" aria-hidden="true" focusable="false"><use href="#mesh-network"/></svg>Add peer</h2>
           <form id="invite-form" class="mt-4 space-y-3">
             <input id="invite-name" placeholder="Name (for example, laptop)" required maxlength="200" class="w-full rounded-lg bg-slate-800 px-3 py-2 outline-none ring-slate-500 focus:ring-2">
             <textarea id="invite-notes" placeholder="Notes" maxlength="2000" rows="3" class="w-full rounded-lg bg-slate-800 px-3 py-2 outline-none ring-slate-500 focus:ring-2"></textarea>
@@ -63,7 +134,7 @@
       <section class="mt-6 rounded-2xl bg-slate-900 p-5 ring-1 ring-slate-800">
         <div class="flex flex-wrap items-center justify-between gap-4">
           <div>
-            <h2 class="text-lg font-medium">Network resolution and NAT traversal</h2>
+            <h2 class="icon-heading text-lg font-medium"><svg class="section-icon" viewBox="0 0 64 64" aria-hidden="true" focusable="false"><use href="#tun-interface"/></svg>Network resolution and NAT traversal</h2>
             <p class="mt-1 text-sm text-slate-400">Peers use these signed settings for hostname resolution and STUN candidate gathering.</p>
           </div>
           <span id="network-config-status" class="text-sm text-slate-400"></span>
@@ -85,7 +156,7 @@
 
       <section class="mt-6 rounded-2xl bg-slate-900 p-5 ring-1 ring-slate-800">
         <div class="flex items-center justify-between gap-4">
-          <h2 class="text-lg font-medium">Invites</h2>
+          <h2 class="icon-heading text-lg font-medium"><svg class="section-icon" viewBox="0 0 64 64" aria-hidden="true" focusable="false"><use href="#coordination"/></svg>Invites</h2>
           <span class="text-xs text-slate-500">Refreshes every 5 seconds</span>
         </div>
         <div class="mt-4 overflow-x-auto">
@@ -98,7 +169,7 @@
 
       <section class="mt-6 rounded-2xl bg-slate-900 p-5 ring-1 ring-slate-800">
         <div class="flex items-center justify-between gap-4">
-          <h2 class="text-lg font-medium">Peers</h2>
+          <h2 class="icon-heading text-lg font-medium"><svg class="section-icon" viewBox="0 0 64 64" aria-hidden="true" focusable="false"><use href="#peer-dashboard"/></svg>Peers</h2>
           <span id="peer-count" class="text-sm text-slate-500"></span>
         </div>
         <div class="mt-4 overflow-x-auto">
@@ -262,6 +333,7 @@
       ['3b. Start TUN peer (alternative to diagnostic mode)', upCommand],
     ].map(([title, command]) => `<div class="min-w-0"><p class="mb-1 text-sm text-slate-300">${title}</p><pre class="max-w-full overflow-x-auto whitespace-pre-wrap break-all rounded-lg bg-slate-950 p-3 text-xs text-cyan-300">${esc(command)}</pre></div>`).join('');
     $('invite-result').classList.remove('hidden');
+    $('peer-tools').classList.add('invite-open');
     $('invite-result').scrollIntoView({behavior: 'smooth', block: 'start'});
   }
 
@@ -273,7 +345,10 @@
     } catch (error) { showError($('login-error'), error.message); }
   });
   $('logout').addEventListener('click', async () => { try { await api('/api/v1/auth/logout', {method: 'POST'}); } catch (_) {} clearSession(); showLogin(); });
-  $('close-invite').addEventListener('click', () => $('invite-result').classList.add('hidden'));
+  $('close-invite').addEventListener('click', () => {
+    $('invite-result').classList.add('hidden');
+    $('peer-tools').classList.remove('invite-open');
+  });
   $('invite-form').addEventListener('submit', async (event) => {
     event.preventDefault(); clearError($('app-error'));
     try {
