@@ -1,8 +1,8 @@
-import AVFoundation
+@preconcurrency import AVFoundation
 import SwiftUI
 
 @MainActor
-private final class QRScannerModel: NSObject, ObservableObject, AVCaptureMetadataOutputObjectsDelegate {
+private final class QRScannerModel: NSObject, ObservableObject, @preconcurrency AVCaptureMetadataOutputObjectsDelegate {
     @Published var message = "Preparing camera…"
     let session = AVCaptureSession()
     private let onCode: (String) -> Void

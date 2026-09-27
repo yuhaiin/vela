@@ -28,10 +28,11 @@ struct VelaPeerApp: App {
         .defaultSize(width: 620, height: 720)
         .windowResizability(.contentSize)
 
-        Settings {
+        Window("Vela Settings", id: "settings") {
             SettingsView()
                 .environmentObject(model)
         }
+        .windowResizability(.contentSize)
         .commands {
             CommandGroup(replacing: .appTermination) {
                 Button("Quit Vela") {
@@ -69,7 +70,6 @@ final class VelaAppDelegate: NSObject, NSApplicationDelegate {
 private struct MenuBarContent: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.openWindow) private var openWindow
-    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         Text(statusText)
@@ -85,7 +85,7 @@ private struct MenuBarContent: View {
                     .disabled(model.isPeerActionBusy || model.secretsUnavailable)
             }
         }
-        Button("Settings…") { openSettings() }
+        Button("Settings…") { openWindow(id: "settings") }
         Divider()
         Button("Quit Vela") { model.quit() }
             .disabled(model.isPeerActionBusy)
