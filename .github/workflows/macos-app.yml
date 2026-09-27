@@ -1,0 +1,116 @@
+name: macOS App
+
+on:
+  push:
+    branches: [main]
+    tags: [v*]
+    paths:
+      - ".github/workflows/macos-app.yml"
+      - "macos/VelaPeer/**"
+      - "vela-crypto/**"
+      - "vela-diagnostic/**"
+      - "vela-peer-service/**"
+      - "vela-core/**"
+      - "vela-coord-client/**"
+      - "vela-dns/**"
+      - "vela-ip/**"
+      - "vela-proto/**"
+      - "vela-stun/**"
+      - "vela-tun/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/macos-app.yml"
+      - "macos/VelaPeer/**"
+      - "vela-crypto/**"
+      - "vela-diagnostic/**"
+      - "vela-peer-service/**"
+      - "vela-core/**"
+      - "vela-coord-client/**"
+      - "vela-dns/**"
+      - "vela-ip/**"
+      - "vela-proto/**"
+      - "vela-stun/**"
+      - "vela-tun/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Universal Vela.app
+    runs-on: macos-15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install Rust targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-app
+
+      - name: Select app version
+        id: app-version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == v* ]]; then
+            printf 'version=%s\n' "${GITHUB_REF_NAME#v}" >> "${GITHUB_OUTPUT}"
+          else
+            printf 'version=0.0.0\n' >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Build app bundle
+        env:
+          VELA_APP_VERSION: ${{ steps.app-version.outputs.version }}
+          VELA_REQUIRE_PERSISTENT_SIGNING: ${{ (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && '1' || '0' }}
+          VELA_MACOS_SIGNING_P12_BASE64: ${{ (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && secrets.VELA_MACOS_SIGNING_P12_BASE64 || '' }}
+          VELA_MACOS_SIGNING_P12_PASSWORD: ${{ (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && secrets.VELA_MACOS_SIGNING_P12_PASSWORD || '' }}
+        run: bash macos/VelaPeer/build-app.sh
+
+      - name: Upload self-signed preview app
+        uses: actions/upload-artifact@v7
+        with:
+          name: Vela-macos-universal
+          path: |
+            macos/VelaPeer/dist/Vela-macos-universal.zip
+            macos/VelaPeer/dist/Vela-macos-universal.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish macOS download
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release notes
+        uses: actions/checkout@v7
+
+      - name: Download universal app package
+        uses: actions/download-artifact@v8
+        with:
+          name: Vela-macos-universal
+          path: dist
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "Vela ${VERSION} for macOS" \
+            --notes-file macos/README.md \
+            dist/Vela-macos-universal.zip \
+            dist/Vela-macos-universal.zip.sha256

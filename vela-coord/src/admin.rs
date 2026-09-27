@@ -220,10 +220,17 @@ pub(crate) fn router() -> Router<Arc<ServerInner>> {
 }
 
 async fn admin_page() -> Html<String> {
-    Html(include_str!("admin.html").replace(
-        "<!-- VELA_ICON_SPRITE -->",
-        include_str!("../../assets/icons/sprite.svg"),
-    ))
+    let page = include_str!("admin.html")
+        .replace(
+            "<!-- VELA_ICON_SPRITE -->",
+            include_str!("../../assets/icons/sprite.svg"),
+        )
+        .replace(
+            "<!-- VELA_QR_GENERATOR -->",
+            include_str!("qrcode-generator.js"),
+        );
+    let license = format!("<!--\n{}\n-->", include_str!("qrcode-generator.LICENSE"));
+    Html(page.replace("<!-- VELA_QR_LICENSE -->", &license))
 }
 
 #[derive(Deserialize)]

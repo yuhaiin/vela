@@ -1,22 +1,24 @@
 [package]
-name = "vela-cli"
+name = "vela-peer-service"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[lib]
+crate-type = ["rlib", "staticlib"]
+
 [dependencies]
 base64.workspace = true
-clap.workspace = true
-rustls.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
-vela-coord = { path = "../vela-coord" }
 vela-core = { path = "../vela-core" }
-vela-diagnostic = { path = "../vela-diagnostic" }
-vela-peer-service = { path = "../vela-peer-service" }
 vela-crypto = { path = "../vela-crypto" }
+vela-diagnostic = { path = "../vela-diagnostic" }
+vela-ip = { path = "../vela-ip" }
 vela-proto = { path = "../vela-proto" }
 vela-tun = { path = "../vela-tun" }
+rustls.workspace = true

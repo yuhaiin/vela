@@ -105,6 +105,10 @@ platform and `checksums.txt`.
 | Windows | x86_64 | [`vela-windows-amd64.exe`](https://github.com/yuhaiin/vela/releases/download/main/vela-windows-amd64.exe) |
 | Windows | ARM64 | [`vela-windows-arm64.exe`](https://github.com/yuhaiin/vela/releases/download/main/vela-windows-arm64.exe) |
 
+The universal macOS menu bar app is packaged separately from the CLI. Versioned
+releases will include `Vela-macos-universal.zip`; see the [macOS app guide](macos/README.md)
+for installation, registration, updates, and data removal.
+
 For example, download and verify the Linux x86_64 `main` build, then install it
 in `/usr/local/bin`:
 

@@ -20,6 +20,7 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 use vela_core::{NodeConfig, SendError, VelaEvent, VelaNode};
+use vela_crypto::MembershipCredential;
 use vela_proto::{NetworkSnapshot, NodeId, PeerInfo, PeerSummary};
 
 pub const MAX_PING_COUNT: usize = 32;
@@ -34,6 +35,7 @@ const PACKET_QUEUE_CAPACITY: usize = 4096;
 
 pub(crate) struct RuntimeStore {
     snapshot: RwLock<RuntimeSnapshot>,
+    dashboard_updates: watch::Sender<crate::DashboardSnapshot>,
 }
 
 struct RuntimeSnapshot {
@@ -46,13 +48,19 @@ impl RuntimeStore {
     async fn new(peer: &DiagnosticPeer, peers: Vec<PeerSummary>) -> Self {
         let status = peer.status_snapshot(&peers);
         let dashboard = peer.dashboard_snapshot(true, &peers, None).await;
+        let (dashboard_updates, _) = watch::channel(dashboard.clone());
         Self {
             snapshot: RwLock::new(RuntimeSnapshot {
                 status,
                 peers,
-                dashboard,
+                dashboard: dashboard.clone(),
             }),
+            dashboard_updates,
         }
+    }
+
+    fn subscribe_dashboard(&self) -> watch::Receiver<crate::DashboardSnapshot> {
+        self.dashboard_updates.subscribe()
     }
 
     pub(crate) async fn update(
@@ -61,6 +69,7 @@ impl RuntimeStore {
         peers: Vec<PeerSummary>,
         dashboard: crate::DashboardSnapshot,
     ) {
+        self.dashboard_updates.send_replace(dashboard.clone());
         *self.snapshot.write().await = RuntimeSnapshot {
             status,
             peers,
@@ -159,6 +168,8 @@ pub struct RuntimeIo {
     pub packets: mpsc::Receiver<(NodeId, vela_ip::IpPacket)>,
     pub snapshots: watch::Receiver<Option<NetworkSnapshot>>,
     pub mtu: watch::Receiver<usize>,
+    pub credentials: watch::Receiver<Option<MembershipCredential>>,
+    pub dashboard: watch::Receiver<crate::DashboardSnapshot>,
 }
 
 pub struct RuntimeProcess {
@@ -174,6 +185,7 @@ pub struct DiagnosticRuntime {
     packet_tx: mpsc::Sender<(NodeId, vela_ip::IpPacket)>,
     snapshot_tx: watch::Sender<Option<NetworkSnapshot>>,
     mtu_tx: watch::Sender<usize>,
+    credentials_tx: watch::Sender<Option<MembershipCredential>>,
     ping_limit: Arc<Semaphore>,
     connections: JoinSet<()>,
     pings: JoinSet<()>,
@@ -211,7 +223,7 @@ impl DiagnosticRuntime {
         let lock = crate::local_control::StateLock::acquire(state_dir)?;
         let peer =
             DiagnosticPeer::open_with_mtu(state_dir, port, stun_servers, virtual_mtu).await?;
-        Self::start_with_lock(peer, dashboard_bind, lock).await
+        Self::start_with_control(peer, Some((dashboard_bind, lock))).await
     }
 
     pub async fn start(
@@ -219,13 +231,21 @@ impl DiagnosticRuntime {
         dashboard_bind: SocketAddr,
     ) -> Result<RuntimeProcess, DiagnosticError> {
         let lock = crate::local_control::StateLock::acquire(&peer.state_dir)?;
-        Self::start_with_lock(peer, dashboard_bind, lock).await
+        Self::start_with_control(peer, Some((dashboard_bind, lock))).await
     }
 
-    async fn start_with_lock(
+    /// Starts a peer without a filesystem lock or local HTTP/Unix control
+    /// endpoint. Intended for an owning app/helper that exposes controls over
+    /// its own authenticated IPC channel.
+    pub async fn start_without_control(
         peer: DiagnosticPeer,
-        dashboard_bind: SocketAddr,
-        lock: crate::local_control::StateLock,
+    ) -> Result<RuntimeProcess, DiagnosticError> {
+        Self::start_with_control(peer, None).await
+    }
+
+    async fn start_with_control(
+        peer: DiagnosticPeer,
+        control_config: Option<(SocketAddr, crate::local_control::StateLock)>,
     ) -> Result<RuntimeProcess, DiagnosticError> {
         let mut peer = peer;
         let summaries = match peer.list_peers().await {
@@ -236,6 +256,7 @@ impl DiagnosticRuntime {
             }
         };
         let store = Arc::new(RuntimeStore::new(&peer, summaries).await);
+        let dashboard_rx = store.subscribe_dashboard();
         let (commands, command_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
         let (packet_tx, packet_rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
         let tun_packet_queue_drops = Arc::new(AtomicU64::new(0));
@@ -243,25 +264,33 @@ impl DiagnosticRuntime {
         let (snapshot_tx, snapshot_rx) = watch::channel(peer.state.snapshot.clone());
         let initial_mtu = peer.node.effective_virtual_mtu().await;
         let (mtu_tx, mtu_rx) = watch::channel(initial_mtu);
+        let (credentials_tx, credentials_rx) = watch::channel(peer.state.credential.clone());
         let stop = Arc::new(Notify::new());
-        let control = match LocalControlServer::start_with_lock(
-            &peer.state_dir,
-            peer.node_id(),
-            peer.node.incarnation(),
-            Arc::clone(&store),
-            commands.clone(),
-            dashboard_bind,
-            lock,
-        )
-        .await
-        {
-            Ok(control) => control,
-            Err(error) => {
-                peer.node.shutdown().await;
-                return Err(error);
+        let control = if let Some((dashboard_bind, lock)) = control_config {
+            match LocalControlServer::start_with_lock(
+                &peer.state_dir,
+                peer.node_id(),
+                peer.node.incarnation(),
+                Arc::clone(&store),
+                commands.clone(),
+                dashboard_bind,
+                lock,
+            )
+            .await
+            {
+                Ok(control) => Some(control),
+                Err(error) => {
+                    peer.node.shutdown().await;
+                    return Err(error);
+                }
             }
+        } else {
+            None
         };
-        let endpoint = control.endpoint().clone();
+        let endpoint = control.as_ref().map_or_else(
+            crate::local_control::ControlEndpoint::unavailable,
+            |control| control.endpoint().clone(),
+        );
         let handle = RuntimeHandle {
             node_id: peer.node_id(),
             node: peer.node.clone(),
@@ -277,10 +306,11 @@ impl DiagnosticRuntime {
             packet_tx,
             snapshot_tx,
             mtu_tx,
+            credentials_tx,
             ping_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_PINGS)),
             connections: JoinSet::new(),
             pings: JoinSet::new(),
-            control: Some(control),
+            control,
             stop,
             snapshot_expired_notified,
             tun_packet_queue_drops,
@@ -292,6 +322,8 @@ impl DiagnosticRuntime {
                 packets: packet_rx,
                 snapshots: snapshot_rx,
                 mtu: mtu_rx,
+                credentials: credentials_rx,
+                dashboard: dashboard_rx,
             },
             task,
         })
@@ -459,6 +491,8 @@ impl DiagnosticRuntime {
                     match self.peer.reconnect().await {
                         Ok(snapshot) => {
                             self.snapshot_tx.send_replace(Some(snapshot));
+                            self.credentials_tx
+                                .send_replace(self.peer.state.credential.clone());
                             self.snapshot_expired_notified
                                 .store(false, Ordering::Release);
                             control_connected = true;

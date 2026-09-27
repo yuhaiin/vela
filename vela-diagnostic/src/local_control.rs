@@ -53,6 +53,20 @@ pub struct ControlEndpoint {
     pub incarnation: u64,
 }
 
+impl ControlEndpoint {
+    pub(crate) fn unavailable() -> Self {
+        Self {
+            version: CONTROL_VERSION,
+            transport: ControlTransport::Tcp,
+            socket: None,
+            address: None,
+            token: None,
+            pid: std::process::id(),
+            incarnation: 0,
+        }
+    }
+}
+
 pub struct StateLock {
     _file: File,
 }

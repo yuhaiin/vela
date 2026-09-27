@@ -28,7 +28,7 @@ use vela_proto::{Candidate, ControlMessage, NetworkSnapshot, NodeId, PeerInfo, P
 mod local_control;
 mod runtime;
 
-pub use local_control::LocalControlClient;
+pub use local_control::{ControlEndpoint, LocalControlClient};
 pub use runtime::{
     DiagnosticRuntime, MAX_PING_COUNT, MAX_PING_TIMEOUT, MIN_PING_TIMEOUT, RuntimeHandle,
     RuntimeProcess,
@@ -36,6 +36,7 @@ pub use runtime::{
 
 const STATE_FILE: &str = "state.json";
 const IDENTITY_FILE: &str = "identity";
+const CONFIG_FILE: &str = "config.json";
 pub const CANDIDATE_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
 const DASHBOARD_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const DASHBOARD_PEER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
@@ -167,7 +168,14 @@ impl PeerState {
     }
 
     pub fn load(dir: impl AsRef<Path>) -> Result<Self, DiagnosticError> {
-        let data = fs::read(dir.as_ref().join(STATE_FILE))?;
+        let path = dir.as_ref().join(STATE_FILE);
+        let data = fs::read(&path).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                DiagnosticError::StateFileNotFound(path.clone())
+            } else {
+                DiagnosticError::StateFileRead { path, source }
+            }
+        })?;
         let mut value: serde_json::Value = serde_json::from_slice(&data)?;
         if is_legacy_snapshot(&value) {
             if let Some(state) = value.as_object_mut() {
@@ -193,6 +201,90 @@ impl PeerState {
     pub fn identity_path(dir: impl AsRef<Path>) -> PathBuf {
         dir.as_ref().join(IDENTITY_FILE)
     }
+
+    pub fn config(&self) -> PeerConfig {
+        PeerConfig {
+            server: self.server.clone(),
+            server_key: self.server_key,
+            last_local_addrs: self.last_local_addrs.clone(),
+            doh_servers: self.doh_servers.clone(),
+            stun_servers: self.stun_servers.clone(),
+            manual_stun_servers: self.manual_stun_servers.clone(),
+            candidates: self.candidates.clone(),
+            snapshot: self.snapshot.clone(),
+        }
+    }
+}
+
+/// Persistent peer settings that contain no private identity or membership
+/// credential. Platform apps can store this in Application Support and keep
+/// [`PeerSecrets`] in Keychain.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerConfig {
+    pub server: String,
+    #[serde(with = "vela_proto::base64_32_serde")]
+    pub server_key: [u8; 32],
+    #[serde(default)]
+    pub last_local_addrs: Vec<SocketAddr>,
+    #[serde(default = "default_doh_servers")]
+    pub doh_servers: Vec<String>,
+    pub stun_servers: Vec<String>,
+    #[serde(default)]
+    pub manual_stun_servers: Vec<String>,
+    pub candidates: Vec<Candidate>,
+    pub snapshot: Option<NetworkSnapshot>,
+}
+
+impl PeerConfig {
+    pub fn new(server: String, server_key: [u8; 32], stun_servers: Vec<String>) -> Self {
+        PeerState::new(server, server_key, stun_servers).config()
+    }
+
+    pub fn load(dir: impl AsRef<Path>) -> Result<Self, DiagnosticError> {
+        let data = fs::read(dir.as_ref().join(CONFIG_FILE))?;
+        let mut value: serde_json::Value = serde_json::from_slice(&data)?;
+        if is_legacy_snapshot(&value)
+            && let Some(config) = value.as_object_mut()
+        {
+            config.insert("snapshot".to_owned(), serde_json::Value::Null);
+        }
+        Ok(serde_json::from_value(value)?)
+    }
+
+    pub fn save(&self, dir: impl AsRef<Path>) -> Result<(), DiagnosticError> {
+        let dir = dir.as_ref();
+        fs::create_dir_all(dir)?;
+        let temporary = dir.join("config.json.tmp");
+        fs::write(&temporary, serde_json::to_vec_pretty(self)?)?;
+        set_private(&temporary)?;
+        fs::rename(temporary, dir.join(CONFIG_FILE))?;
+        Ok(())
+    }
+
+    fn into_state(self, credential: Option<MembershipCredential>) -> PeerState {
+        PeerState {
+            server: self.server,
+            server_key: self.server_key,
+            credential,
+            last_local_addrs: self.last_local_addrs,
+            doh_servers: self.doh_servers,
+            stun_servers: self.stun_servers,
+            manual_stun_servers: self.manual_stun_servers,
+            candidates: self.candidates,
+            snapshot: self.snapshot,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct PeerSecrets {
+    pub identity: Identity,
+    pub credential: MembershipCredential,
+}
+
+pub struct PeerRegistration {
+    pub config: PeerConfig,
+    pub secrets: PeerSecrets,
 }
 
 fn is_legacy_snapshot(state: &serde_json::Value) -> bool {
@@ -246,6 +338,53 @@ pub async fn register(
     Ok(peer.state)
 }
 
+/// Registers without loading or writing private data to the state directory.
+/// The returned identity and membership credential are intended for a
+/// platform secure store.
+pub async fn register_with_material(
+    config: PeerConfig,
+    identity: Identity,
+    invite: &str,
+    port: u16,
+) -> Result<PeerRegistration, DiagnosticError> {
+    let manual_stun_servers = config.manual_stun_servers.clone();
+    let state = config.into_state(None);
+    let mut peer = DiagnosticPeer::build_without_persistence(
+        state,
+        identity.clone(),
+        PathBuf::new(),
+        manual_stun_servers,
+        port,
+        None,
+        NodeConfig::default().virtual_mtu,
+    )
+    .await?;
+    let candidates = peer.candidates.clone();
+    let registration = peer
+        .client
+        .register_with_incarnation(
+            peer.node.identity(),
+            peer.node.incarnation(),
+            Some(invite),
+            None,
+            candidates.clone(),
+        )
+        .await?;
+    let credential = registration.credential;
+    peer.state.credential = Some(credential.clone());
+    peer.state.candidates = candidates;
+    peer.apply_snapshot(registration.snapshot).await?;
+    peer.refresh_candidates().await?;
+    peer.state.last_local_addrs = peer.node.local_addrs()?;
+    Ok(PeerRegistration {
+        config: peer.state.config(),
+        secrets: PeerSecrets {
+            identity,
+            credential,
+        },
+    })
+}
+
 pub struct DiagnosticPeer {
     pub node: VelaNode,
     pub client: CoordinationClient,
@@ -253,6 +392,16 @@ pub struct DiagnosticPeer {
     candidates: Vec<Candidate>,
     state_dir: PathBuf,
     manual_stun_servers: Vec<String>,
+    persist_state: bool,
+}
+
+struct PeerBuildConfig {
+    state_dir: PathBuf,
+    manual_stun_servers: Vec<String>,
+    port: u16,
+    preferred_ports: Option<[Option<u16>; 2]>,
+    virtual_mtu: usize,
+    persist_state: bool,
 }
 
 pub struct DiagnosticControl {
@@ -386,6 +535,50 @@ impl DiagnosticPeer {
         Ok(peer)
     }
 
+    /// Opens a registered peer from in-memory identity material and keeps
+    /// refreshed runtime state out of the filesystem.
+    pub async fn open_with_material(
+        config: PeerConfig,
+        secrets: PeerSecrets,
+        state_dir: impl AsRef<Path>,
+        port: Option<u16>,
+        virtual_mtu: usize,
+    ) -> Result<Self, DiagnosticError> {
+        let manual_stun_servers = config.manual_stun_servers.clone();
+        let state = config.into_state(Some(secrets.credential));
+        let (port, preferred_ports) = match port {
+            Some(port) => (port, None),
+            None => (0, preferred_local_ports(&state.last_local_addrs)),
+        };
+        let mut peer = Self::build_without_persistence(
+            state,
+            secrets.identity,
+            state_dir,
+            manual_stun_servers,
+            port,
+            preferred_ports,
+            virtual_mtu,
+        )
+        .await?;
+        let registration = peer
+            .client
+            .register_with_incarnation(
+                peer.node.identity(),
+                peer.node.incarnation(),
+                None,
+                peer.state.credential.as_ref(),
+                peer.candidates.clone(),
+            )
+            .await?;
+        peer.state.credential = Some(registration.credential);
+        peer.state.candidates = peer.candidates.clone();
+        peer.apply_snapshot(registration.snapshot).await?;
+        peer.refresh_candidates().await?;
+        peer.state.last_local_addrs = peer.node.local_addrs()?;
+        peer.node.start().await?;
+        Ok(peer)
+    }
+
     async fn build(
         state: PeerState,
         identity: Identity,
@@ -395,25 +588,61 @@ impl DiagnosticPeer {
         preferred_ports: Option<[Option<u16>; 2]>,
         virtual_mtu: usize,
     ) -> Result<Self, DiagnosticError> {
-        let provider = match preferred_ports {
+        Self::build_with_persistence(
+            state,
+            identity,
+            PeerBuildConfig {
+                state_dir: state_dir.as_ref().to_path_buf(),
+                manual_stun_servers,
+                port,
+                preferred_ports,
+                virtual_mtu,
+                persist_state: true,
+            },
+        )
+        .await
+    }
+
+    async fn build_without_persistence(
+        state: PeerState,
+        identity: Identity,
+        state_dir: impl AsRef<Path>,
+        manual_stun_servers: Vec<String>,
+        port: u16,
+        preferred_ports: Option<[Option<u16>; 2]>,
+        virtual_mtu: usize,
+    ) -> Result<Self, DiagnosticError> {
+        Self::build_with_persistence(
+            state,
+            identity,
+            PeerBuildConfig {
+                state_dir: state_dir.as_ref().to_path_buf(),
+                manual_stun_servers,
+                port,
+                preferred_ports,
+                virtual_mtu,
+                persist_state: false,
+            },
+        )
+        .await
+    }
+
+    async fn build_with_persistence(
+        state: PeerState,
+        identity: Identity,
+        config: PeerBuildConfig,
+    ) -> Result<Self, DiagnosticError> {
+        let provider = match config.preferred_ports {
             Some(preferred_ports) => Arc::new(TokioDatagramProvider::with_preferred_ports(
                 Vec::new(),
                 preferred_ports,
             )),
             None => Arc::new(TokioDatagramProvider::new(Vec::new())),
         };
-        Self::build_with_provider(
-            state,
-            identity,
-            state_dir,
-            manual_stun_servers,
-            port,
-            provider,
-            virtual_mtu,
-        )
-        .await
+        Self::build_with_provider_and_persistence(state, identity, config, provider).await
     }
 
+    #[cfg(test)]
     async fn build_with_provider(
         state: PeerState,
         identity: Identity,
@@ -423,6 +652,36 @@ impl DiagnosticPeer {
         provider: Arc<dyn DatagramProvider>,
         virtual_mtu: usize,
     ) -> Result<Self, DiagnosticError> {
+        Self::build_with_provider_and_persistence(
+            state,
+            identity,
+            PeerBuildConfig {
+                state_dir: state_dir.as_ref().to_path_buf(),
+                manual_stun_servers,
+                port,
+                preferred_ports: None,
+                virtual_mtu,
+                persist_state: true,
+            },
+            provider,
+        )
+        .await
+    }
+
+    async fn build_with_provider_and_persistence(
+        state: PeerState,
+        identity: Identity,
+        config: PeerBuildConfig,
+        provider: Arc<dyn DatagramProvider>,
+    ) -> Result<Self, DiagnosticError> {
+        let PeerBuildConfig {
+            state_dir,
+            manual_stun_servers,
+            port,
+            preferred_ports: _,
+            virtual_mtu,
+            persist_state,
+        } = config;
         let local = state.snapshot.as_ref().and_then(|snapshot| {
             snapshot
                 .peers
@@ -477,8 +736,9 @@ impl DiagnosticPeer {
             client,
             state,
             candidates,
-            state_dir: state_dir.as_ref().to_path_buf(),
+            state_dir,
             manual_stun_servers,
+            persist_state,
         })
     }
 
@@ -564,7 +824,7 @@ impl DiagnosticPeer {
         self.apply_snapshot(snapshot).await?;
         self.candidates = candidates.clone();
         self.state.candidates = candidates;
-        self.state.save(&self.state_dir)?;
+        self.save_state()?;
         Ok(())
     }
 
@@ -606,7 +866,7 @@ impl DiagnosticPeer {
         // that snapshot to the runtime so its TUN route watcher does not
         // briefly regress to the older snapshot carried by RegisterOk.
         let snapshot = self.state.snapshot.clone().unwrap_or(snapshot);
-        self.state.save(&self.state_dir)?;
+        self.save_state()?;
         debug!(
             debug_marker = "vela-control",
             generation = snapshot.generation,
@@ -657,9 +917,16 @@ impl DiagnosticPeer {
         self.state.stun_servers =
             merge_stun_servers(&self.manual_stun_servers, &snapshot.stun_servers);
         self.state.snapshot = Some(snapshot);
-        self.state.save(&self.state_dir)?;
+        self.save_state()?;
         Ok(self.state.doh_servers != previous_doh_servers
             || self.state.stun_servers != previous_stun_servers)
+    }
+
+    fn save_state(&self) -> Result<(), DiagnosticError> {
+        if self.persist_state {
+            self.state.save(&self.state_dir)?;
+        }
+        Ok(())
     }
 
     async fn collect_candidates(&self) -> Result<Vec<Candidate>, DiagnosticError> {
@@ -1136,6 +1403,14 @@ impl PingReport {
 pub enum DiagnosticError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("peer state file {0:?} was not found; register this peer before starting it")]
+    StateFileNotFound(PathBuf),
+    #[error("could not read peer state file {path:?}: {source}")]
+    StateFileRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("state serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("identity/credential error: {0}")]
@@ -1237,6 +1512,16 @@ mod tests {
     use vela_coord::CoordServer;
     use vela_core::DatagramSocket;
     use vela_proto::{PacketType, WirePacket};
+
+    #[test]
+    fn peer_config_serialization_excludes_membership_credentials() {
+        let config = PeerConfig::new("wss://coord.example/ws".to_owned(), [7; 32], Vec::new());
+        let value = serde_json::to_value(config).unwrap();
+        let fields = value.as_object().unwrap();
+        assert!(!fields.contains_key("credential"));
+        assert!(!fields.contains_key("identity"));
+        assert!(!fields.contains_key("signing_private"));
+    }
 
     struct RecordingProvider {
         inner: TokioDatagramProvider,

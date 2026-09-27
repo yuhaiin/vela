@@ -2624,6 +2624,7 @@ dependencies = [
  "vela-core",
  "vela-crypto",
  "vela-diagnostic",
+ "vela-peer-service",
  "vela-proto",
  "vela-tun",
 ]
@@ -2765,6 +2766,25 @@ dependencies = [
  "bytes",
  "thiserror",
  "vela-proto",
+]
+
+[[package]]
+name = "vela-peer-service"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "vela-core",
+ "vela-crypto",
+ "vela-diagnostic",
+ "vela-ip",
+ "vela-proto",
+ "vela-tun",
 ]
 
 [[package]]
