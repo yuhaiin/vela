@@ -50,8 +50,13 @@ cleanup_signing() {
   rm -f "${SIGNING_SOURCE}"
   if [[ "${TRUSTED_CERT_ADDED}" == "1" && -f "${SIGNING_DIR}/certificate.pem" ]]; then
     if [[ "${TRUSTED_CERT_DOMAIN}" == "admin" ]]; then
-      sudo -n security remove-trusted-cert -d "${SIGNING_DIR}/certificate.pem" \
-        >/dev/null 2>&1 || true
+      # GitHub-hosted macOS runners are discarded after the job. Removing an
+      # admin trust setting asks securityd for an interactive authorization and
+      # can leave a headless CI job waiting forever.
+      if [[ "${GITHUB_ACTIONS:-}" != "true" ]]; then
+        sudo -n security remove-trusted-cert -d "${SIGNING_DIR}/certificate.pem" \
+          >/dev/null 2>&1 || true
+      fi
     else
       security remove-trusted-cert "${SIGNING_DIR}/certificate.pem" \
         >/dev/null 2>&1 || true
@@ -101,14 +106,16 @@ fi
 openssl pkcs12 -in "${SIGNING_DIR}/identity.p12" -clcerts -nokeys \
   -passin "pass:${P12_PASSWORD}" -out "${SIGNING_DIR}/certificate.pem"
 security create-keychain -p "${KEYCHAIN_PASSWORD}" "${SIGNING_KEYCHAIN}"
+security set-keychain-settings -lut 21600 "${SIGNING_KEYCHAIN}"
 security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${SIGNING_KEYCHAIN}"
 security import "${SIGNING_DIR}/identity.p12" \
   -k "${SIGNING_KEYCHAIN}" -P "${P12_PASSWORD}" \
   -T /usr/bin/codesign -T /usr/bin/security
 security set-key-partition-list \
-  -S apple-tool:,apple: -s -k "${KEYCHAIN_PASSWORD}" "${SIGNING_KEYCHAIN}"
+  -S apple-tool:,apple:,codesign: -s -k "${KEYCHAIN_PASSWORD}" "${SIGNING_KEYCHAIN}"
 if ! security verify-cert -c "${SIGNING_DIR}/certificate.pem" -p codeSign \
   -k "${SIGNING_KEYCHAIN}" >/dev/null 2>&1; then
+  echo "Trusting the temporary Vela signing certificate for this build"
   if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
     sudo -n security add-trusted-cert -d -r trustRoot -p codeSign \
       -k "${SIGNING_KEYCHAIN}" "${SIGNING_DIR}/certificate.pem"
@@ -119,11 +126,21 @@ if ! security verify-cert -c "${SIGNING_DIR}/certificate.pem" -p codeSign \
   fi
   TRUSTED_CERT_ADDED=1
 fi
+if ! security verify-cert -c "${SIGNING_DIR}/certificate.pem" -p codeSign \
+  -k "${SIGNING_KEYCHAIN}"; then
+  echo "The Vela signing certificate is not trusted for code signing" >&2
+  exit 1
+fi
 SIGNING_CERTIFICATE_SHA1="$(openssl x509 -in "${SIGNING_DIR}/certificate.pem" \
   -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':')"
-if ! security find-identity -v -p codesigning "${SIGNING_KEYCHAIN}" \
-  | grep -qi "${SIGNING_CERTIFICATE_SHA1}"; then
-  echo "Could not find the Vela code-signing identity" >&2
+SIGNING_IDENTITIES="$(security find-identity -v -p codesigning "${SIGNING_KEYCHAIN}")"
+printf '%s\n' "${SIGNING_IDENTITIES}"
+if ! awk -v fingerprint="${SIGNING_CERTIFICATE_SHA1}" '
+  /Valid identities only/ { in_valid_identities = 1; next }
+  in_valid_identities && index(tolower($0), tolower(fingerprint)) { found = 1 }
+  END { exit !found }
+' <<<"${SIGNING_IDENTITIES}"; then
+  echo "The Vela code-signing certificate is not a valid signing identity" >&2
   exit 1
 fi
 SIGNING_IDENTITY="${SIGNING_CERTIFICATE_SHA1}"
@@ -134,6 +151,14 @@ public enum PeerSigningIdentity {
     public static let helperRequirement = "identifier \"com.vela.peer.helper\" and certificate leaf = H\"${SIGNING_CERTIFICATE_SHA1}\""
 }
 EOF
+
+cat > "${SIGNING_DIR}/code-signing-check.c" <<'EOF'
+int main(void) { return 0; }
+EOF
+clang "${SIGNING_DIR}/code-signing-check.c" -o "${SIGNING_DIR}/code-signing-check"
+codesign --force --timestamp=none --sign "${SIGNING_IDENTITY}" \
+  --keychain "${SIGNING_KEYCHAIN}" "${SIGNING_DIR}/code-signing-check"
+codesign --verify --strict "${SIGNING_DIR}/code-signing-check"
 
 swift build --package-path "${PACKAGE_DIR}" --scratch-path "${BUILD_DIR}/swift-arm64" \
   --triple arm64-apple-macosx13.0 --configuration release --product VelaPeer
