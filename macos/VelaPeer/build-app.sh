@@ -102,7 +102,7 @@ security set-key-partition-list \
   -S apple-tool:,apple: -s -k "${KEYCHAIN_PASSWORD}" "${SIGNING_KEYCHAIN}"
 if ! security verify-cert -c "${SIGNING_DIR}/certificate.pem" -p codeSign \
   -k "${SIGNING_KEYCHAIN}" >/dev/null 2>&1; then
-  security add-trusted-cert -r trustAsRoot -p codeSign \
+  security add-trusted-cert -r trustRoot -p codeSign \
     -k "${SIGNING_KEYCHAIN}" "${SIGNING_DIR}/certificate.pem"
   TRUSTED_CERT_ADDED=1
 fi
