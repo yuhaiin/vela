@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-PACKAGE_DIR="${SCRIPT_DIR}/VelaPeer"
+PACKAGE_DIR="${SCRIPT_DIR}"
 RUST_LIB_DIR="${PACKAGE_DIR}/Rust"
 BUILD_DIR="${SCRIPT_DIR}/build"
 DIST_DIR="${SCRIPT_DIR}/dist"
@@ -133,9 +133,9 @@ lipo -create \
   -output "${APP_BUNDLE}/Contents/MacOS/VelaPeerHelper"
 sed -e "s/__APP_VERSION__/${APP_VERSION}/g" \
     -e "s/__BUILD_VERSION__/${BUILD_VERSION}/g" \
-    "${SCRIPT_DIR}/VelaPeer/Resources/Info.plist" \
+    "${SCRIPT_DIR}/Resources/Info.plist" \
     > "${APP_BUNDLE}/Contents/Info.plist"
-cp "${SCRIPT_DIR}/VelaPeer/Resources/com.vela.peer.helper.plist" \
+cp "${SCRIPT_DIR}/Resources/com.vela.peer.helper.plist" \
   "${APP_BUNDLE}/Contents/Library/LaunchDaemons/com.vela.peer.helper.plist"
 
 codesign --force --timestamp=none --sign "${SIGNING_IDENTITY}" \
