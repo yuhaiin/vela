@@ -297,11 +297,18 @@ final class AppModel: ObservableObject {
         guard let status = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw PeerAppError.helperUnavailable("the helper returned invalid peer status")
         }
-        if let error = status["error"] as? String {
-            throw PeerAppError.helperUnavailable(error)
-        }
         guard let running = status["running"] as? Bool else {
             throw PeerAppError.helperUnavailable("the helper status did not include a running state")
+        }
+        if !running {
+            if let error = status["error"] as? String, error != lastHelperStatusError {
+                appendLog("Peer service: \(error)")
+                lastHelperStatusError = error
+            }
+            return false
+        }
+        if let error = status["error"] as? String {
+            throw PeerAppError.helperUnavailable(error)
         }
         return running
     }
