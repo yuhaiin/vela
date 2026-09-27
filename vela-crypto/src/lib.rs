@@ -84,6 +84,21 @@ impl Identity {
         })
     }
 
+    /// Reconstructs an identity from the two private keys stored by a secure
+    /// platform credential store such as the macOS Keychain.
+    pub fn from_private_keys(signing_private: [u8; 32], noise_private: [u8; 32]) -> Self {
+        Self {
+            signing: SigningKey::from_bytes(&signing_private),
+            noise_static: StaticSecret::from(noise_private),
+        }
+    }
+
+    /// Returns the private key bytes so a platform adapter can store them in
+    /// its protected credential store instead of a state file.
+    pub fn private_keys(&self) -> ([u8; 32], [u8; 32]) {
+        (self.signing.to_bytes(), self.noise_static.to_bytes())
+    }
+
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), CryptoError> {
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent)?;
@@ -496,6 +511,14 @@ mod tests {
             identity.public().node_id.as_bytes(),
             blake3::hash(&identity.signing_public()).as_bytes()
         );
+    }
+
+    #[test]
+    fn identity_round_trips_through_platform_key_material() {
+        let identity = Identity::generate();
+        let restored =
+            Identity::from_private_keys(identity.private_keys().0, identity.private_keys().1);
+        assert_eq!(restored.public(), identity.public());
     }
 
     #[test]

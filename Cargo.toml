@@ -11,6 +11,7 @@ members = [
     "vela-tun",
     "vela-core",
     "vela-diagnostic",
+    "vela-peer-service",
     "vela-coord",
     "vela-cli",
 ]

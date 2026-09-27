@@ -300,6 +300,30 @@ mod platform {
                 .map_err(netlink_error)
         }
 
+        pub async fn remove_local_address(
+            &self,
+            address: IpAddr,
+            prefix_len: u8,
+        ) -> Result<(), TunError> {
+            let mut addresses = self
+                .handle
+                .address()
+                .get()
+                .set_link_index_filter(self.interface_index)
+                .set_address_filter(address)
+                .set_prefix_length_filter(prefix_len)
+                .execute();
+            while let Some(message) = addresses.next().await {
+                self.handle
+                    .address()
+                    .del(message.map_err(netlink_error)?)
+                    .execute()
+                    .await
+                    .map_err(netlink_error)?;
+            }
+            Ok(())
+        }
+
         pub async fn claim_host_route(&self, address: IpAddr) -> Result<RouteLease, TunError> {
             let key = match address {
                 IpAddr::V4(address) => RouteKey::V4(address),
@@ -576,6 +600,10 @@ mod platform {
             }
         }
 
+        fn remove_local_address(&self, address: IpAddr) -> Result<(), TunError> {
+            self.device.remove_address(address).map_err(TunError::Io)
+        }
+
         fn interface_index(&self) -> Result<u32, TunError> {
             self.device.if_index().map_err(TunError::Io)
         }
@@ -628,6 +656,14 @@ mod platform {
             prefix_len: u8,
         ) -> Result<(), TunError> {
             self.tun.add_local_address(address, prefix_len)
+        }
+
+        pub async fn remove_local_address(
+            &self,
+            address: IpAddr,
+            _prefix_len: u8,
+        ) -> Result<(), TunError> {
+            self.tun.remove_local_address(address)
         }
 
         pub async fn claim_host_route(&self, address: IpAddr) -> Result<RouteLease, TunError> {
@@ -776,6 +812,13 @@ mod platform {
             Err(TunError::Unsupported)
         }
         pub async fn set_mtu(&self, _mtu: usize) -> Result<(), TunError> {
+            Err(TunError::Unsupported)
+        }
+        pub async fn remove_local_address(
+            &self,
+            _address: IpAddr,
+            _prefix_len: u8,
+        ) -> Result<(), TunError> {
             Err(TunError::Unsupported)
         }
     }

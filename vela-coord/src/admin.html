@@ -1,5 +1,6 @@
 <!doctype html>
 <html lang="en">
+<!-- VELA_QR_LICENSE -->
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -123,11 +124,27 @@
 
         <div id="invite-result" class="hidden min-w-0 rounded-2xl bg-slate-900 p-5 ring-1 ring-cyan-900">
           <div class="flex items-center justify-between gap-4">
-            <h2 class="text-lg font-medium">One-time commands for the new peer</h2>
+            <h2 class="text-lg font-medium">Register a Vela Peer device</h2>
             <button id="close-invite" class="text-slate-400 hover:text-white">Close</button>
           </div>
-          <p class="mt-2 text-xs text-amber-300">The download token and invite token are shown only once. Save them now.</p>
-          <div id="invite-commands" class="mt-4 min-w-0 space-y-4"></div>
+          <p class="mt-2 text-sm text-amber-300">This QR code and package contain a one-time invite. Share them only with the device owner; save them now because the invite is shown only once.</p>
+          <div class="mt-4 grid gap-5 lg:grid-cols-[15rem_minmax(0,1fr)]">
+            <div id="registration-qr" class="flex min-h-56 items-center justify-center rounded-xl bg-white p-3" aria-label="One-time Vela Peer registration QR code"></div>
+            <div class="min-w-0">
+              <label for="registration-bundle" class="mb-2 block text-sm text-slate-300">Registration package</label>
+              <textarea id="registration-bundle" readonly rows="8" class="w-full rounded-lg bg-slate-950 p-3 font-mono text-xs text-cyan-300"></textarea>
+              <div class="mt-2 flex flex-wrap gap-2">
+                <button id="copy-registration-bundle" class="rounded-lg border border-slate-700 px-3 py-2 text-sm hover:bg-slate-800">Copy package</button>
+                <button id="download-registration-bundle" class="rounded-lg border border-slate-700 px-3 py-2 text-sm hover:bg-slate-800">Download JSON</button>
+                <span id="registration-copy-status" class="self-center text-xs text-slate-400" aria-live="polite"></span>
+              </div>
+            </div>
+          </div>
+          <details class="mt-5 border-t border-slate-800 pt-4">
+            <summary class="cursor-pointer text-sm text-slate-300">CLI commands</summary>
+            <p class="mt-2 text-xs text-amber-300">The CLI download token is shown only once. Save the download command if this peer will use the CLI.</p>
+            <div id="invite-commands" class="mt-4 min-w-0 space-y-4"></div>
+          </details>
         </div>
       </section>
 
@@ -184,6 +201,7 @@
   </main>
 
 <script>
+<!-- VELA_QR_GENERATOR -->
 (() => {
   const sessionKey = 'vela.admin.session';
   let session = null;
@@ -326,6 +344,21 @@
     const upCommand = serverConfig.windows
       ? `${executable} peer up --state ${state} --mtu 1200`
       : `sudo ${executable} peer up --state ${state} --mtu 1200`;
+    const registrationBundle = JSON.stringify({
+      version: 1,
+      coordinator: {url: wsOrigin() + '/ws', public_key: serverConfig.server_key},
+      invite: invite.invite_token,
+    }, null, 2);
+    $('registration-bundle').value = registrationBundle;
+    const qr = qrcode(0, 'M');
+    qr.addData(registrationBundle, 'Byte');
+    qr.make();
+    $('registration-qr').innerHTML = qr.createSvgTag({
+      cellSize: 5,
+      margin: 4,
+      scalable: true,
+      title: {text: 'One-time Vela Peer registration invite'},
+    });
     $('invite-commands').innerHTML = [
       ['1. Download CLI', downloadCommand],
       ['2. Register peer', registerCommand],
@@ -348,6 +381,29 @@
   $('close-invite').addEventListener('click', () => {
     $('invite-result').classList.add('hidden');
     $('peer-tools').classList.remove('invite-open');
+  });
+  $('copy-registration-bundle').addEventListener('click', async () => {
+    const value = $('registration-bundle').value;
+    try {
+      await navigator.clipboard.writeText(value);
+    } catch (_) {
+      $('registration-bundle').focus();
+      $('registration-bundle').select();
+      document.execCommand('copy');
+    }
+    $('registration-copy-status').textContent = 'Package copied';
+    setTimeout(() => { $('registration-copy-status').textContent = ''; }, 2500);
+  });
+  $('download-registration-bundle').addEventListener('click', () => {
+    const file = new Blob([$('registration-bundle').value], {type: 'application/json'});
+    const url = URL.createObjectURL(file);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'vela-peer-registration.json';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   });
   $('invite-form').addEventListener('submit', async (event) => {
     event.preventDefault(); clearError($('app-error'));

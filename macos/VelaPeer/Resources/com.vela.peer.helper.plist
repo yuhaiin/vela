@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.vela.peer.helper</string>
+    <key>AssociatedBundleIdentifiers</key>
+    <string>com.vela.peer</string>
+    <key>BundleProgram</key>
+    <string>Contents/MacOS/VelaPeerHelper</string>
+    <key>MachServices</key>
+    <dict>
+        <key>com.vela.peer.helper</key>
+        <true/>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

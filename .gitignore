@@ -1,4 +1,7 @@
 /target/
+/macos/VelaPeer/Rust/
+/macos/VelaPeer/build/
+/macos/VelaPeer/dist/
 /.codebase-index/
 *.key
 *.db
