@@ -62,6 +62,46 @@ Keep the private key out of the repository. Pull request builds use a temporary 
 
 After Mac validation and choosing the release version, push a `v`-prefixed numeric tag (`v<major>.<minor>.<patch>`). The workflow builds the universal zip, publishes it with a SHA-256 checksum, and uses this directory's `README.md` as the release notes. The app version comes from the tag.
 
-## Mac validation still required
+## Mac validation checklist
 
-Run the app on macOS 13 or later and verify first launch, Camera permission, LaunchDaemon registration and approval, TUN creation, route cleanup, peer stop after app termination, helper exit and relaunch after an app update, launch-at-login, and local-data deletion. The helper should stop the peer and exit when its app client disconnects, so the next launch loads the helper from the current app bundle. The Linux development environment cannot validate these macOS system behaviors.
+These checks require a Mac; a successful CI build does not prove how macOS handles helper approval, TUN permissions, routes, or camera access. Run them on macOS 13 or later with a staging Coordinator and disposable peer registrations. Cover both Apple Silicon and Intel before calling the Universal build ready. Record the Mac model, macOS version, app commit, and pass/fail result, but do not include invite packages, private keys, or credentials in screenshots or logs.
+
+For an Actions preview, download the app archive and its checksum from the same workflow run, then verify it before opening:
+
+```sh
+shasum -a 256 -c Vela-macos-universal.zip.sha256
+```
+
+The preview is signed with a temporary self-signed certificate and is not notarized. Only use the Gatekeeper override described in [README.md](README.md) after confirming the download came from the Vela repository and its checksum matches.
+
+### First launch and registration
+
+- [ ] Launch Vela with no saved peer. Confirm the menu bar item appears and the app does not start a peer or request TUN access.
+- [ ] Open and close the main window. Confirm the menu bar app stays available and can reopen the window.
+- [ ] Create a disposable registration package on the staging Coordinator. Paste it into Vela and confirm the displayed Coordinator address and public-key fingerprint match the admin page.
+- [ ] Cancel registration and confirm the peer remains unregistered. Use a fresh one-time invite, submit it, and confirm the app shows **Registered** without starting the peer.
+- [ ] Repeat registration using a fresh QR invite and grant camera access when prompted. Confirm the preview matches the pasted-package flow.
+- [ ] Confirm the identity and credential are stored in Keychain and peer files are under `~/Library/Application Support/Vela/peer`. Do not inspect or copy secret values into test notes.
+
+### Helper approval and peer lifecycle
+
+- [ ] Select **Start** explicitly. Approve Vela Peer Helper in Login Items if macOS asks. Confirm the peer starts, the TUN interface appears, and the UI reports Coordinator/peer status.
+- [ ] Select **Stop**. Confirm the peer stops and Vela removes its TUN interface and routes.
+- [ ] Start again, close the main window, then reopen it from the menu bar. Confirm the peer stayed running.
+- [ ] Stop from the menu bar. Start again and choose **Quit Vela** from the menu bar context menu. Confirm the peer stops, routes are removed, and the helper exits.
+- [ ] Start the peer again and force-quit the app from Activity Monitor. Confirm the helper notices the disconnected app, stops the peer, removes its TUN interface/routes, and exits. Relaunch Vela and confirm it reports the peer stopped.
+- [ ] While running, inspect **Diagnostics** and **Logs**. Confirm status and errors are visible and **Copy logs** works. Check that logs do not contain invite text, private keys, or credentials.
+
+### Login item and Coordinator migration
+
+- [ ] Confirm **Open Vela and start the peer at login** is off by default.
+- [ ] Enable it on a disposable account, approve the login item if prompted, log out and back in, and confirm Vela opens and starts the registered peer. Disable it afterward and confirm the peer no longer auto-starts at login.
+- [ ] With a peer registered to Coordinator A, enter a package for Coordinator B. Cancel the replacement warning and confirm A remains active. Repeat and confirm replacement; verify the local identity is reused and the UI explains that an administrator must revoke the old Coordinator registration.
+
+### Uninstall, local data, and update
+
+- [ ] Choose **Prepare to uninstall** and keep device data. Confirm the peer stops, helper and login item are unregistered, and local peer data remains. Relaunch the app and confirm it still shows the same registration.
+- [ ] On a separate disposable registration, choose **Delete device data**. Confirm only this Mac's peer files and Keychain identity are removed; verify the Coordinator registration still exists until its administrator revokes it.
+- [ ] For an update test, use two builds signed with the same persistent release identity. With the peer running, quit Vela, replace `Vela.app`, relaunch, and confirm the helper loads from the new bundle and the saved identity remains usable. This check is not covered by temporary-certificate preview builds.
+
+Keep the observed results with the PR. Any failure in helper approval, abnormal-exit cleanup, route removal, identity retention, or update must be fixed before publishing a release. Choose the release version and create a public tag only after these Mac checks pass.
