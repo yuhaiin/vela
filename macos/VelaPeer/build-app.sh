@@ -45,10 +45,17 @@ fi
 
 mkdir -p "${SIGNING_DIR}"
 TRUSTED_CERT_ADDED=0
+TRUSTED_CERT_DOMAIN=user
 cleanup_signing() {
   rm -f "${SIGNING_SOURCE}"
   if [[ "${TRUSTED_CERT_ADDED}" == "1" && -f "${SIGNING_DIR}/certificate.pem" ]]; then
-    security remove-trusted-cert "${SIGNING_DIR}/certificate.pem" >/dev/null 2>&1 || true
+    if [[ "${TRUSTED_CERT_DOMAIN}" == "admin" ]]; then
+      sudo -n security remove-trusted-cert -d "${SIGNING_DIR}/certificate.pem" \
+        >/dev/null 2>&1 || true
+    else
+      security remove-trusted-cert "${SIGNING_DIR}/certificate.pem" \
+        >/dev/null 2>&1 || true
+    fi
   fi
   security delete-keychain "${SIGNING_KEYCHAIN}" >/dev/null 2>&1 || true
   rm -rf "${SIGNING_DIR}"
@@ -102,8 +109,14 @@ security set-key-partition-list \
   -S apple-tool:,apple: -s -k "${KEYCHAIN_PASSWORD}" "${SIGNING_KEYCHAIN}"
 if ! security verify-cert -c "${SIGNING_DIR}/certificate.pem" -p codeSign \
   -k "${SIGNING_KEYCHAIN}" >/dev/null 2>&1; then
-  security add-trusted-cert -r trustRoot -p codeSign \
-    -k "${SIGNING_KEYCHAIN}" "${SIGNING_DIR}/certificate.pem"
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    sudo -n security add-trusted-cert -d -r trustRoot -p codeSign \
+      -k "${SIGNING_KEYCHAIN}" "${SIGNING_DIR}/certificate.pem"
+    TRUSTED_CERT_DOMAIN=admin
+  else
+    security add-trusted-cert -r trustRoot -p codeSign \
+      -k "${SIGNING_KEYCHAIN}" "${SIGNING_DIR}/certificate.pem"
+  fi
   TRUSTED_CERT_ADDED=1
 fi
 SIGNING_CERTIFICATE_SHA1="$(openssl x509 -in "${SIGNING_DIR}/certificate.pem" \
