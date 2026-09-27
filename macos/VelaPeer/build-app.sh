@@ -135,11 +135,9 @@ SIGNING_CERTIFICATE_SHA1="$(openssl x509 -in "${SIGNING_DIR}/certificate.pem" \
   -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':')"
 SIGNING_IDENTITIES="$(security find-identity -v -p codesigning "${SIGNING_KEYCHAIN}")"
 printf '%s\n' "${SIGNING_IDENTITIES}"
-if ! awk -v fingerprint="${SIGNING_CERTIFICATE_SHA1}" '
-  /Valid identities only/ { in_valid_identities = 1; next }
-  in_valid_identities && index(tolower($0), tolower(fingerprint)) { found = 1 }
-  END { exit !found }
-' <<<"${SIGNING_IDENTITIES}"; then
+if ! grep -qi "${SIGNING_CERTIFICATE_SHA1}" <<<"${SIGNING_IDENTITIES}" \
+  || ! grep -Eq '^[[:space:]]*[1-9][0-9]* valid identities found$' \
+    <<<"${SIGNING_IDENTITIES}"; then
   echo "The Vela code-signing certificate is not a valid signing identity" >&2
   exit 1
 fi
