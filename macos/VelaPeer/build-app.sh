@@ -46,6 +46,7 @@ fi
 mkdir -p "${SIGNING_DIR}"
 TRUSTED_CERT_ADDED=0
 TRUSTED_CERT_DOMAIN=user
+ORIGINAL_DEFAULT_KEYCHAIN=""
 cleanup_signing() {
   rm -f "${SIGNING_SOURCE}"
   if [[ "${TRUSTED_CERT_ADDED}" == "1" && -f "${SIGNING_DIR}/certificate.pem" ]]; then
@@ -61,6 +62,10 @@ cleanup_signing() {
       security remove-trusted-cert "${SIGNING_DIR}/certificate.pem" \
         >/dev/null 2>&1 || true
     fi
+  fi
+  if [[ -n "${ORIGINAL_DEFAULT_KEYCHAIN}" ]]; then
+    security default-keychain -d user -s "${ORIGINAL_DEFAULT_KEYCHAIN}" \
+      >/dev/null 2>&1 || true
   fi
   security delete-keychain "${SIGNING_KEYCHAIN}" >/dev/null 2>&1 || true
   rm -rf "${SIGNING_DIR}"
@@ -105,7 +110,10 @@ EOF
 fi
 openssl pkcs12 -in "${SIGNING_DIR}/identity.p12" -clcerts -nokeys \
   -passin "pass:${P12_PASSWORD}" -out "${SIGNING_DIR}/certificate.pem"
+ORIGINAL_DEFAULT_KEYCHAIN="$(security default-keychain -d user \
+  | sed -e 's/^"//' -e 's/"$//')"
 security create-keychain -p "${KEYCHAIN_PASSWORD}" "${SIGNING_KEYCHAIN}"
+security default-keychain -d user -s "${SIGNING_KEYCHAIN}"
 security set-keychain-settings -lut 21600 "${SIGNING_KEYCHAIN}"
 security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${SIGNING_KEYCHAIN}"
 if [[ -n "${VELA_MACOS_SIGNING_P12_BASE64:-}" ]]; then
@@ -162,7 +170,7 @@ int main(void) { return 0; }
 EOF
 clang "${SIGNING_DIR}/code-signing-check.c" -o "${SIGNING_DIR}/code-signing-check"
 codesign --force --timestamp=none --sign "${SIGNING_IDENTITY}" \
-  --keychain "${SIGNING_KEYCHAIN}" "${SIGNING_DIR}/code-signing-check"
+  "${SIGNING_DIR}/code-signing-check"
 codesign --verify --strict "${SIGNING_DIR}/code-signing-check"
 
 swift build --package-path "${PACKAGE_DIR}" --scratch-path "${BUILD_DIR}/swift-arm64" \
@@ -194,10 +202,10 @@ cp "${SCRIPT_DIR}/Resources/com.vela.peer.helper.plist" \
   "${APP_BUNDLE}/Contents/Library/LaunchDaemons/com.vela.peer.helper.plist"
 
 codesign --force --timestamp=none --sign "${SIGNING_IDENTITY}" \
-  --keychain "${SIGNING_KEYCHAIN}" --identifier com.vela.peer.helper \
+  --identifier com.vela.peer.helper \
   "${APP_BUNDLE}/Contents/MacOS/VelaPeerHelper"
 codesign --force --timestamp=none --sign "${SIGNING_IDENTITY}" \
-  --keychain "${SIGNING_KEYCHAIN}" --identifier com.vela.peer "${APP_BUNDLE}"
+  --identifier com.vela.peer "${APP_BUNDLE}"
 codesign --verify --deep --strict "${APP_BUNDLE}"
 
 ditto -c -k --keepParent "${APP_BUNDLE}" "${DIST_DIR}/Vela-macos-universal.zip"
