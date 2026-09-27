@@ -44,8 +44,12 @@ if [[ -e "${SIGNING_SOURCE}" ]]; then
 fi
 
 mkdir -p "${SIGNING_DIR}"
+TRUSTED_CERT_ADDED=0
 cleanup_signing() {
   rm -f "${SIGNING_SOURCE}"
+  if [[ "${TRUSTED_CERT_ADDED}" == "1" && -f "${SIGNING_DIR}/certificate.pem" ]]; then
+    security remove-trusted-cert "${SIGNING_DIR}/certificate.pem" >/dev/null 2>&1 || true
+  fi
   security delete-keychain "${SIGNING_KEYCHAIN}" >/dev/null 2>&1 || true
   rm -rf "${SIGNING_DIR}"
 }
@@ -96,9 +100,15 @@ security import "${SIGNING_DIR}/identity.p12" \
   -T /usr/bin/codesign -T /usr/bin/security
 security set-key-partition-list \
   -S apple-tool:,apple: -s -k "${KEYCHAIN_PASSWORD}" "${SIGNING_KEYCHAIN}"
+if ! security verify-cert -c "${SIGNING_DIR}/certificate.pem" -p codeSign \
+  -k "${SIGNING_KEYCHAIN}" >/dev/null 2>&1; then
+  security add-trusted-cert -r trustAsRoot -p codeSign \
+    -k "${SIGNING_KEYCHAIN}" "${SIGNING_DIR}/certificate.pem"
+  TRUSTED_CERT_ADDED=1
+fi
 SIGNING_CERTIFICATE_SHA1="$(openssl x509 -in "${SIGNING_DIR}/certificate.pem" \
   -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':')"
-if ! security find-identity -p codesigning "${SIGNING_KEYCHAIN}" \
+if ! security find-identity -v -p codesigning "${SIGNING_KEYCHAIN}" \
   | grep -qi "${SIGNING_CERTIFICATE_SHA1}"; then
   echo "Could not find the Vela code-signing identity" >&2
   exit 1
