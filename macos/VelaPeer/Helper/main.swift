@@ -113,6 +113,10 @@ private final class PeerHelperService: NSObject, PeerHelperProtocol {
 private final class PeerHelperListener: NSObject, NSXPCListenerDelegate {
     private let service = PeerHelperService()
 
+    func terminate() {
+        service.terminate()
+    }
+
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection connection: NSXPCConnection) -> Bool {
         guard service.accept(connection) else { return false }
         connection.setCodeSigningRequirement(PeerSigningIdentity.appRequirement)

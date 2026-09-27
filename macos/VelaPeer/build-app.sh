@@ -12,6 +12,8 @@ SIGNING_KEYCHAIN="${SIGNING_DIR}/vela-peer-build.keychain-db"
 SIGNING_SOURCE="${PACKAGE_DIR}/Shared/PeerSigningIdentity.swift"
 APP_VERSION="${VELA_APP_VERSION:-0.0.0}"
 BUILD_VERSION="${VELA_BUILD_VERSION:-${GITHUB_RUN_NUMBER:-1}}"
+MACOSX_DEPLOYMENT_TARGET="${VELA_MACOS_DEPLOYMENT_TARGET:-13.0}"
+export MACOSX_DEPLOYMENT_TARGET
 
 if [[ ! "${APP_VERSION}" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
   echo "VELA_APP_VERSION must contain dot-separated numbers" >&2
