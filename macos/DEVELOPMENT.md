@@ -62,6 +62,8 @@ Keep the private key out of the repository. Pull request builds use a temporary 
 
 After Mac validation and choosing the release version, push a `v`-prefixed numeric tag (`v<major>.<minor>.<patch>`). The workflow builds the universal zip, publishes it with a SHA-256 checksum, and uses this directory's `README.md` as the release notes. The app version comes from the tag.
 
+After this workflow is on `main`, use **Run workflow** for `macOS App` on the `main` ref to build a stable-signed preview artifact without publishing a release. This exercises the persistent signing identity while keeping the final version choice and public release gated on Mac validation.
+
 ## Mac validation checklist
 
 These checks require a Mac; a successful CI build does not prove how macOS handles helper approval, TUN permissions, routes, or camera access. Run them on macOS 13 or later with a staging Coordinator and disposable peer registrations. Cover both Apple Silicon and Intel before calling the Universal build ready. Record the Mac model, macOS version, app commit, and pass/fail result, but do not include invite packages, private keys, or credentials in screenshots or logs.
