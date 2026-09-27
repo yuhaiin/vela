@@ -26,8 +26,7 @@ struct SettingsView: View {
                 LabeledContent("Service status", value: helperStatus)
                 if model.helperApprovalNeeded {
                     Button("Open Login Items settings") {
-                        SMAppService.daemon(plistName: "com.vela.peer.helper.plist")
-                            .openSystemSettingsLoginItems()
+                        SMAppService.openSystemSettingsLoginItems()
                     }
                 }
             }

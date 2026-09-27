@@ -69,6 +69,7 @@ final class VelaAppDelegate: NSObject, NSApplicationDelegate {
 private struct MenuBarContent: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         Text(statusText)
@@ -84,7 +85,7 @@ private struct MenuBarContent: View {
                     .disabled(model.isPeerActionBusy || model.secretsUnavailable)
             }
         }
-        SettingsLink { Text("Settings…") }
+        Button("Settings…") { openSettings() }
         Divider()
         Button("Quit Vela") { model.quit() }
             .disabled(model.isPeerActionBusy)

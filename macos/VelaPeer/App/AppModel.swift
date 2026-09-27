@@ -248,7 +248,10 @@ final class AppModel: ObservableObject {
                 helperClient = connectedClient
                 client = connectedClient
                 queryStatusFirst = true
-            case .notRegistered, .requiresApproval where !isRunning:
+            case .notRegistered where !isRunning:
+                client = nil
+                queryStatusFirst = false
+            case .requiresApproval where !isRunning:
                 client = nil
                 queryStatusFirst = false
             case .notFound:
@@ -318,7 +321,7 @@ final class AppModel: ObservableObject {
                 }
             }
             if service.status == .requiresApproval {
-                service.openSystemSettingsLoginItems()
+                SMAppService.openSystemSettingsLoginItems()
                 settings.launchAtLogin = true
                 try PeerFiles.saveSettings(settings)
                 launchAtLogin = true
@@ -375,10 +378,10 @@ final class AppModel: ObservableObject {
     func prepareForUninstall(deleteDeviceData: Bool = false) async throws {
         try await stopPeerAndConfirm(confirmHelperState: true)
         if helperService.status != .notRegistered {
-            try helperService.unregister()
+            try await helperService.unregister()
         }
         if SMAppService.mainApp.status != .notRegistered {
-            try SMAppService.mainApp.unregister()
+            try await SMAppService.mainApp.unregister()
         }
         settings.helperSigningCertificate = nil
         settings.launchAtLogin = false
@@ -451,7 +454,7 @@ final class AppModel: ObservableObject {
                 guard helperService.status == .requiresApproval else { throw error }
             }
         case .requiresApproval:
-            helperService.openSystemSettingsLoginItems()
+            SMAppService.openSystemSettingsLoginItems()
             throw PeerAppError.helperApprovalRequired
         case .notFound:
             throw PeerAppError.helperUnavailable("the daemon plist is missing from the app bundle")
@@ -459,7 +462,7 @@ final class AppModel: ObservableObject {
             throw PeerAppError.helperUnavailable("unknown Service Management status")
         }
         if helperService.status != .enabled {
-            helperService.openSystemSettingsLoginItems()
+            SMAppService.openSystemSettingsLoginItems()
             throw PeerAppError.helperApprovalRequired
         }
     }

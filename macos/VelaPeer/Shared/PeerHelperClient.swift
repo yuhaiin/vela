@@ -1,5 +1,4 @@
 import Foundation
-import VelaPeerShared
 
 private final class PeerHelperCompletion<Value> {
     private let lock = NSLock()

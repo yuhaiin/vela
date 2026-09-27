@@ -162,9 +162,9 @@ struct MainWindow: View {
     private var connectionStatus: String {
         guard model.isRunning else { return "Stopped" }
         switch model.coordinatorConnected {
-        case true: "Connected"
-        case false: "Reconnecting"
-        case nil: "Starting"
+        case true: return "Connected"
+        case false: return "Reconnecting"
+        case nil: return "Starting"
         }
     }
 
