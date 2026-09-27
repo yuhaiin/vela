@@ -108,11 +108,18 @@ openssl pkcs12 -in "${SIGNING_DIR}/identity.p12" -clcerts -nokeys \
 security create-keychain -p "${KEYCHAIN_PASSWORD}" "${SIGNING_KEYCHAIN}"
 security set-keychain-settings -lut 21600 "${SIGNING_KEYCHAIN}"
 security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${SIGNING_KEYCHAIN}"
-security import "${SIGNING_DIR}/identity.p12" \
-  -k "${SIGNING_KEYCHAIN}" -P "${P12_PASSWORD}" \
-  -T /usr/bin/codesign -T /usr/bin/security
-security set-key-partition-list \
-  -S apple-tool:,apple:,codesign: -s -k "${KEYCHAIN_PASSWORD}" "${SIGNING_KEYCHAIN}"
+if [[ -n "${VELA_MACOS_SIGNING_P12_BASE64:-}" ]]; then
+  security import "${SIGNING_DIR}/identity.p12" \
+    -k "${SIGNING_KEYCHAIN}" -P "${P12_PASSWORD}" \
+    -T /usr/bin/codesign -T /usr/bin/security
+  security set-key-partition-list \
+    -S apple-tool:,apple:,codesign: -s -k "${KEYCHAIN_PASSWORD}" "${SIGNING_KEYCHAIN}"
+else
+  # This throwaway private key is generated for one build and deleted with its
+  # keychain. Allowing the build process to use it avoids headless ACL prompts.
+  security import "${SIGNING_DIR}/identity.p12" \
+    -k "${SIGNING_KEYCHAIN}" -P "${P12_PASSWORD}" -A
+fi
 if ! security verify-cert -c "${SIGNING_DIR}/certificate.pem" -p codeSign \
   -k "${SIGNING_KEYCHAIN}" >/dev/null 2>&1; then
   echo "Trusting the temporary Vela signing certificate for this build"
